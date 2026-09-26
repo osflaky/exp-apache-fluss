@@ -1,0 +1,1632 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.tablet;
+
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.InvalidBucketRoutingException;
+import org.apache.fluss.exception.InvalidRequiredAcksException;
+import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.DefaultKvRecordBatch;
+import org.apache.fluss.record.DefaultValueRecordBatch;
+import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.row.encode.ValueDecoder;
+import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetTableStatsRequest;
+import org.apache.fluss.rpc.messages.GetTableStatsResponse;
+import org.apache.fluss.rpc.messages.InitWriterRequest;
+import org.apache.fluss.rpc.messages.InitWriterResponse;
+import org.apache.fluss.rpc.messages.ListOffsetsRequest;
+import org.apache.fluss.rpc.messages.ListOffsetsResponse;
+import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
+import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
+import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
+import org.apache.fluss.rpc.messages.PbFetchLogRespForTable;
+import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
+import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
+import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
+import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
+import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
+import org.apache.fluss.rpc.messages.PbTableStatsRespForBucket;
+import org.apache.fluss.rpc.messages.ProduceLogResponse;
+import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.rpc.messages.ScanKvRequest;
+import org.apache.fluss.rpc.messages.ScanKvResponse;
+import org.apache.fluss.rpc.messages.StopReplicaRequest;
+import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
+import org.apache.fluss.server.log.ListOffsetsParam;
+import org.apache.fluss.server.metadata.ServerInfo;
+import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.types.DataField;
+import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.types.Tuple2;
+
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import javax.annotation.Nullable;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.TestData.ANOTHER_DATA1;
+import static org.apache.fluss.record.TestData.DATA1;
+import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
+import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.record.TestData.DATA_1_WITH_KEY_AND_VALUE;
+import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
+import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
+import static org.apache.fluss.server.testutils.KvTestUtils.assertLookupResponse;
+import static org.apache.fluss.server.testutils.KvTestUtils.assertPrefixLookupResponse;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.assertFetchLogResponse;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.assertLimitScanResponse;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.assertProduceLogResponse;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newFetchLogRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newLimitScanRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newListOffsetsRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newLookupRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPrefixLookupRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newProduceLogRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyLeaderAndIsrResponseData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeNotifyBucketLeaderAndIsr;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeStopBucketReplica;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeUpdateMetadataRequest;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
+import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
+import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
+import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** ITCase for {@link TabletService}. */
+public class TabletServiceITCase {
+    @RegisterExtension
+    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
+            FlussClusterExtension.builder().setNumOfTabletServers(3).build();
+
+    @ParameterizedTest
+    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})
+    void testProduceLog(byte recordBatchMagic) throws Exception {
+        long tableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        // 1. send first batch.
+        assertProduceLogResponse(
+                leaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        tableId,
+                                        0,
+                                        1,
+                                        genMemoryLogRecordsByObject(recordBatchMagic, DATA1)))
+                        .get(),
+                0,
+                0L);
+
+        // 2. send second batch.
+        assertProduceLogResponse(
+                leaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        tableId, 0, 1, genMemoryLogRecordsByObject(DATA1)))
+                        .get(),
+                0,
+                10L);
+
+        // 3. test produce with error acks to check error produce record.
+        assertThatThrownBy(
+                        () ->
+                                leaderGateWay
+                                        .produceLog(
+                                                newProduceLogRequest(
+                                                        tableId,
+                                                        0,
+                                                        100,
+                                                        genMemoryLogRecordsByObject(DATA1)))
+                                        .get())
+                .cause()
+                .isInstanceOf(InvalidRequiredAcksException.class)
+                .hasMessageContaining("Invalid required acks");
+    }
+
+    @Test
+    @Disabled("TODO: add back in https://github.com/apache/fluss/issues/771")
+    void testProduceLogResponseReturnInOrder() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        DATA1_TABLE_PATH,
+                        DATA1_TABLE_DESCRIPTOR.withReplicationFactor(3));
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        Queue<Integer> responseOrder = new ConcurrentLinkedQueue<>();
+        Random random = new Random();
+        for (int i = 0; i < 1000; i++) {
+            boolean needAck = random.nextBoolean();
+            CompletableFuture<ProduceLogResponse> produceLogFuture =
+                    leaderGateWay.produceLog(
+                            newProduceLogRequest(
+                                    tableId,
+                                    0,
+                                    needAck ? -1 : 0, // 0 means return immediately.
+                                    genMemoryLogRecordsByObject(DATA1)));
+            final int number = i;
+            produceLogFuture.whenComplete((r, e) -> responseOrder.add(number));
+        }
+
+        retry(Duration.ofMinutes(1), () -> assertThat(responseOrder.size()).isEqualTo(1000));
+        int previousValue = -1;
+        while (!responseOrder.isEmpty()) {
+            int currentValue = responseOrder.poll();
+            assertThat(currentValue).isGreaterThan(previousValue);
+            previousValue = currentValue;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})
+    void testFetchLog(byte recordBatchMagic) throws Exception {
+        long tableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        // produce one batch to this bucket.
+        assertProduceLogResponse(
+                leaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        tableId,
+                                        0,
+                                        1,
+                                        genMemoryLogRecordsByObject(recordBatchMagic, DATA1)))
+                        .get(),
+                0,
+                0L);
+
+        // fetch from this bucket from offset 0, return data1.
+        assertFetchLogResponse(
+                leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, 0, 0L)).get(),
+                tableId,
+                0,
+                10L,
+                DATA1);
+
+        // fetch from this bucket from offset 3, return data1.
+        assertFetchLogResponse(
+                leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, 0, 3L)).get(),
+                tableId,
+                0,
+                10L,
+                DATA1);
+
+        // append new batch.
+        assertProduceLogResponse(
+                leaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        tableId,
+                                        0,
+                                        1,
+                                        genMemoryLogRecordsByObject(
+                                                recordBatchMagic, ANOTHER_DATA1)))
+                        .get(),
+                0,
+                10L);
+
+        // fetch this bucket from offset 10, return data2.
+        assertFetchLogResponse(
+                leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, 0, 10L)).get(),
+                tableId,
+                0,
+                20L,
+                ANOTHER_DATA1);
+
+        // fetch this bucket from offset 100, return error code.
+        assertFetchLogResponse(
+                leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, 0, 100L)).get(),
+                tableId,
+                0,
+                Errors.LOG_OFFSET_OUT_OF_RANGE_EXCEPTION.code(),
+                "Received request for offset");
+
+        // fetch only first field
+        List<Object[]> totalData = new ArrayList<>(DATA1);
+        totalData.addAll(ANOTHER_DATA1);
+        List<Object[]> expected1 = new ArrayList<>();
+        for (int i = 0; i < ANOTHER_DATA1.size(); i++) {
+            expected1.add(new Object[] {totalData.get(i)[0]});
+        }
+        assertFetchLogResponse(
+                leaderGateWay
+                        .fetchLog(newFetchLogRequest(-1, tableId, 0, 10L, new int[] {0}))
+                        .get(),
+                DATA1_ROW_TYPE.project(new int[] {0}),
+                TEST_SCHEMA_GETTER,
+                tableId,
+                0,
+                20L,
+                expected1);
+
+        // fetch only second field, results contains from offset 10 ~ 20, even fetchOffset=15L
+        List<Object[]> expected2 = new ArrayList<>();
+        for (int i = 10; i < totalData.size(); i++) {
+            expected2.add(new Object[] {totalData.get(i)[1]});
+        }
+        assertFetchLogResponse(
+                leaderGateWay
+                        .fetchLog(newFetchLogRequest(-1, tableId, 0, 15L, new int[] {1}))
+                        .get(),
+                DATA1_ROW_TYPE.project(new int[] {1}),
+                TEST_SCHEMA_GETTER,
+                tableId,
+                0,
+                20L,
+                expected2);
+
+        assertFetchLogResponse(
+                leaderGateWay
+                        .fetchLog(newFetchLogRequest(-1, tableId, 0, 10L, new int[] {2, 3}))
+                        .get(),
+                tableId,
+                0,
+                Errors.INVALID_COLUMN_PROJECTION.code(),
+                "Projected fields [2, 3] is out of bound for schema with 2 fields.");
+    }
+
+    @Test
+    @Disabled("TODO: add back in https://github.com/apache/fluss/issues/777")
+    void testFetchLogWithMinFetchSizeAndTimeout() throws Exception {
+        long tableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        // first send an empty fetch request, without min fetch size, the request will return
+        // immediately.
+        FetchLogResponse fetchLogResponse =
+                leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, 0, 0L)).get();
+        assertThat(fetchLogResponse.getTablesRespsCount()).isEqualTo(1);
+        PbFetchLogRespForTable fetchLogRespForTable = fetchLogResponse.getTablesRespsList().get(0);
+        assertThat(fetchLogRespForTable.getTableId()).isEqualTo(tableId);
+        assertThat(fetchLogRespForTable.getBucketsRespsCount()).isEqualTo(1);
+        PbFetchLogRespForBucket protoFetchedBucket =
+                fetchLogRespForTable.getBucketsRespsList().get(0);
+        assertThat(protoFetchedBucket.getHighWatermark()).isEqualTo(0L);
+        assertThat(protoFetchedBucket.getRecordsSize()).isEqualTo(0);
+
+        // second send a fetch request with minFetchSize and small maxFetchWaitMs, the request will
+        // also return immediately.
+        fetchLogResponse =
+                leaderGateWay
+                        .fetchLog(
+                                newFetchLogRequest(
+                                        -1, tableId, 0, 0L, null, 1, Integer.MAX_VALUE, 100))
+                        .get();
+        assertThat(fetchLogResponse.getTablesRespsCount()).isEqualTo(1);
+        fetchLogRespForTable = fetchLogResponse.getTablesRespsList().get(0);
+        assertThat(fetchLogRespForTable.getTableId()).isEqualTo(tableId);
+        assertThat(fetchLogRespForTable.getBucketsRespsCount()).isEqualTo(1);
+        protoFetchedBucket = fetchLogRespForTable.getBucketsRespsList().get(0);
+        assertThat(protoFetchedBucket.getHighWatermark()).isEqualTo(0L);
+        assertThat(protoFetchedBucket.getRecordsSize()).isEqualTo(0);
+
+        // third send a fetch request with minFetchSize and much bigger maxFetchWaitMs, the request
+        // will return after we send a produce log request to this bucket.
+        CompletableFuture<FetchLogResponse> fetchResultFuture =
+                leaderGateWay.fetchLog(
+                        newFetchLogRequest(
+                                -1,
+                                tableId,
+                                0,
+                                0L,
+                                null,
+                                1,
+                                Integer.MAX_VALUE,
+                                (int) Duration.ofMinutes(5).toMillis()));
+
+        // send a produce log request to trigger delay fetch log finish.
+        assertProduceLogResponse(
+                leaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        tableId, 0, -1, genMemoryLogRecordsByObject(DATA1)))
+                        .get(),
+                0,
+                0L);
+        // the delay fetch will be completed.
+        assertFetchLogResponse(fetchResultFuture.get(), tableId, 0, 10L, DATA1);
+
+        // return immediately.
+        assertFetchLogResponse(
+                leaderGateWay
+                        .fetchLog(
+                                newFetchLogRequest(
+                                        -1,
+                                        tableId,
+                                        0,
+                                        0L,
+                                        null,
+                                        1,
+                                        Integer.MAX_VALUE,
+                                        (int) Duration.ofMinutes(5).toMillis()))
+                        .get(),
+                tableId,
+                0,
+                10L,
+                DATA1);
+    }
+
+    @Test
+    void testInvalidFetchLog() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        TablePath.of("test_db_1", "test_indexed_table_1"),
+                        TableDescriptor.builder()
+                                .schema(DATA1_SCHEMA)
+                                .logFormat(LogFormat.INDEXED)
+                                .distributedBy(3)
+                                .build());
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        assertFetchLogResponse(
+                leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, 0, 0L, new int[] {1})).get(),
+                tableId,
+                0,
+                Errors.INVALID_COLUMN_PROJECTION.code(),
+                "Column projection is only supported for ARROW format, "
+                        + "but the table test_db_1.test_indexed_table_1 is INDEXED format.");
+    }
+
+    @Test
+    void testPutKv() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        // 1. send one batch kv.
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+
+        // 2. test put with error acks to check error produce record.
+        assertThatThrownBy(
+                        () ->
+                                leaderGateWay
+                                        .putKv(
+                                                newPutKvRequest(
+                                                        tableId,
+                                                        0,
+                                                        100,
+                                                        genKvRecordBatch(
+                                                                DATA_1_WITH_KEY_AND_VALUE)))
+                                        .get())
+                .cause()
+                .isInstanceOf(InvalidRequiredAcksException.class)
+                .hasMessageContaining("Invalid required acks");
+    }
+
+    @Test
+    void testLookup() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        DATA1_TABLE_PATH_PK,
+                        withRowTtl(DATA1_TABLE_DESCRIPTOR_PK));
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        // first lookup without in table, key = 1.
+        Object[] key1 = DATA_1_WITH_KEY_AND_VALUE.get(0).f0;
+        CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(DATA1_ROW_TYPE, new int[] {0});
+        byte[] key1Bytes = keyEncoder.encodeKey(row(key1));
+        assertLookupResponse(
+                leaderGateWay.lookup(newLookupRequest(tableId, 0, key1Bytes)).get(), null);
+
+        // send one batch kv.
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+
+        // second lookup in table, key = 1, value = 1, "a1".
+        Object[] value1 = DATA_1_WITH_KEY_AND_VALUE.get(3).f1;
+        byte[] value1Bytes =
+                ValueEncoder.encodeValue(DEFAULT_SCHEMA_ID, compactedRow(DATA1_ROW_TYPE, value1));
+        assertLookupResponse(
+                leaderGateWay.lookup(newLookupRequest(tableId, 0, key1Bytes)).get(), value1Bytes);
+
+        // key = 3 is deleted, need return null.
+        Object[] key3 = DATA_1_WITH_KEY_AND_VALUE.get(2).f0;
+        byte[] key3Bytes = keyEncoder.encodeKey(row(key3));
+        assertLookupResponse(
+                leaderGateWay.lookup(newLookupRequest(tableId, 0, key3Bytes)).get(), null);
+
+        // Lookup from an unknown table-bucket.
+        PbLookupRespForBucket pbLookupRespForBucket =
+                leaderGateWay
+                        .lookup(newLookupRequest(10005L, 6, key3Bytes))
+                        .get()
+                        .getBucketsRespAt(0);
+
+        verifyLookupBucketError(
+                pbLookupRespForBucket,
+                Errors.UNKNOWN_TABLE_OR_BUCKET_EXCEPTION,
+                "Unknown table or bucket: TableBucket{tableId=10005, bucket=6}");
+
+        // Lookup from a non-pk table.
+        long logTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket logTableBucket = new TableBucket(logTableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(logTableBucket);
+
+        int logLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(logTableBucket);
+        TabletServerGateway logLeaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(logLeader);
+        pbLookupRespForBucket =
+                logLeaderGateWay
+                        .lookup(newLookupRequest(logTableId, 0, key3Bytes))
+                        .get()
+                        .getBucketsRespAt(0);
+        verifyLookupBucketError(
+                pbLookupRespForBucket,
+                Errors.NON_PRIMARY_KEY_TABLE_EXCEPTION,
+                "the primary key table not exists for TableBucket");
+    }
+
+    @Test
+    void testPrefixLookup() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "test_prefix_lookup_t1");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .column("c", DataTypes.BIGINT())
+                        .column("d", DataTypes.STRING())
+                        .primaryKey("a", "b", "c")
+                        .build();
+        RowType rowType = schema.getRowType();
+        RowType primaryKeyType =
+                DataTypes.ROW(
+                        new DataField("a", DataTypes.INT()),
+                        new DataField("b", DataTypes.STRING()),
+                        new DataField("c", DataTypes.BIGINT()));
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(3, "a", "b")
+                        .property(ConfigOptions.TABLE_KV_TTL.key(), "1 h")
+                        .build();
+        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, descriptor);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        // first prefix lookup without in table, prefix key = (1, "a").
+        Object[] prefixKey1 = new Object[] {1, "a"};
+        CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(rowType, new int[] {0, 1});
+        byte[] prefixKey1Bytes = keyEncoder.encodeKey(row(prefixKey1));
+        assertPrefixLookupResponse(
+                leaderGateWay
+                        .prefixLookup(
+                                newPrefixLookupRequest(
+                                        tableId, 0, Collections.singletonList(prefixKey1Bytes)))
+                        .get(),
+                Collections.singletonList(Collections.emptyList()));
+
+        // send one batch kv.
+        List<Tuple2<Object[], Object[]>> data1 =
+                Arrays.asList(
+                        Tuple2.of(new Object[] {1, "a", 1L}, new Object[] {1, "a", 1L, "value1"}),
+                        Tuple2.of(new Object[] {1, "a", 2L}, new Object[] {1, "a", 2L, "value2"}),
+                        Tuple2.of(new Object[] {1, "a", 3L}, new Object[] {1, "a", 3L, "value3"}),
+                        Tuple2.of(new Object[] {2, "a", 4L}, new Object[] {2, "a", 4L, "value4"}));
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId,
+                                        0,
+                                        1,
+                                        genKvRecordBatch(primaryKeyType, rowType, data1)))
+                        .get());
+
+        // second prefix lookup in table, prefix key = (1, "a").
+        List<byte[]> key1ExpectedValues =
+                Arrays.asList(
+                        ValueEncoder.encodeValue(
+                                DEFAULT_SCHEMA_ID,
+                                compactedRow(rowType, new Object[] {1, "a", 1L, "value1"})),
+                        ValueEncoder.encodeValue(
+                                DEFAULT_SCHEMA_ID,
+                                compactedRow(rowType, new Object[] {1, "a", 2L, "value2"})),
+                        ValueEncoder.encodeValue(
+                                DEFAULT_SCHEMA_ID,
+                                compactedRow(rowType, new Object[] {1, "a", 3L, "value3"})));
+        assertPrefixLookupResponse(
+                leaderGateWay
+                        .prefixLookup(
+                                newPrefixLookupRequest(
+                                        tableId, 0, Collections.singletonList(prefixKey1Bytes)))
+                        .get(),
+                Collections.singletonList(key1ExpectedValues));
+
+        // third prefix lookup in table for multi prefix keys, prefix key = (1, "a") and (2, "a").
+        Object[] prefixKey2 = new Object[] {2, "a"};
+        byte[] prefixKey2Bytes = keyEncoder.encodeKey(row(prefixKey2));
+        List<byte[]> key2ExpectedValues =
+                Collections.singletonList(
+                        ValueEncoder.encodeValue(
+                                DEFAULT_SCHEMA_ID,
+                                compactedRow(rowType, new Object[] {2, "a", 4L, "value4"})));
+        assertPrefixLookupResponse(
+                leaderGateWay
+                        .prefixLookup(
+                                newPrefixLookupRequest(
+                                        tableId,
+                                        0,
+                                        Arrays.asList(prefixKey1Bytes, prefixKey2Bytes)))
+                        .get(),
+                Arrays.asList(key1ExpectedValues, key2ExpectedValues));
+
+        // Prefix lookup an unsupported prefixLookup table.
+        long logTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        tb = new TableBucket(logTableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay2 =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        PbPrefixLookupRespForBucket pbPrefixLookupRespForBucket =
+                leaderGateWay2
+                        .prefixLookup(
+                                newPrefixLookupRequest(
+                                        logTableId, 0, Collections.singletonList(prefixKey1Bytes)))
+                        .get()
+                        .getBucketsRespAt(0);
+        verifyPrefixLookupBucketError(
+                pbPrefixLookupRespForBucket,
+                Errors.NON_PRIMARY_KEY_TABLE_EXCEPTION,
+                "Try to do prefix lookup on a non primary key table: " + DATA1_TABLE_PATH);
+    }
+
+    @Test
+    void testLimitScanPrimaryKeyTable() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        DATA1_TABLE_PATH_PK,
+                        withRowTtl(DATA1_TABLE_DESCRIPTOR_PK));
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        DefaultValueRecordBatch.Builder builder = DefaultValueRecordBatch.builder();
+
+        // first limit scan from empty table.
+        assertLimitScanResponse(
+                leaderGateWay.limitScan(newLimitScanRequest(tableId, 0, 1)).get(), builder.build());
+
+        // send one batch kv.
+        DefaultKvRecordBatch kvRecordBatch =
+                (DefaultKvRecordBatch) genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE);
+        assertPutKvResponse(
+                leaderGateWay.putKv(newPutKvRequest(tableId, 0, 1, kvRecordBatch)).get());
+        builder.append(DEFAULT_SCHEMA_ID, compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a1"}));
+        // second limit scan from table
+        assertLimitScanResponse(
+                leaderGateWay.limitScan(newLimitScanRequest(tableId, 0, 1)).get(), builder.build());
+        builder.append(DEFAULT_SCHEMA_ID, compactedRow(DATA1_ROW_TYPE, new Object[] {2, "b1"}));
+        assertLimitScanResponse(
+                leaderGateWay.limitScan(newLimitScanRequest(tableId, 0, 3)).get(), builder.build());
+    }
+
+    @Test
+    void testLimitScanLogTable() throws Exception {
+        long logTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket logTableBucket = new TableBucket(logTableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(logTableBucket);
+        int logLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(logTableBucket);
+        TabletServerGateway logLeaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(logLeader);
+        // send first batch.
+        assertProduceLogResponse(
+                logLeaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        logTableId, 0, 1, genMemoryLogRecordsByObject(DATA1)))
+                        .get(),
+                0,
+                0L);
+
+        // append new batch.
+        assertProduceLogResponse(
+                logLeaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        logTableId,
+                                        0,
+                                        1,
+                                        genMemoryLogRecordsByObject(ANOTHER_DATA1)))
+                        .get(),
+                0,
+                10L);
+
+        // fetch only second field, results contains from offset 10 ~ 20, even fetchOffset=15L
+        List<Object[]> expected2 = new ArrayList<>(ANOTHER_DATA1);
+
+        // limit log table scan will get the latest limit number of data.
+        assertLimitScanResponse(
+                logLeaderGateWay.limitScan(newLimitScanRequest(logTableId, 0, 10)).get(),
+                DATA1_ROW_TYPE,
+                TEST_SCHEMA_GETTER,
+                expected2);
+    }
+
+    @Test
+    void testRoutingBucketCountValidationAppliesToClientRequestsOnly() throws Exception {
+        // Routing validation only applies to hash-distributed tables: a keyless table may place a
+        // record in any bucket, so a stale count is harmless there (see
+        // ReplicaManager#validateRoutingBucketCount).
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        // a client whose bucket count doesn't match the actual one computed its bucketId from a
+        // count the server has confirmed to be stale.
+        assertThatThrownBy(
+                        () ->
+                                leaderGateWay
+                                        .listOffsets(
+                                                newListOffsetsRequestWithRoutingBucketCount(
+                                                        -1,
+                                                        ListOffsetsParam.LATEST_OFFSET_TYPE,
+                                                        tableId,
+                                                        0,
+                                                        999))
+                                        .get())
+                .cause()
+                .isInstanceOf(InvalidBucketRoutingException.class);
+
+        // the very same count coming from a follower is not validated: a follower's bucket ids come
+        // from NotifyLeaderAndIsr, so replication must not depend on the leader's metadata cache.
+        assertListOffsetsResponse(
+                leaderGateWay
+                        .listOffsets(
+                                newListOffsetsRequestWithRoutingBucketCount(
+                                        1, ListOffsetsParam.LATEST_OFFSET_TYPE, tableId, 0, 999))
+                        .get(),
+                0L,
+                Errors.NONE.code(),
+                null);
+
+        // Request-scoped validation resolves the target immediately, so an unknown table/bucket
+        // fails the whole RPC with the standard replica lookup exception.
+        assertThatThrownBy(
+                        () ->
+                                leaderGateWay
+                                        .listOffsets(
+                                                newListOffsetsRequestWithRoutingBucketCount(
+                                                        -1,
+                                                        ListOffsetsParam.LATEST_OFFSET_TYPE,
+                                                        10005L,
+                                                        0,
+                                                        3))
+                                        .get())
+                .cause()
+                .isInstanceOf(UnknownTableOrBucketException.class)
+                .hasMessageContaining("Unknown table or bucket");
+    }
+
+    private static ListOffsetsRequest newListOffsetsRequestWithRoutingBucketCount(
+            int followerServerId,
+            int offsetType,
+            long tableId,
+            int bucketId,
+            int routingBucketCount) {
+        return newListOffsetsRequest(followerServerId, offsetType, tableId, bucketId)
+                .setRoutingBucketCount(routingBucketCount);
+    }
+
+    @Test
+    void testInvalidRoutingBucketCountOnlyFailsTheOffendingBucket() throws Exception {
+        // 9 buckets over 3 tablet servers, so at least one server necessarily leads two of them
+        // and a single request can carry two buckets hosted by the same leader.
+        int bucketCount = 9;
+        TablePath tablePath = TablePath.of("test_db_1", "test_stale_routing_per_bucket");
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        tablePath,
+                        TableDescriptor.builder()
+                                .schema(DATA1_SCHEMA)
+                                // hash-distributed: routing validation is skipped for keyless
+                                // tables
+                                .distributedBy(bucketCount, "a")
+                                .build());
+
+        Map<Integer, List<Integer>> bucketsByLeader = new HashMap<>();
+        for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+            TableBucket tb = new TableBucket(tableId, bucketId);
+            FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+            bucketsByLeader
+                    .computeIfAbsent(
+                            FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb), k -> new ArrayList<>())
+                    .add(bucketId);
+        }
+        Map.Entry<Integer, List<Integer>> coLocated =
+                bucketsByLeader.entrySet().stream()
+                        .filter(entry -> entry.getValue().size() >= 2)
+                        .findFirst()
+                        .orElseThrow(
+                                () ->
+                                        new AssertionError(
+                                                "9 buckets over 3 servers must co-locate two leaders"));
+        int healthyBucket = coLocated.getValue().get(0);
+        int staleBucket = coLocated.getValue().get(1);
+
+        GetTableStatsRequest request = new GetTableStatsRequest().setTableId(tableId);
+        request.addBucketsReq().setBucketId(healthyBucket).setRoutingBucketCount(bucketCount);
+        request.addBucketsReq().setBucketId(staleBucket).setRoutingBucketCount(bucketCount + 1);
+
+        GetTableStatsResponse response =
+                FLUSS_CLUSTER_EXTENSION
+                        .newTabletServerClientForNode(coLocated.getKey())
+                        .getTableStats(request)
+                        .get();
+
+        assertThat(response.getBucketsRespsCount()).isEqualTo(2);
+        Map<Integer, PbTableStatsRespForBucket> respByBucket = new HashMap<>();
+        for (PbTableStatsRespForBucket bucketResp : response.getBucketsRespsList()) {
+            respByBucket.put(bucketResp.getBucketId(), bucketResp);
+        }
+
+        // the co-batched bucket whose routing is still valid is served as usual
+        assertThat(respByBucket.get(healthyBucket).hasErrorCode()).isFalse();
+        // Only the bucket routed by an invalid count is rejected without retrying the fixed route.
+        assertThat(respByBucket.get(staleBucket).getErrorCode())
+                .isEqualTo(Errors.INVALID_BUCKET_ROUTING.code());
+    }
+
+    @Test
+    void testListOffsets() throws Exception {
+        long tableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        // produce one batch to this bucket.
+        assertProduceLogResponse(
+                leaderGateWay
+                        .produceLog(
+                                newProduceLogRequest(
+                                        tableId, 0, 1, genMemoryLogRecordsByObject(DATA1)))
+                        .get(),
+                0,
+                0L);
+
+        // listOffset from client.
+        assertListOffsetsResponse(
+                leaderGateWay
+                        .listOffsets(
+                                newListOffsetsRequest(
+                                        -1, ListOffsetsParam.LATEST_OFFSET_TYPE, tableId, 0))
+                        .get(),
+                10L,
+                Errors.NONE.code(),
+                null);
+
+        // listOffset from tablet server where follower locate in.
+        assertListOffsetsResponse(
+                leaderGateWay
+                        .listOffsets(
+                                newListOffsetsRequest(
+                                        1, ListOffsetsParam.LATEST_OFFSET_TYPE, tableId, 0))
+                        .get(),
+                10L,
+                Errors.NONE.code(),
+                null);
+
+        // list an unknown table id.
+        assertListOffsetsResponse(
+                leaderGateWay
+                        .listOffsets(
+                                newListOffsetsRequest(
+                                        1, ListOffsetsParam.LATEST_OFFSET_TYPE, 10005L, 6))
+                        .get(),
+                null,
+                Errors.UNKNOWN_TABLE_OR_BUCKET_EXCEPTION.code(),
+                "Unknown table or bucket: TableBucket{tableId=10005, bucket=6}");
+    }
+
+    @Test
+    void testInitWriterId() throws Exception {
+        TabletServerGateway tabletServerGateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(0);
+        for (int i = 0; i < 100; i++) {
+            InitWriterResponse response =
+                    tabletServerGateway.initWriter(new InitWriterRequest()).get();
+            assertThat(response.getWriterId()).isEqualTo(i);
+        }
+
+        FLUSS_CLUSTER_EXTENSION.stopCoordinatorServer();
+        // start again.
+        FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
+
+        for (int i = 100; i < 200; i++) {
+            InitWriterResponse response =
+                    tabletServerGateway.initWriter(new InitWriterRequest()).get();
+            assertThat(response.getWriterId()).isEqualTo(i);
+        }
+    }
+
+    @Test
+    void testBecomeLeaderOrFollowerWithOneTabletServerOffline() throws Exception {
+        // If one tabletServer offline, and the leader of specify tableBucket is on this
+        // tabletServer, one bucket level error NotLeaderOrFollower exception will be thrown.
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        DATA1_TABLE_PATH,
+                        TableDescriptor.builder()
+                                .schema(DATA1_SCHEMA)
+                                .distributedBy(3)
+                                .property(ConfigOptions.TABLE_REPLICATION_FACTOR.key(), "3")
+                                .build());
+        TableBucket tb = new TableBucket(tableId, 0);
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        LeaderAndIsr originLeaderAndIsr = FLUSS_CLUSTER_EXTENSION.waitLeaderAndIsrReady(tb);
+        int leader = originLeaderAndIsr.leader();
+        int follower = getOneFollower(originLeaderAndIsr);
+        TabletServerGateway followerGateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(follower);
+
+        // 1. first send one NotifyLeaderAndIsr request with same LeaderAndIsr to mock the
+        // coordinator is offline and recovery to send NotifyLeaderAndIsr request with same
+        // leader but leader epoch plus 1.
+        NotifyLeaderAndIsrResponse notifyLeaderAndIsrResponse =
+                followerGateway
+                        .notifyLeaderAndIsr(
+                                makeNotifyLeaderAndIsrRequest(
+                                        DATA1_PHYSICAL_TABLE_PATH,
+                                        tb,
+                                        new LeaderAndIsr(
+                                                leader,
+                                                1,
+                                                originLeaderAndIsr.isr(),
+                                                originLeaderAndIsr.standbyReplicas(),
+                                                originLeaderAndIsr.coordinatorEpoch(),
+                                                originLeaderAndIsr.bucketEpoch())))
+                        .get();
+        List<NotifyLeaderAndIsrResultForBucket> result =
+                getNotifyLeaderAndIsrResponseData(notifyLeaderAndIsrResponse);
+        assertThat(result.size()).isEqualTo(1);
+        assertThat(result.get(0).getErrorCode()).isEqualTo(Errors.NONE.code());
+
+        // 2. send one UpdateMetadata request to followerGateway to mock the tabletServer where the
+        // leader resides is offline.
+        ServerInfo coordinatorServerInfo = FLUSS_CLUSTER_EXTENSION.getCoordinatorServerInfo();
+        Set<ServerInfo> newTabletServerInfos = new HashSet<>();
+        FLUSS_CLUSTER_EXTENSION
+                .getTabletServerInfos()
+                .forEach(
+                        serverNode -> {
+                            if (serverNode.id() != leader) {
+                                newTabletServerInfos.add(serverNode);
+                            }
+                        });
+        followerGateway
+                .updateMetadata(
+                        makeUpdateMetadataRequest(
+                                coordinatorServerInfo,
+                                null,
+                                newTabletServerInfos,
+                                Collections.emptyList(),
+                                Collections.emptyList()))
+                .get();
+
+        // 3. send one NotifyLeaderAndIsr request again with same LeaderAndIsr to mock the
+        // coordinator is offline and recovery again to send NotifyLeaderAndIsr request with
+        // same leader but leader epoch plus 1. Shouldn't throw any exception
+        notifyLeaderAndIsrResponse =
+                followerGateway
+                        .notifyLeaderAndIsr(
+                                makeNotifyLeaderAndIsrRequest(
+                                        DATA1_PHYSICAL_TABLE_PATH,
+                                        tb,
+                                        new LeaderAndIsr(
+                                                leader,
+                                                2,
+                                                originLeaderAndIsr.isr(),
+                                                originLeaderAndIsr.standbyReplicas(),
+                                                originLeaderAndIsr.coordinatorEpoch(),
+                                                originLeaderAndIsr.bucketEpoch())))
+                        .get();
+        result = getNotifyLeaderAndIsrResponseData(notifyLeaderAndIsrResponse);
+        assertThat(result.size()).isEqualTo(1);
+        assertThat(result.get(0).getError().error()).isEqualTo(Errors.NONE);
+    }
+
+    private static void assertPutKvResponse(PutKvResponse putKvResponse) {
+        assertThat(putKvResponse.getBucketsRespsCount()).isEqualTo(1);
+        PbPutKvRespForBucket putKvRespForBucket = putKvResponse.getBucketsRespsList().get(0);
+        assertThat(putKvRespForBucket.getBucketId()).isEqualTo(0);
+    }
+
+    private static void assertListOffsetsResponse(
+            ListOffsetsResponse listOffsetsResponse,
+            @Nullable Long offset,
+            Integer errorCode,
+            @Nullable String errorMessage) {
+        assertThat(listOffsetsResponse.getBucketsRespsCount()).isEqualTo(1);
+        PbListOffsetsRespForBucket respForBucket = listOffsetsResponse.getBucketsRespsList().get(0);
+        if (respForBucket.hasErrorCode()) {
+            assertThat(respForBucket.getErrorCode()).isEqualTo(errorCode);
+            assertThat(respForBucket.getErrorMessage()).contains(errorMessage);
+        } else {
+            assertThat(respForBucket.getOffset()).isEqualTo(offset);
+        }
+    }
+
+    private static void verifyLookupBucketError(
+            PbLookupRespForBucket lookupRespForBucket,
+            Errors expectedError,
+            String expectErrMessage) {
+        assertThat(lookupRespForBucket.hasErrorCode()).isTrue();
+        assertThat(lookupRespForBucket.getErrorCode()).isEqualTo(expectedError.code());
+        assertThat(lookupRespForBucket.getErrorMessage()).contains(expectErrMessage);
+    }
+
+    private static void verifyPrefixLookupBucketError(
+            PbPrefixLookupRespForBucket prefixLookupRespForBucket,
+            Errors expectedError,
+            String expectErrMessage) {
+        assertThat(prefixLookupRespForBucket.hasErrorCode()).isTrue();
+        assertThat(prefixLookupRespForBucket.getErrorCode()).isEqualTo(expectedError.code());
+        assertThat(prefixLookupRespForBucket.getErrorMessage()).contains(expectErrMessage);
+    }
+
+    private int getOneFollower(LeaderAndIsr leaderAndIsr) {
+        int leader = leaderAndIsr.leader();
+        for (int follower : leaderAndIsr.isr()) {
+            if (follower != leader) {
+                return follower;
+            }
+        }
+        throw new FlussRuntimeException("No follower found");
+    }
+
+    private NotifyLeaderAndIsrRequest makeNotifyLeaderAndIsrRequest(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            LeaderAndIsr leaderAndIsr) {
+        PbNotifyLeaderAndIsrReqForBucket reqForBucket =
+                makeNotifyBucketLeaderAndIsr(
+                        new NotifyLeaderAndIsrData(
+                                physicalTablePath,
+                                tableBucket,
+                                leaderAndIsr.isr(),
+                                leaderAndIsr,
+                                3,
+                                0L));
+        return ServerRpcMessageUtils.makeNotifyLeaderAndIsrRequest(
+                0, Collections.singletonList(reqForBucket));
+    }
+
+    @Test
+    void testLookupWithInsertIfNotExists() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway gateway = FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(DATA1_ROW_TYPE, new int[] {0});
+
+        byte[] key1 = keyEncoder.encodeKey(row(new Object[] {100}));
+        byte[] key2 = keyEncoder.encodeKey(row(new Object[] {200}));
+        byte[] key3 = keyEncoder.encodeKey(row(new Object[] {300}));
+
+        // Insert missing keys
+        PbLookupRespForBucket resp1 =
+                gateway.lookup(newLookupRequest(tableId, 0, true, 20000, 1, key1, key2))
+                        .get()
+                        .getBucketsRespAt(0);
+        assertThat(resp1.hasErrorCode()).isFalse();
+        byte[] value1 = resp1.getValuesList().get(0).getValues();
+        byte[] value2 = resp1.getValuesList().get(1).getValues();
+        assertThat(value1).isNotNull();
+        assertThat(value2).isNotNull();
+
+        // Existing keys return same values
+        PbLookupRespForBucket resp2 =
+                gateway.lookup(newLookupRequest(tableId, 0, true, 20000, 1, key1, key2))
+                        .get()
+                        .getBucketsRespAt(0);
+        assertThat(resp2.getValuesList().get(0).getValues()).isEqualTo(value1);
+        assertThat(resp2.getValuesList().get(1).getValues()).isEqualTo(value2);
+
+        // Mixed: key1 exists, key3 missing
+        PbLookupRespForBucket resp3 =
+                gateway.lookup(newLookupRequest(tableId, 0, true, 20000, 1, key1, key3))
+                        .get()
+                        .getBucketsRespAt(0);
+        assertThat(resp3.getValuesList().get(0).getValues()).isEqualTo(value1);
+        assertThat(resp3.getValuesList().get(1).getValues()).isNotNull();
+    }
+
+    @Test
+    void testLookupWithInsertIfNotExistsAutoIncrement() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "test_auto_increment_t1");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.BIGINT())
+                        .withComment("auto increment column")
+                        .column("c", DataTypes.STRING())
+                        .enableAutoIncrement("b")
+                        .primaryKey("a")
+                        .build();
+        RowType rowType = schema.getRowType();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(1, "a").build();
+        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, descriptor);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway gateway = FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(rowType, new int[] {0});
+        TestingSchemaGetter schemaGetter = new TestingSchemaGetter(DEFAULT_SCHEMA_ID, schema);
+        ValueDecoder valueDecoder =
+                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, KvValueLayout.PLAIN);
+
+        byte[] key1 = keyEncoder.encodeKey(row(new Object[] {100}));
+        byte[] key2 = keyEncoder.encodeKey(row(new Object[] {200}));
+        byte[] key3 = keyEncoder.encodeKey(row(new Object[] {300}));
+
+        // Insert key1, key2 - auto-increment: 1, 2
+        PbLookupRespForBucket resp1 =
+                gateway.lookup(newLookupRequest(tableId, 0, true, 20000, 1, key1, key2))
+                        .get()
+                        .getBucketsRespAt(0);
+        assertThat(resp1.hasErrorCode()).isFalse();
+        InternalRow row1 = valueDecoder.decodeValue(resp1.getValuesList().get(0).getValues()).row;
+        InternalRow row2 = valueDecoder.decodeValue(resp1.getValuesList().get(1).getValues()).row;
+        assertThat(row1.getLong(1)).isEqualTo(1L);
+        assertThat(row2.getLong(1)).isEqualTo(2L);
+
+        // Mixed: key1 exists (unchanged), key3 missing (gets 3)
+        PbLookupRespForBucket resp2 =
+                gateway.lookup(newLookupRequest(tableId, 0, true, 20000, 1, key1, key3))
+                        .get()
+                        .getBucketsRespAt(0);
+        InternalRow existingRow =
+                valueDecoder.decodeValue(resp2.getValuesList().get(0).getValues()).row;
+        InternalRow newRow = valueDecoder.decodeValue(resp2.getValuesList().get(1).getValues()).row;
+        assertThat(existingRow.getLong(1)).isEqualTo(1L);
+        assertThat(newRow.getLong(1)).isEqualTo(3L);
+    }
+
+    @Test
+    void testScanKv_newScan_happyPath() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION,
+                        DATA1_TABLE_PATH_PK,
+                        withRowTtl(DATA1_TABLE_DESCRIPTOR_PK));
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        ScanKvResponse response =
+                leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1024 * 1024)).get();
+
+        assertThat(response.hasErrorCode()).isFalse();
+        assertThat(response.getScannerId()).isNotEmpty();
+        assertThat(response.isHasMoreResults()).isFalse();
+        assertThat(response.hasLogOffset()).isTrue();
+        assertThat(response.getLogOffset()).isGreaterThanOrEqualTo(0L);
+        assertThat(response.hasRecords()).isTrue();
+        DefaultValueRecordBatch batch = DefaultValueRecordBatch.pointToBytes(response.getRecords());
+        DefaultValueRecordBatch.Builder expected = DefaultValueRecordBatch.builder();
+        expected.append(DEFAULT_SCHEMA_ID, compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a1"}));
+        expected.append(DEFAULT_SCHEMA_ID, compactedRow(DATA1_ROW_TYPE, new Object[] {2, "b1"}));
+        assertThat(batch).isEqualTo(expected.build());
+    }
+
+    @Test
+    void testScanKv_multiBatchContinuation() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        // batch_size_bytes=1 forces one record per batch via the appendedAny progress guard.
+        ScanKvResponse first = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        assertThat(first.hasErrorCode()).isFalse();
+        byte[] scannerId = first.getScannerId();
+        long firstLogOffset = first.getLogOffset();
+        int totalRecords =
+                DefaultValueRecordBatch.pointToBytes(first.getRecords()).getRecordCount();
+
+        ScanKvResponse current = first;
+        int seq = 1;
+        while (current.isHasMoreResults()) {
+            current =
+                    leaderGateWay
+                            .scanKv(newScanKvContinueRequest(scannerId, seq++, /*batch=*/ 1))
+                            .get();
+            assertThat(current.hasErrorCode()).isFalse();
+            assertThat(current.getScannerId()).isEqualTo(scannerId);
+            // log_offset is carried only on the open response.
+            assertThat(current.hasLogOffset()).isFalse();
+            if (current.hasRecords()) {
+                totalRecords +=
+                        DefaultValueRecordBatch.pointToBytes(current.getRecords()).getRecordCount();
+            }
+        }
+        assertThat(totalRecords).isEqualTo(2);
+        // After draining, the session is auto-closed.
+        ScanKvResponse afterDrain =
+                leaderGateWay.scanKv(newScanKvContinueRequest(scannerId, seq, 1024)).get();
+        assertThat(afterDrain.getErrorCode()).isEqualTo(Errors.UNKNOWN_SCANNER_ID.code());
+        assertThat(firstLogOffset).isGreaterThanOrEqualTo(0L);
+    }
+
+    @Test
+    void testScanKv_explicitClose() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        // Tiny batch keeps the session open after the first response.
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        assertThat(open.hasErrorCode()).isFalse();
+        assertThat(open.isHasMoreResults()).isTrue();
+        byte[] scannerId = open.getScannerId();
+
+        ScanKvResponse close = leaderGateWay.scanKv(newScanKvCloseRequest(scannerId)).get();
+        assertThat(close.hasErrorCode()).isFalse();
+        assertThat(close.getScannerId()).isEqualTo(scannerId);
+        assertThat(close.isHasMoreResults()).isFalse();
+        assertThat(close.hasRecords()).isFalse();
+    }
+
+    @Test
+    void testScanKv_closeOnAlreadyGoneScannerIsNoOp() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        byte[] scannerId = open.getScannerId();
+
+        leaderGateWay.scanKv(newScanKvCloseRequest(scannerId)).get();
+
+        // Second close on the already-gone session must be a benign no-op.
+        ScanKvResponse second = leaderGateWay.scanKv(newScanKvCloseRequest(scannerId)).get();
+        assertThat(second.hasErrorCode()).isFalse();
+        assertThat(second.getScannerId()).isEqualTo(scannerId);
+        assertThat(second.isHasMoreResults()).isFalse();
+    }
+
+    @Test
+    void testScanKv_unknownScannerId() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        byte[] fakeId = "not-a-real-scanner-id".getBytes();
+        ScanKvResponse response =
+                leaderGateWay.scanKv(newScanKvContinueRequest(fakeId, 0, 1024)).get();
+        assertThat(response.getErrorCode()).isEqualTo(Errors.UNKNOWN_SCANNER_ID.code());
+        assertThat(response.getErrorMessage()).contains("Unknown scanner ID");
+    }
+
+    @Test
+    void testScanKv_expiredOnRecentlyEvicted() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        assertThat(open.hasErrorCode()).isFalse();
+        assertThat(open.isHasMoreResults()).isTrue();
+        byte[] scannerId = open.getScannerId();
+
+        // stopReplica(delete=false) routes through closeScannersForBucket, which records
+        // the id in recentlyExpiredIds.
+        LeaderAndIsr la = FLUSS_CLUSTER_EXTENSION.waitLeaderAndIsrReady(tb);
+        stopReplicaWithLatestEpoch(leaderGateWay, tb, la);
+
+        ScanKvResponse cont =
+                leaderGateWay.scanKv(newScanKvContinueRequest(scannerId, 0, 1024)).get();
+        assertThat(cont.getErrorCode()).isEqualTo(Errors.SCANNER_EXPIRED.code());
+        assertThat(cont.getErrorMessage()).contains("expired");
+    }
+
+    @Test
+    void testScanKv_leadershipFlipMidScan() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        assertThat(open.hasErrorCode()).isFalse();
+        assertThat(open.isHasMoreResults()).isTrue();
+        byte[] scannerId = open.getScannerId();
+
+        LeaderAndIsr la = FLUSS_CLUSTER_EXTENSION.waitLeaderAndIsrReady(tb);
+        stopReplicaWithLatestEpoch(leaderGateWay, tb, la);
+
+        ScanKvResponse cont =
+                leaderGateWay.scanKv(newScanKvContinueRequest(scannerId, 0, 1024)).get();
+        assertThat(cont.getErrorCode())
+                .isIn(Errors.SCANNER_EXPIRED.code(), Errors.NOT_LEADER_OR_FOLLOWER.code());
+    }
+
+    @Test
+    void testScanKv_callSeqIdMismatch() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        byte[] scannerId = open.getScannerId();
+
+        ScanKvResponse bad =
+                leaderGateWay.scanKv(newScanKvContinueRequest(scannerId, 5, 1024)).get();
+        assertThat(bad.getErrorCode()).isEqualTo(Errors.INVALID_SCAN_REQUEST.code());
+        assertThat(bad.getErrorMessage()).contains("Out-of-order");
+    }
+
+    @Test
+    void testScanKv_missingCallSeqIdIsRejected() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        // Open request without call_seq_id should be rejected.
+        ScanKvRequest openWithoutSeqId = new ScanKvRequest();
+        openWithoutSeqId.setBucketScanReq().setTableId(tableId).setBucketId(0);
+        openWithoutSeqId.setBatchSizeBytes(1024);
+        ScanKvResponse openResp = leaderGateWay.scanKv(openWithoutSeqId).get();
+        assertThat(openResp.getErrorCode()).isEqualTo(Errors.INVALID_SCAN_REQUEST.code());
+        assertThat(openResp.getErrorMessage()).contains("call_seq_id is required");
+
+        // Continuation request without call_seq_id should also be rejected.
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        assertThat(open.hasErrorCode()).isFalse();
+        byte[] scannerId = open.getScannerId();
+
+        ScanKvRequest contWithoutSeqId = new ScanKvRequest();
+        contWithoutSeqId.setScannerId(scannerId);
+        contWithoutSeqId.setBatchSizeBytes(1024);
+        ScanKvResponse contResp = leaderGateWay.scanKv(contWithoutSeqId).get();
+        assertThat(contResp.getErrorCode()).isEqualTo(Errors.INVALID_SCAN_REQUEST.code());
+        assertThat(contResp.getErrorMessage()).contains("call_seq_id is required");
+    }
+
+    @Test
+    void testScanKv_oversizeBatchSizeBytesIsClamped() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        ScanKvResponse response =
+                leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, Integer.MAX_VALUE)).get();
+        assertThat(response.hasErrorCode()).isFalse();
+        assertThat(response.hasRecords()).isTrue();
+        assertThat(DefaultValueRecordBatch.pointToBytes(response.getRecords()).getRecordCount())
+                .isEqualTo(2);
+    }
+
+    @Test
+    void testScanKv_bucketScanReqAndScannerIdRejected() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        ScanKvRequest bad = new ScanKvRequest();
+        bad.setBucketScanReq().setTableId(tableId).setBucketId(0);
+        bad.setScannerId("ambiguous".getBytes());
+        bad.setBatchSizeBytes(1024);
+        ScanKvResponse response = leaderGateWay.scanKv(bad).get();
+        assertThat(response.getErrorCode()).isEqualTo(Errors.INVALID_SCAN_REQUEST.code());
+        assertThat(response.getErrorMessage())
+                .contains("must not set both bucket_scan_req and scanner_id");
+    }
+
+    private static ScanKvRequest newScanKvOpenRequest(long tableId, int bucketId, int batchSize) {
+        ScanKvRequest req = new ScanKvRequest();
+        req.setBucketScanReq().setTableId(tableId).setBucketId(bucketId);
+        req.setBatchSizeBytes(batchSize);
+        req.setCallSeqId(0);
+        return req;
+    }
+
+    private static TableDescriptor withRowTtl(TableDescriptor descriptor) {
+        Map<String, String> properties = new HashMap<>(descriptor.getProperties());
+        properties.put(ConfigOptions.TABLE_KV_TTL.key(), "1 h");
+        return descriptor.withProperties(properties);
+    }
+
+    private static ScanKvRequest newScanKvContinueRequest(
+            byte[] scannerId, int callSeqId, int batchSize) {
+        ScanKvRequest req = new ScanKvRequest();
+        req.setScannerId(scannerId);
+        req.setCallSeqId(callSeqId);
+        req.setBatchSizeBytes(batchSize);
+        return req;
+    }
+
+    private static ScanKvRequest newScanKvCloseRequest(byte[] scannerId) {
+        ScanKvRequest req = new ScanKvRequest();
+        req.setScannerId(scannerId);
+        req.setCloseScanner(true);
+        return req;
+    }
+
+    /** Sends stopReplica using the current coordinator epoch (vs. the helper's hardcoded 0). */
+    private static void stopReplicaWithLatestEpoch(
+            TabletServerGateway leaderGateWay, TableBucket tb, LeaderAndIsr la) throws Exception {
+        leaderGateWay
+                .stopReplica(
+                        new StopReplicaRequest()
+                                .setCoordinatorEpoch(la.coordinatorEpoch())
+                                .addAllStopReplicasReqs(
+                                        Collections.singleton(
+                                                makeStopBucketReplica(
+                                                        tb, false, false, la.leaderEpoch()))))
+                .get();
+    }
+}

@@ -1,0 +1,976 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.log.remote;
+
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.remote.RemoteLogFetchInfo;
+import org.apache.fluss.remote.RemoteLogManifest;
+import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
+import org.apache.fluss.rpc.protocol.ApiError;
+import org.apache.fluss.rpc.protocol.FetchLogReadPreference;
+import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
+import org.apache.fluss.server.entity.FetchReqInfo;
+import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.entity.StopReplicaData;
+import org.apache.fluss.server.entity.StopReplicaResultForBucket;
+import org.apache.fluss.server.log.FetchParams;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.testutils.ServerTestTags;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.io.File;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
+import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PA_2024;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
+import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_BUCKET_EPOCH;
+import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
+import static org.apache.fluss.utils.FlussPaths.remoteLogDir;
+import static org.apache.fluss.utils.FlussPaths.remoteLogTabletDir;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Test for {@link RemoteLogManager}. */
+class RemoteLogManagerTest extends RemoteLogTestBase {
+
+    @BeforeEach
+    public void setup() throws Exception {
+        super.setup();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testBecomeLeaderWithoutRemoteLogManifest(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        assertThatThrownBy(() -> remoteLogManager.relevantRemoteLogSegments(tb, 0L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("RemoteLogTablet can't be found for table-bucket " + tb);
+
+        // make leader, and then remote log tablet should be created.
+        makeLogTableAsLeader(tb, partitionTable);
+        RemoteLogTablet remoteLogTablet = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLogTablet).isNotNull();
+        assertThat(remoteLogTablet.allRemoteLogSegments()).isEmpty();
+        assertThat(remoteLogTablet.getRemoteLogStartOffset()).isEqualTo(Long.MAX_VALUE);
+        assertThat(remoteLogTablet.getRemoteLogEndOffset()).isNotPresent();
+
+        // verify upload log segment to remote.
+        addMultiSegmentsToLogTablet(replicaManager.getReplicaOrException(tb).getLogTablet(), 5);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        // should upload 4 segments to remote, only 1 active segment left
+        assertThat(remoteLogSegmentList.size()).isEqualTo(4);
+        assertThat(remoteLogManager.lookupPositionForOffset(remoteLogSegmentList.get(0), 2L))
+                .isGreaterThan(10);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testBecomeLeaderWithRemoteLogLogManifest(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        addMultiSegmentsToLogTablet(replicaManager.getReplicaOrException(tb).getLogTablet(), 5);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList.size()).isEqualTo(4);
+        assertThat(remoteLogManager.lookupPositionForOffset(remoteLogSegmentList.get(0), 2L))
+                .isGreaterThan(10);
+        // check remote storage has the files
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegmentList.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+
+        // rebuild a remote log manager.
+        replicaManager.shutdown();
+        replicaManager = buildReplicaManager(new TestCoordinatorGateway());
+        makeLogTableAsLeader(tb, partitionTable);
+        // trigger reload remote log metadata from remote snapshot.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        remoteLogSegmentList = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList.size()).isEqualTo(4);
+        assertThat(remoteLogManager.lookupPositionForOffset(remoteLogSegmentList.get(0), 2L))
+                .isGreaterThan(10);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCopyAndExpireLogSegmentsSuccess(boolean partitionTable) throws Exception {
+        long ts1 = manualClock.milliseconds();
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5, false);
+
+        // should upload 4 segments to remote, only 1 active segment left
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLog.allRemoteLogSegments())
+                .hasSize(4)
+                .allSatisfy(s -> assertThat(s.maxTimestamp()).isEqualTo(ts1));
+
+        // write 4 segments after 4 days
+        manualClock.advanceTime(Duration.ofDays(4));
+        long ts2 = manualClock.milliseconds();
+        addMultiSegmentsToLogTablet(logTablet, 4, false);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        assertThat(remoteLog.allRemoteLogSegments())
+                .hasSize(8)
+                .filteredOn(s -> ts1 == s.maxTimestamp())
+                .hasSize(5);
+        assertThat(remoteLog.allRemoteLogSegments())
+                .filteredOn(s -> ts2 == s.maxTimestamp())
+                .hasSize(3);
+
+        // should clean up beginning 5 segments after 4+4 days (ttl=7days)
+        manualClock.advanceTime(Duration.ofDays(4));
+        addMultiSegmentsToLogTablet(logTablet, 1, false);
+
+        // trigger to upload and clean up
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        assertThat(remoteLog.allRemoteLogSegments())
+                .hasSize(4)
+                .filteredOn(s -> ts1 == s.maxTimestamp())
+                .hasSize(0);
+        assertThat(remoteLog.allRemoteLogSegments())
+                .filteredOn(s -> ts2 == s.maxTimestamp())
+                .hasSize(4);
+        // check remote storage has the files
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLog.allRemoteLogSegments().stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCommitCopyLogSegmentsToRemoteFailed1(boolean partitionTable) throws Exception {
+        // make commit remote log manifest fail by failed to upload remote log manifest
+        remoteLogStorage.writeManifestFail.set(true);
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        addMultiSegmentsToLogTablet(replicaManager.getReplicaOrException(tb).getLogTablet(), 5);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        // no remote log segment should be committed.
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList).isEmpty();
+        // log storage should clean up the temporary data
+        assertThat(listRemoteLogFiles(tb)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCommitCopyLogSegmentsToRemoteFailed2(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        addMultiSegmentsToLogTablet(replicaManager.getReplicaOrException(tb).getLogTablet(), 5);
+
+        // make commit remote log manifest fail by failed to commit remote log manifest
+        testCoordinatorGateway.commitRemoteLogManifestFail.set(true);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        // no remote log segment should be committed.
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList).isEmpty();
+        // log storage should clean up the temporary data
+        assertThat(listRemoteLogFiles(tb)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCommitDeleteLogSegmentsFromRemoteFailed1(boolean partitionTable) throws Exception {
+        long ts1 = manualClock.milliseconds();
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5, false);
+
+        // should upload 4 segments to remote, only 1 active segment left
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        List<RemoteLogSegment> remoteLogSegments = remoteLog.allRemoteLogSegments();
+        assertThat(remoteLogSegments)
+                .hasSize(4)
+                .allSatisfy(s -> assertThat(s.maxTimestamp()).isEqualTo(ts1));
+        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(40L);
+        // check remote storage has the files
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegments.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+
+        // all upload segments should be deleted after commit.
+        manualClock.advanceTime(Duration.ofDays(8));
+        // make write manifest fail
+        remoteLogStorage.writeManifestFail.set(true);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        assertThat(remoteLog.allRemoteLogSegments()).isEqualTo(remoteLogSegments);
+        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(40L);
+        // remote storage should not delete files
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegments.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCommitDeleteLogSegmentsFromRemoteFailed2(boolean partitionTable) throws Exception {
+        long ts1 = manualClock.milliseconds();
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5, false);
+
+        // should upload 4 segments to remote, only 1 active segment left
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        List<RemoteLogSegment> remoteLogSegments = remoteLog.allRemoteLogSegments();
+        assertThat(remoteLogSegments)
+                .hasSize(4)
+                .allSatisfy(s -> assertThat(s.maxTimestamp()).isEqualTo(ts1));
+        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(40L);
+        // check remote storage has the files
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegments.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+
+        // all upload segments should be deleted after commit.
+        manualClock.advanceTime(Duration.ofDays(8));
+        // mock commit fail by making CommitRemoteLogManifestRequest failed.
+        testCoordinatorGateway.commitRemoteLogManifestFail.set(true);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        assertThat(remoteLog.allRemoteLogSegments()).isEqualTo(remoteLogSegments);
+        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(40L);
+        // remote storage should not delete files
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegments.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+    }
+
+    @Test
+    void testFetchRemainsAvailableWhenRemoteOffsetsAdvance() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tableBucket, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tableBucket).getLogTablet();
+
+        // Local segments are [0, 10), [10, 20), [20, 30), [30, 40), and [40, 50).
+        addMultiSegmentsToLogTablet(logTablet, 5);
+
+        List<RemoteLogSegment> remoteSegments = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            remoteSegments.add(copyLogSegmentToRemote(logTablet, remoteLogStorage, i));
+        }
+        RemoteLogTablet remoteLogTablet = remoteLogManager.remoteLogTablet(tableBucket);
+        remoteLogTablet.loadRemoteLogManifest(
+                new RemoteLogManifest(
+                        logTablet.getPhysicalTablePath(),
+                        tableBucket,
+                        remoteSegments.subList(0, 2),
+                        40L));
+
+        // An older manifest is readable only up to 20 even though copying has advanced to 40.
+        // Cleanup must remain bounded by the readable end, leaving offset 25 available locally.
+        logTablet.updateRemoteLogOffsets(0L, 20L, 40L);
+        assertThat(logTablet.localLogStartOffset()).isEqualTo(20L);
+
+        FetchLogResultForBucket localResult = fetch(tableBucket, 25L);
+        assertThat(localResult.getError()).isEqualTo(ApiError.NONE);
+        assertThat(localResult.fetchFromRemote()).isFalse();
+
+        remoteLogTablet.loadRemoteLogManifest(
+                new RemoteLogManifest(
+                        logTablet.getPhysicalTablePath(), tableBucket, remoteSegments, 40L));
+        logTablet.updateRemoteLogOffsets(0L, 40L, 40L);
+        assertThat(logTablet.localLogStartOffset()).isEqualTo(30L);
+        assertThat(logTablet.canFetchFromRemoteLog(25L)).isTrue();
+
+        FetchLogResultForBucket remoteResult = fetch(tableBucket, 25L);
+        assertThat(remoteResult.getError()).isEqualTo(ApiError.NONE);
+        assertThat(remoteResult.fetchFromRemote()).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testFetchRecordsFromRemote(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList.size()).isEqualTo(4);
+        assertThat(remoteLogManager.lookupPositionForOffset(remoteLogSegmentList.get(0), 2L))
+                .isGreaterThan(10);
+
+        // 1. first, fetch records from remote.
+        // mock to update remote log end offset and delete local log segments.
+        logTablet.updateRemoteLogOffsets(0L, 40L, 40L);
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> future =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 0L, 1024 * 1024)),
+                null,
+                future::complete);
+        Map<TableBucket, FetchLogResultForBucket> result = future.get();
+        assertThat(result.size()).isEqualTo(1);
+        FetchLogResultForBucket resultForBucket = result.get(tb);
+        assertThat(resultForBucket.getError()).isEqualTo(ApiError.NONE);
+        assertThat(resultForBucket.getTableBucket()).isEqualTo(tb);
+        assertThat(resultForBucket.fetchFromRemote()).isTrue();
+        assertThat(resultForBucket.records()).isNull();
+        assertThat(resultForBucket.getHighWatermark()).isEqualTo(50L);
+
+        RemoteLogFetchInfo remoteLogFetchInfo = resultForBucket.remoteLogFetchInfo();
+        assertThat(remoteLogFetchInfo).isNotNull();
+        assertThat(remoteLogFetchInfo.remoteLogSegmentList().size()).isEqualTo(4);
+
+        // 2. then, fetch records from active segments, result rhe local records in server.
+        future = new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 47, 1024 * 1024)),
+                null,
+                future::complete);
+        result = future.get();
+        assertThat(result.size()).isEqualTo(1);
+        resultForBucket = result.get(tb);
+        assertThat(resultForBucket.getTableBucket()).isEqualTo(tb);
+        assertThat(resultForBucket.getHighWatermark()).isEqualTo(50L);
+        assertThat(resultForBucket.records()).isNotNull();
+        assertThat(resultForBucket.fetchFromRemote()).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testRemoteFirstFetchPrefersRemoteWhenLocalStillHasRecords(boolean partitionTable)
+            throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        logTablet.updateRemoteLogOffsets(0L, 40L, 40L);
+
+        Map<TableBucket, FetchReqInfo> fetchData =
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 35L, 1024 * 1024));
+
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> localFirstFuture =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                fetchData,
+                null,
+                localFirstFuture::complete);
+        FetchLogResultForBucket localFirstResult = localFirstFuture.get().get(tb);
+        assertThat(localFirstResult.getError()).isEqualTo(ApiError.NONE);
+        assertThat(localFirstResult.fetchFromRemote()).isFalse();
+        assertThat(localFirstResult.records()).isNotNull();
+
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> remoteFirstFuture =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(
+                        -1,
+                        true,
+                        Integer.MAX_VALUE,
+                        -1,
+                        -1,
+                        null,
+                        FetchLogReadPreference.REMOTE_FIRST),
+                fetchData,
+                null,
+                remoteFirstFuture::complete);
+        FetchLogResultForBucket remoteFirstResult = remoteFirstFuture.get().get(tb);
+        assertThat(remoteFirstResult.getError()).isEqualTo(ApiError.NONE);
+        assertThat(remoteFirstResult.fetchFromRemote()).isTrue();
+        assertThat(remoteFirstResult.records()).isNull();
+        assertThat(remoteFirstResult.remoteLogFetchInfo()).isNotNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testRemoteFirstFetchRejectsNonLeader(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        makeLogTableAsLeader(tb, partitionTable);
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        LogTablet logTablet = replica.getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        logTablet.updateRemoteLogOffsets(0L, 40L, 40L);
+
+        int newLeaderId = TABLET_SERVER_ID + 1;
+        replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        partitionTable
+                                ? DATA1_PHYSICAL_TABLE_PATH_PA_2024
+                                : DATA1_PHYSICAL_TABLE_PATH,
+                        tb,
+                        Arrays.asList(TABLET_SERVER_ID, newLeaderId),
+                        new LeaderAndIsr(
+                                newLeaderId,
+                                INITIAL_LEADER_EPOCH + 1,
+                                Arrays.asList(TABLET_SERVER_ID, newLeaderId),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                INITIAL_BUCKET_EPOCH + 1),
+                        3,
+                        0L));
+
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> fetchFuture =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(
+                        -1,
+                        true,
+                        Integer.MAX_VALUE,
+                        -1,
+                        -1,
+                        null,
+                        FetchLogReadPreference.REMOTE_FIRST),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 35L, 1024 * 1024)),
+                null,
+                fetchFuture::complete);
+
+        FetchLogResultForBucket result = fetchFuture.get().get(tb);
+        assertThat(result.getError().exception()).isInstanceOf(NotLeaderOrFollowerException.class);
+        assertThat(result.fetchFromRemote()).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCleanupLocalSegments(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeKvTableAsLeader(tb, DATA1_TABLE_PATH_PK, INITIAL_LEADER_EPOCH, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+
+        // 2. generate 5 segments and trigger upload 4 to remote storage
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLog.allRemoteLogSegments()).hasSize(4);
+
+        // 3. mock to update remote end offset, shouldn't cleanup local segments
+        logTablet.updateRemoteLogOffsets(0L, 40L, 40L);
+        assertThat(logTablet.getSegments()).hasSize(5);
+
+        // 4. mock to update min retain, should remove the first 3 segments (end offset < 33)
+        logTablet.updateMinRetainOffset(33);
+        assertThat(logTablet.getSegments()).hasSize(2);
+
+        // 5. should fetch from remote, because local doesn't have the data
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> future =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 0L, 1024 * 1024)),
+                null,
+                future::complete);
+        Map<TableBucket, FetchLogResultForBucket> result = future.get();
+        assertThat(result.size()).isEqualTo(1);
+        FetchLogResultForBucket resultForBucket = result.get(tb);
+        assertThat(resultForBucket.getError()).isEqualTo(ApiError.NONE);
+        assertThat(resultForBucket.getTableBucket()).isEqualTo(tb);
+        assertThat(resultForBucket.fetchFromRemote()).isTrue();
+        assertThat(resultForBucket.records()).isNull();
+        assertThat(resultForBucket.getHighWatermark()).isEqualTo(50L);
+
+        RemoteLogFetchInfo remoteLogFetchInfo = resultForBucket.remoteLogFetchInfo();
+        assertThat(remoteLogFetchInfo).isNotNull();
+        assertThat(remoteLogFetchInfo.remoteLogSegmentList().size()).isEqualTo(4);
+
+        // 6. then, fetch records from active segments, result rhe local records in server.
+        future = new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 35, 1024 * 1024)),
+                null,
+                future::complete);
+        result = future.get();
+        assertThat(result.size()).isEqualTo(1);
+        resultForBucket = result.get(tb);
+        assertThat(resultForBucket.getTableBucket()).isEqualTo(tb);
+        assertThat(resultForBucket.getHighWatermark()).isEqualTo(50L);
+        assertThat(resultForBucket.records()).isNotNull();
+        assertThat(resultForBucket.fetchFromRemote()).isFalse();
+
+        // 7. mock to update min retain to be same to remote end offset,
+        //  although 4 segments has been updated to remote, should still retain 2 segments in local
+        // since 2(by default) segments is configured to retain in local
+        logTablet.updateMinRetainOffset(40L);
+        assertThat(logTablet.getSegments()).hasSize(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testConfigureTieredLogLocalSegments(boolean partitionedTable) throws Exception {
+        int tieredLogLocalSegments = 8;
+        long tableId =
+                registerTableInZkClient(
+                        DATA1_TABLE_PATH,
+                        DATA1_SCHEMA,
+                        200L,
+                        Collections.emptyList(),
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key(),
+                                String.valueOf(tieredLogLocalSegments)));
+        TableBucket tb = makeTableBucket(tableId, partitionedTable);
+
+        // make leader, and then remote log tablet should be created.
+        makeLogTableAsLeader(tb, partitionedTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        // verify upload log segment to remote.
+        addMultiSegmentsToLogTablet(replicaManager.getReplicaOrException(tb).getLogTablet(), 10);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        // should upload 9 segments except for one active segment to remote
+        assertThat(remoteLogSegmentList).hasSize(9);
+        //  should still retain 8 segments since 8 segments is configured to retain in local
+        assertThat(logTablet.getSegments()).hasSize(tieredLogLocalSegments);
+
+        // fetch from offset 20 should be from local
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> future =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 20L, 1024 * 1024)),
+                null,
+                future::complete);
+        Map<TableBucket, FetchLogResultForBucket> result = future.get();
+        assertThat(result.get(tb).fetchFromRemote()).isFalse();
+        assertThat(result.get(tb).records()).isNotNull();
+
+        // fetch from offset 0, should be from remote
+        future = new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(tb, new FetchReqInfo(tb.getTableId(), 0, 1024 * 1024)),
+                null,
+                future::complete);
+        result = future.get();
+        assertThat(result.get(tb).fetchFromRemote()).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testStopReplica(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        LogTablet logTablet = replica.getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList.size()).isEqualTo(4);
+        assertThat(remoteLogManager.lookupPositionForOffset(remoteLogSegmentList.get(0), 2L))
+                .isGreaterThan(10);
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegmentList.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+
+        // test stop replica and delete.
+        remoteLogManager.stopReplica(replica, true);
+        assertThatThrownBy(() -> remoteLogManager.relevantRemoteLogSegments(tb, 0L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("RemoteLogTablet can't be found for table-bucket " + tb);
+        FsPath logTabletDir =
+                remoteLogTabletDir(
+                        remoteLogDir(conf),
+                        partitionTable
+                                ? DATA1_PHYSICAL_TABLE_PATH_PA_2024
+                                : DATA1_PHYSICAL_TABLE_PATH,
+                        tb);
+        assertThat(logTabletDir.getFileSystem().exists(logTabletDir)).isFalse();
+    }
+
+    @ParameterizedTest
+    @MethodSource("stopArgs")
+    void testStopReplicaDeleteRemoteLog(boolean partitionTable, boolean deleteRemote)
+            throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        List<RemoteLogSegment> remoteLogSegmentList =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteLogSegmentList.size()).isEqualTo(4);
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        remoteLogSegmentList.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+        assertThat(remoteLogManager.getTaskWithFuture(tb)).isNotNull();
+
+        FsPath remoteLogTabletDir =
+                remoteLogTabletDir(
+                        remoteLogDir(conf),
+                        partitionTable
+                                ? DATA1_PHYSICAL_TABLE_PATH_PA_2024
+                                : DATA1_PHYSICAL_TABLE_PATH,
+                        tb);
+        assertThat(remoteLogTabletDir.getFileSystem().exists(remoteLogTabletDir)).isTrue();
+        assertThat(logTablet.getLogDir().exists()).isTrue();
+
+        // stop with delete = false, deleteRemote =false, local and remote log should be kept,
+        // remote log task will be removed.
+        CompletableFuture<List<StopReplicaResultForBucket>> future1 = new CompletableFuture<>();
+        replicaManager.stopReplicas(
+                0,
+                Collections.singletonList(new StopReplicaData(tb, false, false, 0, 0)),
+                future1::complete);
+        assertThat(future1.get()).containsOnly(new StopReplicaResultForBucket(tb));
+        ReplicaManager.HostedReplica hostedReplica = replicaManager.getReplica(tb);
+        assertThat(hostedReplica).isInstanceOf(ReplicaManager.OnlineReplica.class);
+        assertThat(remoteLogTabletDir.getFileSystem().exists(remoteLogTabletDir)).isTrue();
+        assertThat(remoteLogManager.getTaskWithFuture(tb)).isNull();
+
+        CompletableFuture<List<StopReplicaResultForBucket>> future2 = new CompletableFuture<>();
+        replicaManager.stopReplicas(
+                0,
+                Collections.singletonList(new StopReplicaData(tb, true, deleteRemote, 0, 0)),
+                future2::complete);
+        assertThat(future2.get()).containsOnly(new StopReplicaResultForBucket(tb));
+        hostedReplica = replicaManager.getReplica(tb);
+        assertThat(hostedReplica).isInstanceOf(ReplicaManager.NoneReplica.class);
+        assertThat(logTablet.getLogDir().exists()).isFalse();
+        if (!deleteRemote) {
+            // stop with delete = true, deleteRemote =false, local log should be deleted, remote log
+            // should be kept.
+            assertThat(remoteLogTabletDir.getFileSystem().exists(remoteLogTabletDir)).isTrue();
+        } else {
+            // stop with delete = true, deleteRemote =true, local and remote log should be deleted
+            assertThat(remoteLogTabletDir.getFileSystem().exists(remoteLogTabletDir)).isFalse();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testLookupOffsetForTimestamp(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        long startTimestamp = manualClock.milliseconds();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        // trigger RLMTask copy local log segment to remote and update metadata.
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLog.allRemoteLogSegments()).hasSize(4);
+
+        assertThat(remoteLogManager.lookupOffsetForTimestamp(tb, startTimestamp)).isEqualTo(0L);
+        remoteLogManager
+                .relevantRemoteLogSegments(tb, 0L)
+                .forEach(
+                        remoteLogSegment ->
+                                assertThat(
+                                                remoteLogManager.lookupOffsetForTimestamp(
+                                                        tb, remoteLogSegment.maxTimestamp()))
+                                        .isLessThan(remoteLogSegment.remoteLogEndOffset())
+                                        .isGreaterThan(remoteLogSegment.remoteLogStartOffset()));
+        assertThat(remoteLogManager.lookupOffsetForTimestamp(tb, startTimestamp + 5000))
+                .isEqualTo(-1L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testLookupRemoteIndexThrowsWhenLocalLogMissing(boolean partitionTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        long startTimestamp = manualClock.milliseconds();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        RemoteLogSegment remoteLogSegment =
+                remoteLogManager.relevantRemoteLogSegments(tb, 0L).get(0);
+        logManager.dropLog(tb);
+
+        assertThatThrownBy(() -> remoteLogManager.lookupPositionForOffset(remoteLogSegment, 2L))
+                .isInstanceOf(NotLeaderOrFollowerException.class)
+                .hasMessageContaining("Can't resolve remote log index cache for bucket " + tb);
+        assertThatThrownBy(() -> remoteLogManager.lookupOffsetForTimestamp(tb, startTimestamp))
+                .isInstanceOf(NotLeaderOrFollowerException.class)
+                .hasMessageContaining("Can't resolve remote log index cache for bucket " + tb);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testAlterTableTieredLogLocalSegments(boolean partitionedTable) throws Exception {
+        // 1. Create table with initial config tieredLogLocalSegments = 2
+        long tableId =
+                registerTableInZkClient(
+                        DATA1_TABLE_PATH,
+                        DATA1_SCHEMA,
+                        200L,
+                        Collections.emptyList(),
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key(), "2"));
+        TableBucket tb = makeTableBucket(tableId, partitionedTable);
+        makeLogTableAsLeader(tb, partitionedTable);
+
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        LogTablet logTablet = replica.getLogTablet();
+
+        // Verify initial config
+        assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(2);
+
+        // 2. Generate 10 segments, upload 9 to remote (excluding active segment)
+        addMultiSegmentsToLogTablet(logTablet, 10);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        // Verify upload success
+        List<RemoteLogSegment> remoteSegments = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        assertThat(remoteSegments).hasSize(9);
+
+        // Verify 2 local segments retained
+        assertThat(logTablet.getSegments()).hasSize(2);
+
+        // 3. Directly update config via Replica (simulating metadata propagation)
+        updateTableConfig(replica, ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS, "5");
+
+        // Verify LogTablet internal state has been updated
+        assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(5);
+
+        // 4. Generate more segments and trigger cleanup, verify new config takes effect
+        addMultiSegmentsToLogTablet(logTablet, 10);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        // Should retain 5 local segments
+        assertThat(logTablet.getSegments()).hasSize(5);
+
+        // 5. Modify config to 3 again, verify multiple modifications work
+        updateTableConfig(replica, ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS, "3");
+
+        // Verify LogTablet internal state updated again
+        assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(3);
+
+        // Generate more segments and verify new config takes effect
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        // Should retain 3 local segments
+        assertThat(logTablet.getSegments()).hasSize(3);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testUpdateTableInfo(boolean partitionedTable) throws Exception {
+        long tableId =
+                registerTableInZkClient(
+                        DATA1_TABLE_PATH,
+                        DATA1_SCHEMA,
+                        201L,
+                        Collections.emptyList(),
+                        Collections.emptyMap());
+        TableBucket tb = makeTableBucket(tableId, partitionedTable);
+        makeLogTableAsLeader(tb, partitionedTable);
+
+        Replica replica = replicaManager.getReplicaOrException(tb);
+
+        // Verify initial ttl matches the configured default.
+        long defaultTtlMs = ConfigOptions.TABLE_LOG_TTL.defaultValue().toMillis();
+        assertThat(replica.getTableInfo().getTableConfig().getLogTTLMs()).isEqualTo(defaultTtlMs);
+
+        // Update the complete TableInfo and verify all config consumers see the new value.
+        long newTtlMs = Duration.ofDays(1).toMillis();
+        updateTableConfig(replica, ConfigOptions.TABLE_LOG_TTL, "1d");
+        assertThat(replica.getTableInfo().getTableConfig().getLogTTLMs()).isEqualTo(newTtlMs);
+        assertThat(replica.getLogTablet().getEffectiveLocalLogTtlMs()).isEqualTo(newTtlMs);
+
+        // no-op: same value must not break anything.
+        updateTableConfig(replica, ConfigOptions.TABLE_LOG_TTL, "1d");
+        assertThat(replica.getTableInfo().getTableConfig().getLogTTLMs()).isEqualTo(newTtlMs);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCopySegmentPartialFailureCommitsSuccessfulOnes(boolean partitionTable)
+            throws Exception {
+        TableBucket tb = makeTableBucket(partitionTable);
+        // Need to make leader by ReplicaManager.
+        makeLogTableAsLeader(tb, partitionTable);
+        addMultiSegmentsToLogTablet(replicaManager.getReplicaOrException(tb).getLogTablet(), 5);
+        // 5 segments total, 4 candidates (1 active segment excluded).
+
+        // Inject failure: let the first 2 segment copies succeed, then fail on the 3rd.
+        remoteLogStorage.copySegmentFailAfterNCopies.set(2);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        // Verify: The manifest should contain exactly 2 segments (the successfully copied ones).
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        List<RemoteLogSegment> manifestSegments = remoteLog.allRemoteLogSegments();
+        assertThat(manifestSegments).hasSize(2);
+
+        // Verify: Remote storage should contain exactly the 2 committed segment files.
+        assertThat(listRemoteLogFiles(tb))
+                .isEqualTo(
+                        manifestSegments.stream()
+                                .map(s -> s.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+    }
+
+    private TableBucket makeTableBucket(boolean partitionTable) {
+        return makeTableBucket(DATA1_TABLE_ID, partitionTable);
+    }
+
+    private FetchLogResultForBucket fetch(TableBucket tableBucket, long fetchOffset)
+            throws Exception {
+        CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> future =
+                new CompletableFuture<>();
+        replicaManager.fetchLogRecords(
+                new FetchParams(-1, Integer.MAX_VALUE),
+                Collections.singletonMap(
+                        tableBucket,
+                        new FetchReqInfo(tableBucket.getTableId(), fetchOffset, 1024 * 1024)),
+                null,
+                future::complete);
+        return future.get().get(tableBucket);
+    }
+
+    private TableBucket makeTableBucket(long tableId, boolean partitionTable) {
+        if (partitionTable) {
+            return new TableBucket(tableId, 0L, 0);
+        } else {
+            return new TableBucket(tableId, 0);
+        }
+    }
+
+    private static Stream<Arguments> stopArgs() {
+        return Stream.of(
+                Arguments.of(false, false),
+                Arguments.of(false, true),
+                Arguments.of(true, false),
+                Arguments.of(true, true));
+    }
+
+    // ---- JBOD multi-directory tests ----
+
+    @Test
+    @Tag(ServerTestTags.JBOD_MULTI_DIR_TAG)
+    void testRemoteIndexCacheFollowsReplicaDirectory() throws Exception {
+        File dataDir1 = new File(tempDir, "data-1");
+        File dataDir2 = new File(tempDir, "data-2");
+        makeLogTableAsLeader(0);
+        makeLogTableAsLeader(1);
+
+        TableBucket tableBucket1 = new TableBucket(DATA1_TABLE_ID, 0);
+        TableBucket tableBucket2 = new TableBucket(DATA1_TABLE_ID, 1);
+        Replica replica1 = replicaManager.getReplicaOrException(tableBucket1);
+        Replica replica2 = replicaManager.getReplicaOrException(tableBucket2);
+        assertThat(replica1.getLogTablet().getDataDir()).isEqualTo(dataDir1.getAbsoluteFile());
+        assertThat(replica2.getLogTablet().getDataDir()).isEqualTo(dataDir2.getAbsoluteFile());
+
+        addMultiSegmentsToLogTablet(replica1.getLogTablet(), 5);
+        addMultiSegmentsToLogTablet(replica2.getLogTablet(), 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        RemoteLogSegment segment1 =
+                remoteLogManager.relevantRemoteLogSegments(tableBucket1, 0L).get(0);
+        RemoteLogSegment segment2 =
+                remoteLogManager.relevantRemoteLogSegments(tableBucket2, 0L).get(0);
+        remoteLogManager.lookupPositionForOffset(segment1, 2L);
+        remoteLogManager.lookupPositionForOffset(segment2, 2L);
+
+        List<String> dir1Files =
+                Arrays.stream(remoteLogManager.getRemoteLogIndexCache(dataDir1).cacheDir().list())
+                        .collect(Collectors.toList());
+        List<String> dir2Files =
+                Arrays.stream(remoteLogManager.getRemoteLogIndexCache(dataDir2).cacheDir().list())
+                        .collect(Collectors.toList());
+
+        assertThat(dir1Files)
+                .anyMatch(name -> name.contains(segment1.remoteLogSegmentId().toString()));
+        assertThat(dir1Files)
+                .noneMatch(name -> name.contains(segment2.remoteLogSegmentId().toString()));
+        assertThat(dir2Files)
+                .anyMatch(name -> name.contains(segment2.remoteLogSegmentId().toString()));
+        assertThat(dir2Files)
+                .noneMatch(name -> name.contains(segment1.remoteLogSegmentId().toString()));
+    }
+}

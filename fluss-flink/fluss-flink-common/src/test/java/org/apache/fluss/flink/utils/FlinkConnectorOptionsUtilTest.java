@@ -1,0 +1,202 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.utils;
+
+import org.apache.fluss.client.initializer.LatestOffsetsInitializer;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
+import org.apache.fluss.client.initializer.TimestampOffsetsInitializer;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.FlinkConnectorOptions.ScanBoundedMode;
+
+import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.table.api.ValidationException;
+import org.junit.jupiter.api.Test;
+
+import java.io.File;
+import java.time.ZoneId;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.TimeZone;
+
+import static org.apache.flink.configuration.CoreOptions.TMP_DIRS;
+import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
+import static org.apache.fluss.config.ConfigOptions.LAKE_TIERING_IO_TMP_DIRS;
+import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE;
+import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP;
+import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.parseTimestamp;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Test for {@link FlinkConnectorOptionsUtils}. */
+class FlinkConnectorOptionsUtilTest {
+    @Test
+    void testParseTimestamp() {
+        assertThat(
+                        parseTimestamp(
+                                "1702134552000",
+                                SCAN_STARTUP_TIMESTAMP.key(),
+                                ZoneId.systemDefault()))
+                .isEqualTo(1702134552000L);
+
+        assertThat(
+                        parseTimestamp(
+                                "2023-12-09 23:09:12",
+                                SCAN_STARTUP_TIMESTAMP.key(),
+                                TimeZone.getTimeZone("Asia/Shanghai").toZoneId()))
+                .isEqualTo(1702134552000L);
+
+        assertThatThrownBy(
+                        () ->
+                                parseTimestamp(
+                                        "2023-12-09T23:09:12",
+                                        SCAN_STARTUP_TIMESTAMP.key(),
+                                        ZoneId.systemDefault()))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(
+                        "Invalid properties 'scan.startup.timestamp' should follow the format 'yyyy-MM-dd HH:mm:ss' "
+                                + "or 'timestamp', but is '2023-12-09T23:09:12'. "
+                                + "You can config like: '2023-12-09 23:09:12' or '1678883047356'.");
+    }
+
+    @Test
+    void testValidateSplitAssignmentBatchSize() {
+        org.apache.flink.configuration.Configuration tableOptions =
+                new org.apache.flink.configuration.Configuration();
+
+        tableOptions.set(SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE, 1);
+        FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions);
+
+        tableOptions.set(SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE, 0);
+        assertThatThrownBy(
+                        () -> FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("'scan.split.assignment.batch-size' must be positive, but was 0.");
+    }
+
+    @Test
+    void testStoppingOffsetsAndBoundedness() {
+        FlinkConnectorOptionsUtils.BoundedOptions boundedOptions =
+                FlinkConnectorOptionsUtils.BoundedOptions.unbounded();
+
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions))
+                .isInstanceOf(NoStoppingOffsetsInitializer.class);
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(false, boundedOptions))
+                .isInstanceOf(LatestOffsetsInitializer.class);
+        assertThat(FlinkConnectorOptionsUtils.toBoundedness(true, boundedOptions))
+                .isEqualTo(Boundedness.CONTINUOUS_UNBOUNDED);
+        assertThat(FlinkConnectorOptionsUtils.toBoundedness(false, boundedOptions))
+                .isEqualTo(Boundedness.BOUNDED);
+
+        boundedOptions = FlinkConnectorOptionsUtils.BoundedOptions.latestOffset();
+        assertThat(boundedOptions.getBoundedMode()).isEqualTo(ScanBoundedMode.LATEST_OFFSET);
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(true, boundedOptions))
+                .isInstanceOf(LatestOffsetsInitializer.class);
+        assertThat(FlinkConnectorOptionsUtils.toBoundedness(true, boundedOptions))
+                .isEqualTo(Boundedness.BOUNDED);
+
+        boundedOptions = FlinkConnectorOptionsUtils.BoundedOptions.timestamp(123L);
+        assertThat(boundedOptions.getBoundedMode()).isEqualTo(ScanBoundedMode.TIMESTAMP);
+        assertThat(boundedOptions.getBoundedTimestampMs()).isEqualTo(123L);
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(true, boundedOptions))
+                .isInstanceOf(TimestampOffsetsInitializer.class);
+    }
+
+    @Test
+    void testGetClientScannerIoTmpDir() {
+        Configuration flussConfig =
+                new Configuration().set(CLIENT_SCANNER_IO_TMP_DIR, "/fluss_tmp_dir");
+        org.apache.flink.configuration.Configuration flinkConfig =
+                new org.apache.flink.configuration.Configuration().set(TMP_DIRS, "/flink_tmp_dir");
+        assertThat(
+                        FlinkConnectorOptionsUtils.getClientScannerIoTmpDir(
+                                flussConfig, new org.apache.flink.configuration.Configuration()))
+                .isEqualTo("/fluss_tmp_dir");
+        assertThat(FlinkConnectorOptionsUtils.getClientScannerIoTmpDir(flussConfig, flinkConfig))
+                .isEqualTo("/fluss_tmp_dir");
+        String property = System.getProperty("java.io.tmpdir");
+        assertThat(
+                        FlinkConnectorOptionsUtils.getClientScannerIoTmpDir(
+                                new Configuration(),
+                                new org.apache.flink.configuration.Configuration()))
+                .isEqualTo(new File(property, "fluss").getAbsolutePath());
+
+        // only replace when flussConfig not contains CLIENT_SCANNER_IO_TMP_DIR while flinkConfig
+        // contains TMP_DIRS.
+        assertThat(
+                        FlinkConnectorOptionsUtils.getClientScannerIoTmpDir(
+                                new Configuration(), flinkConfig))
+                .isEqualTo("/flink_tmp_dir/fluss");
+    }
+
+    @Test
+    void testGetClientScannerIoTmpDirForMultipleReadersOnSameTaskManager() {
+        org.apache.flink.configuration.Configuration commaSeparatedFlinkConfig =
+                new org.apache.flink.configuration.Configuration()
+                        .set(TMP_DIRS, "/flink_tmp_dir_0,/flink_tmp_dir_1");
+
+        Set<String> selectedDirectories = new HashSet<>();
+        for (int i = 0; i < 100; i++) {
+            selectedDirectories.add(
+                    FlinkConnectorOptionsUtils.getClientScannerIoTmpDir(
+                            new Configuration(), commaSeparatedFlinkConfig));
+        }
+        assertThat(selectedDirectories)
+                .containsExactlyInAnyOrder(
+                        new File("/flink_tmp_dir_0", "fluss").getAbsolutePath(),
+                        new File("/flink_tmp_dir_1", "fluss").getAbsolutePath());
+
+        org.apache.flink.configuration.Configuration pathSeparatorFlinkConfig =
+                new org.apache.flink.configuration.Configuration()
+                        .set(
+                                TMP_DIRS,
+                                "/flink_tmp_dir_0" + File.pathSeparator + "/flink_tmp_dir_1");
+
+        assertThat(
+                        FlinkConnectorOptionsUtils.getClientScannerIoTmpDir(
+                                new Configuration(), pathSeparatorFlinkConfig))
+                .isIn(
+                        new File("/flink_tmp_dir_0", "fluss").getAbsolutePath(),
+                        new File("/flink_tmp_dir_1", "fluss").getAbsolutePath());
+    }
+
+    @Test
+    void testGetLakeTieringIoTmpDirs() {
+        Configuration lakeTieringConfig =
+                new Configuration().set(LAKE_TIERING_IO_TMP_DIRS, "/tiering_tmp_0,/tiering_tmp_1");
+        org.apache.flink.configuration.Configuration flinkConfig =
+                new org.apache.flink.configuration.Configuration()
+                        .set(TMP_DIRS, "/flink_tmp_dir_0,/flink_tmp_dir_1");
+
+        assertThat(
+                        FlinkConnectorOptionsUtils.getLakeTieringIoTmpDirs(
+                                lakeTieringConfig, flinkConfig))
+                .containsExactly("/tiering_tmp_0", "/tiering_tmp_1");
+        assertThat(
+                        FlinkConnectorOptionsUtils.getLakeTieringIoTmpDirs(
+                                new Configuration(), flinkConfig))
+                .containsExactly(
+                        new File("/flink_tmp_dir_0", "fluss").getAbsolutePath(),
+                        new File("/flink_tmp_dir_1", "fluss").getAbsolutePath());
+        assertThat(
+                        FlinkConnectorOptionsUtils.getLakeTieringIoTmpDirs(
+                                new Configuration(),
+                                new org.apache.flink.configuration.Configuration()))
+                .containsExactly(
+                        new File(System.getProperty("java.io.tmpdir"), "fluss").getAbsolutePath());
+    }
+}

@@ -1,0 +1,541 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.coordinator;
+
+import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.IneligibleReplicaException;
+import org.apache.fluss.exception.NetworkException;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddServerTagByRackRequest;
+import org.apache.fluss.rpc.messages.AddServerTagByRackResponse;
+import org.apache.fluss.rpc.messages.AddServerTagRequest;
+import org.apache.fluss.rpc.messages.AddServerTagResponse;
+import org.apache.fluss.rpc.messages.AdjustIsrRequest;
+import org.apache.fluss.rpc.messages.AdjustIsrResponse;
+import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
+import org.apache.fluss.rpc.messages.AlterClusterConfigsResponse;
+import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
+import org.apache.fluss.rpc.messages.AlterDatabaseResponse;
+import org.apache.fluss.rpc.messages.AlterTableRequest;
+import org.apache.fluss.rpc.messages.AlterTableResponse;
+import org.apache.fluss.rpc.messages.ApiVersionsRequest;
+import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
+import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
+import org.apache.fluss.rpc.messages.CommitRemoteLogManifestResponse;
+import org.apache.fluss.rpc.messages.ControlledShutdownRequest;
+import org.apache.fluss.rpc.messages.ControlledShutdownResponse;
+import org.apache.fluss.rpc.messages.CreateAclsRequest;
+import org.apache.fluss.rpc.messages.CreateAclsResponse;
+import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
+import org.apache.fluss.rpc.messages.CreateDatabaseResponse;
+import org.apache.fluss.rpc.messages.CreatePartitionRequest;
+import org.apache.fluss.rpc.messages.CreatePartitionResponse;
+import org.apache.fluss.rpc.messages.CreateTableRequest;
+import org.apache.fluss.rpc.messages.CreateTableResponse;
+import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
+import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.DescribeBucketsRequest;
+import org.apache.fluss.rpc.messages.DescribeBucketsResponse;
+import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
+import org.apache.fluss.rpc.messages.DescribeClusterConfigsResponse;
+import org.apache.fluss.rpc.messages.DropAclsRequest;
+import org.apache.fluss.rpc.messages.DropAclsResponse;
+import org.apache.fluss.rpc.messages.DropDatabaseRequest;
+import org.apache.fluss.rpc.messages.DropDatabaseResponse;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.DropPartitionRequest;
+import org.apache.fluss.rpc.messages.DropPartitionResponse;
+import org.apache.fluss.rpc.messages.DropTableRequest;
+import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
+import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
+import org.apache.fluss.rpc.messages.GetDatabaseInfoResponse;
+import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenRequest;
+import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
+import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataRequest;
+import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataResponse;
+import org.apache.fluss.rpc.messages.GetLakeSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetLakeSnapshotResponse;
+import org.apache.fluss.rpc.messages.GetLatestKvSnapshotsRequest;
+import org.apache.fluss.rpc.messages.GetLatestKvSnapshotsResponse;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.GetTableInfoRequest;
+import org.apache.fluss.rpc.messages.GetTableInfoResponse;
+import org.apache.fluss.rpc.messages.GetTableSchemaRequest;
+import org.apache.fluss.rpc.messages.GetTableSchemaResponse;
+import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
+import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
+import org.apache.fluss.rpc.messages.ListAclsRequest;
+import org.apache.fluss.rpc.messages.ListAclsResponse;
+import org.apache.fluss.rpc.messages.ListDatabasesRequest;
+import org.apache.fluss.rpc.messages.ListDatabasesResponse;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsRequest;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
+import org.apache.fluss.rpc.messages.ListPartitionInfosRequest;
+import org.apache.fluss.rpc.messages.ListPartitionInfosResponse;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressRequest;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsRequest;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
+import org.apache.fluss.rpc.messages.ListTablesRequest;
+import org.apache.fluss.rpc.messages.ListTablesResponse;
+import org.apache.fluss.rpc.messages.MetadataRequest;
+import org.apache.fluss.rpc.messages.MetadataResponse;
+import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.RebalanceRequest;
+import org.apache.fluss.rpc.messages.RebalanceResponse;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagByRackRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagByRackResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.messages.TableExistsRequest;
+import org.apache.fluss.rpc.messages.TableExistsResponse;
+import org.apache.fluss.rpc.protocol.ApiError;
+import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
+import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
+import org.apache.fluss.utils.concurrent.FutureUtils;
+
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitRemoteLogManifestData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAdjustIsrResponse;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+
+/** A {@link CoordinatorGateway} for test purpose. */
+public class TestCoordinatorGateway implements CoordinatorGateway {
+
+    private final @Nullable ZooKeeperClient zkClient;
+    public final AtomicBoolean commitRemoteLogManifestFail = new AtomicBoolean(false);
+    public final Map<TableBucket, Integer> currentLeaderEpoch = new HashMap<>();
+    private Set<Integer> shutdownTabletServers;
+    private boolean networkIssueEnable = false;
+
+    public TestCoordinatorGateway() {
+        this(null);
+    }
+
+    public TestCoordinatorGateway(ZooKeeperClient zkClient) {
+        this.zkClient = zkClient;
+        this.shutdownTabletServers = new HashSet<>();
+    }
+
+    @Override
+    public CompletableFuture<ApiVersionsResponse> apiVersions(ApiVersionsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CreateDatabaseResponse> createDatabase(CreateDatabaseRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AlterDatabaseResponse> alterDatabase(AlterDatabaseRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DropDatabaseResponse> dropDatabase(DropDatabaseRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CreateTableResponse> createTable(CreateTableRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AlterTableResponse> alterTable(AlterTableRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DropTableResponse> dropTable(DropTableRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CreatePartitionResponse> createPartition(
+            CreatePartitionRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DropPartitionResponse> dropPartition(DropPartitionRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<ListDatabasesResponse> listDatabases(ListDatabasesRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetDatabaseInfoResponse> getDatabaseInfo(
+            GetDatabaseInfoRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DatabaseExistsResponse> databaseExists(DatabaseExistsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<ListTablesResponse> listTables(ListTablesRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetTableInfoResponse> getTableInfo(GetTableInfoRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DescribeBucketsResponse> describeBuckets(
+            DescribeBucketsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetTableSchemaResponse> getTableSchema(GetTableSchemaRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<TableExistsResponse> tableExists(TableExistsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<MetadataResponse> metadata(MetadataRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetLatestKvSnapshotsResponse> getLatestKvSnapshots(
+            GetLatestKvSnapshotsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetKvSnapshotMetadataResponse> getKvSnapshotMetadata(
+            GetKvSnapshotMetadataRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetFileSystemSecurityTokenResponse> getFileSystemSecurityToken(
+            GetFileSystemSecurityTokenRequest request) {
+        return CompletableFuture.completedFuture(new GetFileSystemSecurityTokenResponse());
+    }
+
+    @Override
+    public CompletableFuture<ListPartitionInfosResponse> listPartitionInfos(
+            ListPartitionInfosRequest request) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<ListRemoteLogManifestsResponse> listRemoteLogManifests(
+            ListRemoteLogManifestsRequest request) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<ListKvSnapshotsResponse> listKvSnapshots(
+            ListKvSnapshotsRequest request) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<GetLakeSnapshotResponse> getLakeSnapshot(
+            GetLakeSnapshotRequest request) {
+        return null;
+    }
+
+    @Override
+    public boolean isLeader() {
+        return true;
+    }
+
+    @Override
+    public CompletableFuture<AdjustIsrResponse> adjustIsr(AdjustIsrRequest request) {
+        if (networkIssueEnable) {
+            return FutureUtils.completedExceptionally(new NetworkException("Mock network issue."));
+        }
+
+        Map<TableBucket, LeaderAndIsr> adjustIsrData = getAdjustIsrData(request);
+        List<AdjustIsrResultForBucket> resultForBuckets = new ArrayList<>();
+
+        adjustIsrData.forEach(
+                (tb, leaderAndIsr) -> {
+                    Integer currentLeaderEpoch = this.currentLeaderEpoch.getOrDefault(tb, 0);
+                    int requestLeaderEpoch = leaderAndIsr.leaderEpoch();
+                    Set<Integer> ineligibleReplicas = new HashSet<>();
+                    for (int replica : leaderAndIsr.isr()) {
+                        if (shutdownTabletServers.contains(replica)) {
+                            ineligibleReplicas.add(replica);
+                        }
+                    }
+                    AdjustIsrResultForBucket adjustIsrResultForBucket;
+                    if (requestLeaderEpoch < currentLeaderEpoch) {
+                        adjustIsrResultForBucket =
+                                new AdjustIsrResultForBucket(
+                                        tb,
+                                        ApiError.fromThrowable(
+                                                new FencedLeaderEpochException(
+                                                        "request leader epoch is fenced.")));
+                    } else if (!ineligibleReplicas.isEmpty()) {
+                        adjustIsrResultForBucket =
+                                new AdjustIsrResultForBucket(
+                                        tb,
+                                        ApiError.fromThrowable(
+                                                new IneligibleReplicaException(
+                                                        String.format(
+                                                                "Rejecting adjustIsr request for table bucket %s because it "
+                                                                        + "specified ineligible replicas %s in the new ISR %s",
+                                                                tb,
+                                                                ineligibleReplicas,
+                                                                leaderAndIsr))));
+
+                    } else {
+                        adjustIsrResultForBucket =
+                                new AdjustIsrResultForBucket(
+                                        tb,
+                                        new LeaderAndIsr(
+                                                leaderAndIsr.leader(),
+                                                currentLeaderEpoch,
+                                                leaderAndIsr.isr(),
+                                                leaderAndIsr.standbyReplicas(),
+                                                leaderAndIsr.coordinatorEpoch(),
+                                                leaderAndIsr.bucketEpoch() + 1));
+                    }
+
+                    resultForBuckets.add(adjustIsrResultForBucket);
+                });
+        return CompletableFuture.completedFuture(makeAdjustIsrResponse(resultForBuckets));
+    }
+
+    @Override
+    public CompletableFuture<CommitKvSnapshotResponse> commitKvSnapshot(
+            CommitKvSnapshotRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CommitRemoteLogManifestResponse> commitRemoteLogManifest(
+            CommitRemoteLogManifestRequest request) {
+        if (commitRemoteLogManifestFail.get()) {
+            return CompletableFuture.completedFuture(
+                    new CommitRemoteLogManifestResponse().setCommitSuccess(false));
+        }
+        checkNotNull(zkClient, "zkClient is null");
+        CommitRemoteLogManifestData commitRemoteLogManifestData =
+                getCommitRemoteLogManifestData(request);
+        CommitRemoteLogManifestResponse response = new CommitRemoteLogManifestResponse();
+        try {
+            zkClient.upsertRemoteLogManifestHandle(
+                    commitRemoteLogManifestData.getTableBucket(),
+                    new RemoteLogManifestHandle(
+                            commitRemoteLogManifestData.getRemoteLogManifestPath(),
+                            commitRemoteLogManifestData.getRemoteLogEndOffset()));
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(response.setCommitSuccess(false));
+        }
+
+        return CompletableFuture.completedFuture(response.setCommitSuccess(true));
+    }
+
+    @Override
+    public CompletableFuture<PrepareLakeTableSnapshotResponse> prepareLakeTableSnapshot(
+            PrepareLakeTableSnapshotRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CommitLakeTableSnapshotResponse> commitLakeTableSnapshot(
+            CommitLakeTableSnapshotRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<LakeTieringHeartbeatResponse> lakeTieringHeartbeat(
+            LakeTieringHeartbeatRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AddServerTagResponse> addServerTag(AddServerTagRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AddServerTagByRackResponse> addServerTagByRack(
+            AddServerTagByRackRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<RemoveServerTagResponse> removeServerTag(
+            RemoveServerTagRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<RemoveServerTagByRackResponse> removeServerTagByRack(
+            RemoveServerTagByRackRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<RebalanceResponse> rebalance(RebalanceRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<ListRebalanceProgressResponse> listRebalanceProgress(
+            ListRebalanceProgressRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CancelRebalanceResponse> cancelRebalance(
+            CancelRebalanceRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<ControlledShutdownResponse> controlledShutdown(
+            ControlledShutdownRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AcquireKvSnapshotLeaseResponse> acquireKvSnapshotLease(
+            AcquireKvSnapshotLeaseRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<ReleaseKvSnapshotLeaseResponse> releaseKvSnapshotLease(
+            ReleaseKvSnapshotLeaseRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DropKvSnapshotLeaseResponse> dropKvSnapshotLease(
+            DropKvSnapshotLeaseRequest request) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<ListAclsResponse> listAcls(ListAclsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CreateAclsResponse> createAcls(CreateAclsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DropAclsResponse> dropAcls(DropAclsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AlterClusterConfigsResponse> alterClusterConfigs(
+            AlterClusterConfigsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DescribeClusterConfigsResponse> describeClusterConfigs(
+            DescribeClusterConfigsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetClusterHealthResponse> getClusterHealth(
+            GetClusterHealthRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<RegisterProducerOffsetsResponse> registerProducerOffsets(
+            RegisterProducerOffsetsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetProducerOffsetsResponse> getProducerOffsets(
+            GetProducerOffsetsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
+            DeleteProducerOffsetsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    public void setCurrentLeaderEpoch(TableBucket tableBucket, int leaderEpoch) {
+        currentLeaderEpoch.put(tableBucket, leaderEpoch);
+    }
+
+    public void setShutdownTabletServers(Set<Integer> shutdownTabletServers) {
+        this.shutdownTabletServers = shutdownTabletServers;
+    }
+
+    public void setNetworkIssueEnable(boolean networkIssueEnable) {
+        this.networkIssueEnable = networkIssueEnable;
+    }
+}

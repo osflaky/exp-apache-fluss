@@ -1,0 +1,144 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.replica;
+
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
+import org.apache.fluss.server.entity.LakeBucketOffset;
+import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
+
+import org.assertj.core.api.AssertionsForClassTypes;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.time.Duration;
+import java.util.Collections;
+import java.util.concurrent.CompletableFuture;
+
+import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
+import static org.apache.fluss.record.TestData.DATA1;
+import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
+import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
+import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Test for notify replica lakehouse data info. */
+class NotifyReplicaLakeTableOffsetTest extends ReplicaTestBase {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testNotifyWithOutRemoteLog(boolean partitionedTable) throws Exception {
+        TableBucket tb = makeTableBucket(partitionedTable);
+        // make leader
+        makeLogTableAsLeader(tb, partitionedTable);
+        Replica replica = replicaManager.getReplicaOrException(tb);
+
+        // now, notify lake table offset
+        notifyAndVerify(tb, replica, 1, 0L, 20L, System.currentTimeMillis());
+        // notify again
+        notifyAndVerify(tb, replica, 2, 20L, 30L, System.currentTimeMillis());
+    }
+
+    @Test
+    void testNotifyLakeTableOffsetClearsPendingRecordsLagWhenCaughtUp() throws Exception {
+        TableBucket tb = makeTableBucket(false);
+        makeLogTableAsLeader(tb, false);
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        updateTableConfig(replica, ConfigOptions.TABLE_DATALAKE_ENABLED, "true");
+
+        long initialTimestamp = manualClock.milliseconds();
+        MemoryLogRecords records =
+                createRecordsWithoutBaseLogOffset(
+                        DATA1_ROW_TYPE,
+                        DEFAULT_SCHEMA_ID,
+                        0,
+                        initialTimestamp,
+                        CURRENT_LOG_MAGIC_VALUE,
+                        DATA1,
+                        replica.getLogFormat());
+        replica.appendRecordsToLeader(records, 0);
+        replica.getLogTablet().updateHighWatermark(replica.getLocalLogEndOffset());
+
+        manualClock.advanceTime(Duration.ofSeconds(30));
+        assertThat(replica.getLogTablet().getPendingRecordsLag(manualClock.milliseconds()))
+                .isEqualTo(Duration.ofSeconds(30).toMillis());
+
+        notifyAndVerify(tb, replica, 1, 0L, replica.getLocalLogEndOffset(), initialTimestamp);
+
+        assertThat(replica.getLogTablet().getPendingRecordsLag(manualClock.milliseconds()))
+                .isZero();
+        assertThat(replica.getLogTablet().getEstimatedPendingStartTimeMs()).isEqualTo(-1L);
+    }
+
+    private void notifyAndVerify(
+            TableBucket tb,
+            Replica replica,
+            long snapshotId,
+            long startOffset,
+            long endOffset,
+            long maxTimestamp)
+            throws Exception {
+        NotifyLakeTableOffsetData notifyLakeTableOffsetData =
+                getNotifyLakeTableOffset(tb, snapshotId, startOffset, endOffset, maxTimestamp);
+        CompletableFuture<NotifyLakeTableOffsetResponse> future = new CompletableFuture<>();
+        replicaManager.notifyLakeTableOffset(notifyLakeTableOffsetData, future::complete);
+        future.get();
+        verifyLakeTableOffset(replica, snapshotId, startOffset, endOffset, maxTimestamp);
+    }
+
+    private void verifyLakeTableOffset(
+            Replica replica, long snapshotId, long startOffset, long endOffset, long maxTimestamp) {
+        AssertionsForClassTypes.assertThat(replica.getLogTablet().getLakeTableSnapshotId())
+                .isEqualTo(snapshotId);
+        AssertionsForClassTypes.assertThat(replica.getLogTablet().getLakeLogStartOffset())
+                .isEqualTo(startOffset);
+        AssertionsForClassTypes.assertThat(replica.getLogTablet().getLakeLogEndOffset())
+                .isEqualTo(endOffset);
+        AssertionsForClassTypes.assertThat(replica.getLogTablet().getLakeMaxTimestamp())
+                .isEqualTo(maxTimestamp);
+    }
+
+    private TableBucket makeTableBucket(boolean partitionTable) {
+        return makeTableBucket(DATA1_TABLE_ID, partitionTable);
+    }
+
+    private TableBucket makeTableBucket(long tableId, boolean partitionTable) {
+        if (partitionTable) {
+            return new TableBucket(tableId, 0L, 0);
+        } else {
+            return new TableBucket(tableId, 0);
+        }
+    }
+
+    private NotifyLakeTableOffsetData getNotifyLakeTableOffset(
+            TableBucket tableBucket,
+            long snapshotId,
+            long startOffset,
+            long endOffset,
+            long maxTimestamp) {
+        return new NotifyLakeTableOffsetData(
+                1,
+                Collections.singletonMap(
+                        tableBucket,
+                        new LakeBucketOffset(snapshotId, startOffset, endOffset, maxTimestamp)));
+    }
+}

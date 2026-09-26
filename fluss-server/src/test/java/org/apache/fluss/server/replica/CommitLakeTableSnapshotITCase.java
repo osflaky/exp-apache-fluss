@@ -1,0 +1,215 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.replica;
+
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.PbCommitLakeTableSnapshotRespForTable;
+import org.apache.fluss.rpc.messages.PbLakeTableOffsetForBucket;
+import org.apache.fluss.rpc.messages.PbLakeTableSnapshotInfo;
+import org.apache.fluss.rpc.messages.PbLakeTableSnapshotMetadata;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.server.testutils.RpcMessageTestUtils;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import java.time.Duration;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.apache.fluss.record.TestData.DATA1;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
+import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.assertj.core.api.AssertionsForInterfaceTypes.assertThat;
+
+/** IT case for commit lakehouse data. */
+class CommitLakeTableSnapshotITCase {
+
+    @RegisterExtension
+    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
+            FlussClusterExtension.builder()
+                    .setClusterConf(initConfig())
+                    .setNumOfTabletServers(3)
+                    .build();
+
+    private static final int BUCKET_NUM = 3;
+
+    private static ZooKeeperClient zkClient;
+
+    private static Configuration initConfig() {
+        Configuration conf = new Configuration();
+        // set default datalake format for the cluster and enable datalake tables
+        conf.set(ConfigOptions.DATALAKE_FORMAT, DataLakeFormat.PAIMON);
+        return conf;
+    }
+
+    @BeforeAll
+    static void beforeAll() {
+        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+    }
+
+    @Test
+    void testCommitDataLakeData() throws Exception {
+        long tableId = createLogTable();
+
+        for (int bucket = 0; bucket < BUCKET_NUM; bucket++) {
+            TableBucket tb = new TableBucket(tableId, bucket);
+            // get the leader server
+            int leaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+            TabletServerGateway leaderGateWay =
+                    FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leaderServer);
+            FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+
+            for (int i = 0; i < 10; i++) {
+                leaderGateWay
+                        .produceLog(
+                                RpcMessageTestUtils.newProduceLogRequest(
+                                        tableId,
+                                        tb.getBucket(),
+                                        -1,
+                                        genMemoryLogRecordsByObject(DATA1)))
+                        .get();
+            }
+        }
+
+        // now, let's commit the lake table snapshot
+        CoordinatorGateway coordinatorGateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+        long snapshotId = 1;
+        long dataLakeLogEndOffset = 50;
+        long dataLakeMaxTimestamp = System.currentTimeMillis();
+        CommitLakeTableSnapshotRequest commitLakeTableSnapshotRequest =
+                genCommitLakeTableSnapshotRequest(
+                        tableId,
+                        BUCKET_NUM,
+                        snapshotId,
+                        dataLakeLogEndOffset,
+                        dataLakeMaxTimestamp);
+        coordinatorGateway.commitLakeTableSnapshot(commitLakeTableSnapshotRequest).get();
+
+        Map<TableBucket, Long> bucketsLogEndOffset = new HashMap<>();
+        for (int bucket = 0; bucket < BUCKET_NUM; bucket++) {
+            TableBucket tb = new TableBucket(tableId, bucket);
+            bucketsLogEndOffset.put(tb, dataLakeLogEndOffset);
+            Replica replica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tb);
+            retry(
+                    Duration.ofMinutes(2),
+                    () -> {
+                        LogTablet logTablet = replica.getLogTablet();
+                        assertThat(logTablet.getLakeLogEndOffset()).isEqualTo(dataLakeLogEndOffset);
+                        assertThat(logTablet.getLakeMaxTimestamp()).isEqualTo(dataLakeMaxTimestamp);
+                    });
+        }
+
+        LakeTableSnapshot expectedDataLakeTieredInfo =
+                new LakeTableSnapshot(snapshotId, bucketsLogEndOffset);
+        checkLakeTableDataInZk(tableId, expectedDataLakeTieredInfo);
+    }
+
+    private void checkLakeTableDataInZk(long tableId, LakeTableSnapshot expected) throws Exception {
+        LakeTableSnapshot lakeTableSnapshot = zkClient.getLakeTableSnapshot(tableId, null).get();
+        assertThat(lakeTableSnapshot).isEqualTo(expected);
+    }
+
+    private static CommitLakeTableSnapshotRequest genCommitLakeTableSnapshotRequest(
+            long tableId, int buckets, long snapshotId, long logEndOffset, long maxTimestamp) {
+        CommitLakeTableSnapshotRequest commitLakeTableSnapshotRequest =
+                new CommitLakeTableSnapshotRequest();
+        PbLakeTableSnapshotInfo reqForTable = commitLakeTableSnapshotRequest.addTablesReq();
+        reqForTable.setTableId(tableId);
+        reqForTable.setSnapshotId(snapshotId);
+        for (int bucket = 0; bucket < buckets; bucket++) {
+            TableBucket tb = new TableBucket(tableId, bucket);
+            PbLakeTableOffsetForBucket lakeTableOffsetForBucket = reqForTable.addBucketsReq();
+            if (tb.getPartitionId() != null) {
+                lakeTableOffsetForBucket.setPartitionId(tb.getPartitionId());
+            }
+            lakeTableOffsetForBucket.setBucketId(tb.getBucket());
+            lakeTableOffsetForBucket.setLogEndOffset(logEndOffset);
+            lakeTableOffsetForBucket.setMaxTimestamp(maxTimestamp);
+        }
+        return commitLakeTableSnapshotRequest;
+    }
+
+    private long createLogTable() throws Exception {
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA)
+                        .distributedBy(BUCKET_NUM, "a")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .build();
+        return RpcMessageTestUtils.createTable(
+                FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, tableDescriptor);
+    }
+
+    @Test
+    void testCommitLakeTableSnapshotV2RejectedAfterDropTable() throws Exception {
+        long tableId = createLogTable();
+        TablePath tablePath = DATA1_TABLE_PATH;
+
+        CoordinatorGateway coordinatorGateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+        coordinatorGateway
+                .dropTable(
+                        RpcMessageTestUtils.newDropTableRequest(
+                                tablePath.getDatabaseName(), tablePath.getTableName(), false))
+                .get();
+
+        // Wait for the table to be fully deleted from ZK
+        retry(
+                Duration.ofMinutes(2),
+                () -> {
+                    assertThat(zkClient.tableExist(tablePath)).isFalse();
+                    assertThat(zkClient.getTableAssignment(tableId)).isEmpty();
+                });
+
+        // Try to commit a V2 lake table snapshot for the dropped tableId
+        PbLakeTableSnapshotMetadata metadata =
+                new PbLakeTableSnapshotMetadata()
+                        .setTableId(tableId)
+                        .setSnapshotId(1L)
+                        .setTieredBucketOffsetsFilePath("/tmp/fake/path.offsets");
+
+        CommitLakeTableSnapshotRequest commitRequest = new CommitLakeTableSnapshotRequest();
+        commitRequest.addAllLakeTableSnapshotMetadatas(Collections.singletonList(metadata));
+
+        CommitLakeTableSnapshotResponse response =
+                coordinatorGateway.commitLakeTableSnapshot(commitRequest).get();
+
+        // Verify the response contains an error for the dropped table
+        assertThat(response.getTableRespsCount()).isEqualTo(1);
+        PbCommitLakeTableSnapshotRespForTable tableResp = response.getTableRespAt(0);
+        assertThat(tableResp.getTableId()).isEqualTo(tableId);
+        assertThat(tableResp.getErrorCode()).isNotZero();
+        assertThat(tableResp.getErrorMessage()).contains("not found");
+    }
+}

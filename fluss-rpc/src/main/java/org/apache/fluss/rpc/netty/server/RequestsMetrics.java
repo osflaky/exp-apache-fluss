@@ -1,0 +1,216 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.rpc.netty.server;
+
+import org.apache.fluss.metrics.Counter;
+import org.apache.fluss.metrics.DescriptiveStatisticsHistogram;
+import org.apache.fluss.metrics.Gauge;
+import org.apache.fluss.metrics.Histogram;
+import org.apache.fluss.metrics.MeterView;
+import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.ThreadSafeSimpleCounter;
+import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.rpc.protocol.Errors;
+
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * A class wrapping the metrics registered for different request types. It's mainly used to simplify
+ * the metric update for a specified request type.
+ */
+public class RequestsMetrics {
+
+    // a map from request name to the metrics registered for the request name
+    private final Map<String, Metrics> metricsByRequest = new HashMap<>();
+
+    // the request metric group
+    private final MetricGroup requestMetricGroup;
+
+    private RequestsMetrics(MetricGroup serverMetricsGroup, Collection<ApiKeys> apiKeys) {
+        for (ApiKeys apiKey : apiKeys) {
+            // we create a metrics group for each type of request, with the request type
+            // as variable
+            addMetrics(serverMetricsGroup, toRequestName(apiKey, false, false));
+            if (apiKey == ApiKeys.FETCH_LOG) {
+                // For fetch, register separate metric groups for clients and followers.
+                addMetrics(serverMetricsGroup, toRequestName(apiKey, true, false));
+            }
+            if (apiKey == ApiKeys.LOOKUP) {
+                addMetrics(serverMetricsGroup, toRequestName(apiKey, false, true));
+            }
+            if (apiKey == ApiKeys.PUT_KV) {
+                addMetrics(serverMetricsGroup, toRequestName(apiKey, false, true));
+            }
+        }
+        this.requestMetricGroup = serverMetricsGroup.addGroup("request");
+    }
+
+    public static RequestsMetrics createTabletServerRequestMetrics(MetricGroup serverMetricsGroup) {
+        List<ApiKeys> apiKeys =
+                Arrays.asList(
+                        ApiKeys.PRODUCE_LOG,
+                        ApiKeys.PUT_KV,
+                        ApiKeys.LOOKUP,
+                        ApiKeys.FETCH_LOG,
+                        ApiKeys.PREFIX_LOOKUP,
+                        ApiKeys.GET_METADATA);
+        return new RequestsMetrics(serverMetricsGroup, apiKeys);
+    }
+
+    public static RequestsMetrics createCoordinatorServerRequestMetrics(
+            MetricGroup serverMetricsGroup) {
+        // now, no need to register any metrics of request for coordinator server
+        return new RequestsMetrics(serverMetricsGroup, Collections.emptySet());
+    }
+
+    /** Create a gauge metric in the request metric group. */
+    <T, G extends Gauge<T>> void gauge(String name, G gauge) {
+        requestMetricGroup.gauge(name, gauge);
+    }
+
+    /** Create a gauge metric in a child group of the request metric group. */
+    <T, G extends Gauge<T>> void gauge(String groupKey, String groupValue, String name, G gauge) {
+        requestMetricGroup.addGroup(groupKey, groupValue).gauge(name, gauge);
+    }
+
+    /** Add a metric group for given request name. */
+    private void addMetrics(MetricGroup parentMetricGroup, String requestName) {
+        metricsByRequest.put(
+                requestName, new Metrics(parentMetricGroup.addGroup("request", requestName)));
+    }
+
+    private static String toRequestName(
+            ApiKeys apiKeys, boolean isFromFollower, boolean isHistorical) {
+        switch (apiKeys) {
+            case PRODUCE_LOG:
+                return "produceLog";
+            case PUT_KV:
+                return isHistorical ? "historicalPutKv" : "putKv";
+            case LOOKUP:
+                return isHistorical ? "historicalLookup" : "lookup";
+            case PREFIX_LOOKUP:
+                return "prefixLookup";
+            case FETCH_LOG:
+                return isFromFollower ? "fetchLogFollower" : "fetchLogClient";
+            case GET_METADATA:
+                return "metadata";
+            default:
+                return "unknown";
+        }
+    }
+
+    public Optional<Metrics> getMetrics(
+            short apiKey, boolean isFromFollower, boolean isHistorical) {
+        String requestName = toRequestName(ApiKeys.forId(apiKey), isFromFollower, isHistorical);
+        return Optional.ofNullable(metricsByRequest.get(requestName));
+    }
+
+    /** A class wrapping all registered metrics for a given request type. */
+    public static final class Metrics {
+        private static final int WINDOW_SIZE = 1024;
+        private final MetricGroup metricGroup;
+        private final Counter requestsCount;
+        private final Counter errorsCount;
+        private final Map<Errors, Counter> errorsCountByError = new ConcurrentHashMap<>();
+
+        private final Histogram requestBytes;
+
+        private final Histogram requestQueueTimeMs;
+        private final Histogram requestProcessTimeMs;
+        private final Histogram responseSendTimeMs;
+        private final Histogram totalTimeMs;
+
+        private Metrics(MetricGroup metricGroup) {
+            this.metricGroup = metricGroup;
+            requestsCount = new ThreadSafeSimpleCounter();
+            metricGroup.meter(MetricNames.REQUESTS_RATE, new MeterView(requestsCount));
+            errorsCount = new ThreadSafeSimpleCounter();
+            metricGroup.meter(MetricNames.ERRORS_RATE, new MeterView(errorsCount));
+
+            requestBytes =
+                    metricGroup.histogram(
+                            MetricNames.REQUEST_BYTES,
+                            new DescriptiveStatisticsHistogram(WINDOW_SIZE));
+            requestQueueTimeMs =
+                    metricGroup.histogram(
+                            MetricNames.REQUEST_QUEUE_TIME_MS,
+                            new DescriptiveStatisticsHistogram(WINDOW_SIZE));
+            requestProcessTimeMs =
+                    metricGroup.histogram(
+                            MetricNames.REQUEST_PROCESS_TIME_MS,
+                            new DescriptiveStatisticsHistogram(WINDOW_SIZE));
+            responseSendTimeMs =
+                    metricGroup.histogram(
+                            MetricNames.RESPONSE_SEND_TIME_MS,
+                            new DescriptiveStatisticsHistogram(WINDOW_SIZE));
+            totalTimeMs =
+                    metricGroup.histogram(
+                            MetricNames.REQUEST_TOTAL_TIME_MS,
+                            new DescriptiveStatisticsHistogram(WINDOW_SIZE));
+        }
+
+        public Counter getRequestsCount() {
+            return requestsCount;
+        }
+
+        public Counter getErrorsCount() {
+            return errorsCount;
+        }
+
+        void markError(Errors error) {
+            errorsCount.inc();
+            errorsCountByError.computeIfAbsent(error, this::registerErrorMeter).inc();
+        }
+
+        private Counter registerErrorMeter(Errors error) {
+            Counter perErrorCount = new ThreadSafeSimpleCounter();
+            metricGroup
+                    .addGroup("error", error.name())
+                    .meter(MetricNames.ERRORS_RATE, new MeterView(perErrorCount));
+            return perErrorCount;
+        }
+
+        public Histogram getRequestBytes() {
+            return requestBytes;
+        }
+
+        public Histogram getRequestQueueTimeMs() {
+            return requestQueueTimeMs;
+        }
+
+        public Histogram getRequestProcessTimeMs() {
+            return requestProcessTimeMs;
+        }
+
+        public Histogram getResponseSendTimeMs() {
+            return responseSendTimeMs;
+        }
+
+        public Histogram getTotalTimeMs() {
+            return totalTimeMs;
+        }
+    }
+}

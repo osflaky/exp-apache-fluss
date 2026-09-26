@@ -1,0 +1,194 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: coordinator-server
+  labels:
+  {{- include "fluss.labels" . | nindent 4 }}
+  {{- with .Values.coordinator.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  serviceName: coordinator-server-hs
+  replicas: {{ .Values.coordinator.numberOfReplicas }}
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "fluss.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: coordinator
+  template:
+    metadata:
+      labels:
+        {{- with .Values.coordinator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- include "fluss.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: coordinator
+      {{- with .Values.coordinator.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "fluss.fullname" .) }}
+      {{- end }}
+      {{- include "fluss.imagePullSecrets" . | nindent 6 }}
+      {{- with .Values.coordinator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or (include "fluss.security.jaas.required" .) .Values.coordinator.initContainers }}
+      initContainers:
+        {{- if include "fluss.security.jaas.required" . }}
+        {{- include "fluss.security.jaas.initContainer" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.coordinator.initContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}-coordinator
+          image: {{ include "fluss.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- if (include "fluss.security.jaas.required" .) }}
+            - name: FLUSS_ENV_JAVA_OPTS
+              value: "-Djava.security.auth.login.config=/etc/fluss/conf/jaas.conf"
+            {{- end }}
+            {{- if (include "fluss.secrets.enabled" .) }}
+            {{- include "fluss.secrets.env" . | trim | nindent 12 }}
+            {{- end }}
+            {{- with .Values.coordinator.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.coordinator.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: internal
+              containerPort: {{ .Values.listeners.internal.port }}
+            - name: client
+              containerPort: {{ .Values.listeners.client.port }}
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              export FLUSS_SERVER_ID=${POD_NAME##*-} && \
+              cp /opt/conf/server.yaml $FLUSS_HOME/conf && \
+
+              BIND_LISTENERS="INTERNAL://${POD_IP}:{{ .Values.listeners.internal.port }}, CLIENT://${POD_IP}:{{ .Values.listeners.client.port }}" && \
+              ADVERTISED_LISTENERS="CLIENT://${POD_NAME}.coordinator-server-hs.${POD_NAMESPACE}.svc.cluster.local:{{ .Values.listeners.client.port }}" && \
+
+              echo "" >> $FLUSS_HOME/conf/server.yaml && \
+              echo "bind.listeners: ${BIND_LISTENERS}" >> $FLUSS_HOME/conf/server.yaml && \
+              echo "advertised.listeners: ${ADVERTISED_LISTENERS}" >> $FLUSS_HOME/conf/server.yaml && \
+
+              exec bin/coordinator-server.sh start-foreground
+          livenessProbe:
+            failureThreshold: 100
+            timeoutSeconds: 1
+            initialDelaySeconds: 10
+            periodSeconds: 3
+            tcpSocket:
+              port: {{ .Values.listeners.client.port }}
+          readinessProbe:
+            failureThreshold: 100
+            timeoutSeconds: 1
+            initialDelaySeconds: 10
+            periodSeconds: 3
+            tcpSocket:
+              port: {{ .Values.listeners.client.port }}
+          resources:
+            {{- toYaml .Values.resources.coordinatorServer | nindent 12 }}
+          volumeMounts:
+            - name: fluss-conf
+              mountPath: /opt/conf
+            - name: data
+              mountPath: /tmp/fluss/data
+            {{- if (include "fluss.security.jaas.required" .) }}
+            - name: sasl-config
+              mountPath: /etc/fluss/conf
+              readOnly: true
+            {{- end }}
+            {{- if (include "fluss.secrets.enabled" .) }}
+            {{- include "fluss.secrets.volumeMounts" . | trim | nindent 12 }}
+            {{- end }}
+            {{- with .Values.coordinator.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: fluss-conf
+          configMap:
+            name: fluss-conf-file
+        {{- if not .Values.coordinator.storage.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if (include "fluss.security.jaas.required" .) }}
+        {{- include "fluss.security.jaas.volumes" . | nindent 8 }}
+        {{- end }}
+        {{- if (include "fluss.secrets.enabled" .) }}
+        {{- include "fluss.secrets.volumes" . | trim | nindent 8 }}
+        {{- end }}
+        {{- with .Values.coordinator.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if .Values.coordinator.storage.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ .Values.coordinator.storage.size }}
+        storageClassName: {{ .Values.coordinator.storage.storageClass }}
+  {{- end}}

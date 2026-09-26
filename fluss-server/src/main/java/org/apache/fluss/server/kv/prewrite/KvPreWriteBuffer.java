@@ -1,0 +1,678 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.kv.prewrite;
+
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.metrics.Counter;
+import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.utils.MurmurHashUtils;
+
+import javax.annotation.Nullable;
+import javax.annotation.concurrent.NotThreadSafe;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.UnsafeUtils.BYTE_ARRAY_BASE_OFFSET;
+
+/**
+ * An in-memory pre-write buffer for putting kv records. The kv records will first be put into the
+ * buffer and then be flushed to the underlying kv storage by method {@link #flush(long)}.
+ *
+ * <p>In Fluss, when putting a key-value pair, Fluss will first write WAL first. Only when the WAL
+ * has been persisted(with fault tolerance), can Fluss safely writing the key-value pair to the
+ * underlying kv storage. Otherwise, it'll cause in-consistent data in the kv storage.
+ *
+ * <p>For example, if Fluss write data to the kv storage without waiting for the WAL to be
+ * persisted, then user can read the data from kv storage. But unfortunately, the kv storage was
+ * lost. Then, Fluss can never restore the piece of data to kv storage from the WAL as it hasn't
+ * been persisted, which will cause user can not read the data any more although the data has been
+ * ever read.
+ *
+ * <p>To solve this problem, we introduce the pre-write buffer. It's mainly designed for two
+ * purpose:
+ *
+ * <ol>
+ *   <li>Buffer all the key-value pairs that are waiting for the corresponding WAL to be persisted.
+ *       And flush these key-value pairs whose WAL has been persisted to underlying kv storage.
+ *   <li>A temporary in-memory key-value buffer for put/get a key. Since Fluss will lookup the
+ *       previous written data to generate CDC as WAL, it needs a buffer to buffer the data been
+ *       written before but is still waiting for the WAL to be persisted before flush to underlying
+ *       kv storage.
+ * </ol>
+ *
+ * <p>In implementation, to achieve the above two purposes, it maintains a map kvEntryMap for
+ * put/get a key and a linked list kvEntryList to iterate the kv entries to be flushed.
+ *
+ * <p>The kvEntryMap is a map from key to the corresponding KvEntry. Each KvEntry wraps a key-value
+ * pair and a log sequence number corresponding to the offset of the WAL, with which, we can find
+ * the key-value pair to be flush when a perice of WAL was persisted.
+ *
+ * <p>When put a key-value pair, it will always create a new KvEntry wrapping the key-value and put
+ * it into the map.
+ *
+ * <p>Then it will append the new KvEntry to the tail of the kvEntryList. So, the kvEntryList
+ * maintains the key-value pair in putting order. When flushing, it will iterate the list to flush
+ * all the entries whose log sequence number is less or equal than the given log sequence number.
+ *
+ * <p>Note: The key-value pairs to be put into the buffer must be with non-decreasing log sequence
+ * number. Otherwise, the flushing will not work as expected since once it found any kv entry whose
+ * log sequence number is greater or equal than the given log sequence number whiling iterating from
+ * head to tail, it will stop flush.
+ */
+@NotThreadSafe
+public class KvPreWriteBuffer {
+
+    // a mapping from the key to the kv-entry
+    private final Map<Key, KvEntry> kvEntryMap = new HashMap<>();
+
+    // a linked list for all kv entries
+    private final LinkedList<KvEntry> allKvEntries = new LinkedList<>();
+
+    // metrics related.
+    private final Counter truncateAsDuplicatedCount;
+    private final Counter truncateAsErrorCount;
+
+    // the max LSN in the buffer
+    private long maxLogSequenceNumber = -1;
+
+    // Accumulated byte size of entries not yet completed by a flush.
+    private long pendingFlushBytes = 0;
+
+    public KvPreWriteBuffer(TabletServerMetricGroup serverMetricGroup) {
+        truncateAsDuplicatedCount = serverMetricGroup.kvTruncateAsDuplicatedCount();
+        truncateAsErrorCount = serverMetricGroup.kvTruncateAsErrorCount();
+    }
+
+    /**
+     * Marks the last KV mutation when it ends a successfully appended or recovered WAL batch.
+     *
+     * <p>Call after applying each batch and before staging any mutation from the next batch. Empty
+     * batches do not mark an entry; their offsets are covered by the flush target or a later batch.
+     *
+     * @param batchEndOffset the exclusive end offset of the completed WAL batch
+     */
+    public void markWalBatchEnd(long batchEndOffset) {
+        KvEntry last = allKvEntries.peekLast();
+        // Empty batches have no mutation to mark. Their offsets are covered by the flush target
+        // or a later batch; never infer a boundary from a gap between KV mutations.
+        if (last != null && last.logSequenceNumber + 1 == batchEndOffset) {
+            last.endOfWalBatch = true;
+        }
+    }
+
+    /**
+     * Delete a key-value pair with the given key.
+     *
+     * @param logSequenceNumber the log sequence number for the delete operation
+     */
+    public void delete(Key key, long logSequenceNumber) {
+        doPut(ChangeType.DELETE, key, Value.of(null), logSequenceNumber);
+    }
+
+    /**
+     * Put a key-value pair.
+     *
+     * @param logSequenceNumber the log sequence number for the put operation
+     */
+    public void insert(Key key, byte[] value, long logSequenceNumber) {
+        doPut(ChangeType.INSERT, key, Value.of(value), logSequenceNumber);
+    }
+
+    /**
+     * Put a key-value pair.
+     *
+     * @param logSequenceNumber the log sequence number for the put operation
+     */
+    public void update(Key key, @Nullable byte[] value, long logSequenceNumber) {
+        doPut(ChangeType.UPDATE_AFTER, key, Value.of(value), logSequenceNumber);
+    }
+
+    private void doPut(ChangeType changeType, Key key, Value value, long lsn) {
+        if (maxLogSequenceNumber >= lsn) {
+            throw new IllegalArgumentException(
+                    "The log sequence number must be non-decreasing. "
+                            + "The current log sequence number is "
+                            + maxLogSequenceNumber
+                            + ", but the new log sequence number is "
+                            + lsn);
+        }
+
+        // create the kv entry with previous pointer if exists, and put the new entry to the map
+        KvEntry kvEntry =
+                kvEntryMap.compute(
+                        key,
+                        (k, v) ->
+                                v == null
+                                        ? KvEntry.of(changeType, key, value, lsn)
+                                        : KvEntry.of(changeType, key, value, lsn, v));
+        // link the previous version forward to the new entry, so each version knows its
+        // successor and completeFlush can detach it in constant time
+        if (kvEntry.previousEntry != null) {
+            kvEntry.previousEntry.nextEntry = kvEntry;
+        }
+        // append the entry to the tail of the list for all kv entries
+        allKvEntries.addLast(kvEntry);
+        // update the max lsn
+        maxLogSequenceNumber = lsn;
+        // track accumulated bytes for flush budget gating
+        pendingFlushBytes += entryBytes(key, value);
+    }
+
+    /**
+     * Return a value with the given key.
+     *
+     * @return A value wrapping a null byte array if the key is marked as deleted; null if any
+     *     key-value pair can be found by the key in the buffer.
+     */
+    public @Nullable Value get(Key key) {
+        KvEntry kvEntry = kvEntryMap.get(key);
+
+        return kvEntry == null ? null : kvEntry.getValue();
+    }
+
+    /**
+     * Truncate the buffer to the given log sequence number so that it only contains key-value pairs
+     * whose log sequence number is less than the given log sequence number.
+     *
+     * @param targetLogSequenceNumber the lower bound of the log sequence number truncated to.
+     * @param truncateReason the reason to truncate
+     */
+    public void truncateTo(long targetLogSequenceNumber, TruncateReason truncateReason) {
+        if (truncateReason == TruncateReason.DUPLICATED) {
+            truncateAsDuplicatedCount.inc();
+        } else {
+            truncateAsErrorCount.inc();
+        }
+
+        Iterator<KvEntry> descIter = allKvEntries.descendingIterator();
+        while (descIter.hasNext()) {
+            KvEntry entry = descIter.next();
+            if (entry.getLogSequenceNumber() < targetLogSequenceNumber) {
+                maxLogSequenceNumber = entry.logSequenceNumber;
+                break;
+            }
+            descIter.remove();
+            if (entry.state == EntryState.PREPARED) {
+                throw new IllegalStateException(
+                        "Cannot truncate prepared pre-write entry. logSequenceNumber="
+                                + entry.getLogSequenceNumber()
+                                + ", targetLogSequenceNumber="
+                                + targetLogSequenceNumber);
+            }
+            pendingFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
+            boolean removed = kvEntryMap.remove(entry.getKey(), entry);
+            // the removed entry is no longer the successor of its previous version; clear the
+            // forward link so the truncated entry does not stay reachable through it
+            if (entry.previousEntry != null) {
+                entry.previousEntry.nextEntry = null;
+            }
+            // if the latest entry is removed, we need to rollback the previous entry to the map
+            if (removed) {
+                KvEntry previousEntry = previousEntryInBuffer(entry.previousEntry);
+                if (previousEntry != null) {
+                    kvEntryMap.put(entry.getKey(), previousEntry);
+                }
+            }
+        }
+        if (!descIter.hasNext()) {
+            maxLogSequenceNumber = -1;
+        }
+    }
+
+    /** Returns the accumulated byte size of all entries waiting to be flushed. */
+    public long pendingFlushBytes() {
+        return pendingFlushBytes;
+    }
+
+    /**
+     * Prepares a prefix of entries for asynchronous flush without removing them from the buffer.
+     *
+     * <p>The prepared entries remain visible through {@link #get(Key)}, so foreground writes can
+     * still derive correct CDC records while the background flush writes RocksDB.
+     */
+    public PreparedFlush prepareFlush(long exclusiveUpToLogSequenceNumber) {
+        ArrayList<KvEntry> entries = new ArrayList<>();
+        int rowCountDiff = 0;
+        for (KvEntry entry : allKvEntries) {
+            if (entry.getLogSequenceNumber() >= exclusiveUpToLogSequenceNumber) {
+                break;
+            }
+            if (entry.state == EntryState.PREPARED) {
+                throw new IllegalStateException(
+                        "Found an already prepared entry while preparing async flush.");
+            }
+            entry.state = EntryState.PREPARED;
+            entries.add(entry);
+            rowCountDiff += rowCountDelta(entry);
+        }
+        return new PreparedFlush(exclusiveUpToLogSequenceNumber, entries, rowCountDiff);
+    }
+
+    /** Completes a prepared async flush and removes flushed entries from the buffer. */
+    public int completeFlush(PreparedFlush preparedFlush) {
+        for (KvEntry entry : preparedFlush.entries) {
+            KvEntry first = allKvEntries.removeFirst();
+            if (first != entry) {
+                throw new IllegalStateException("Prepared flush entries are no longer a prefix.");
+            }
+            if (entry.state != EntryState.PREPARED) {
+                throw new IllegalStateException("Prepared flush entry is not in PREPARED state.");
+            }
+            entry.state = EntryState.FLUSHED;
+            pendingFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
+            kvEntryMap.remove(entry.getKey(), entry);
+            // the immediate successor is the only live referencer of a flushed entry; clearing
+            // its reference makes the flushed entry (and, transitively, its older versions)
+            // unreachable instead of being retained while no longer counted by pendingFlushBytes
+            if (entry.nextEntry != null) {
+                entry.nextEntry.previousEntry = null;
+            }
+        }
+        if (allKvEntries.isEmpty()) {
+            maxLogSequenceNumber = -1;
+        }
+        return preparedFlush.rowCountDiff;
+    }
+
+    /** Aborts a prepared async flush and makes its entries active again. */
+    public void abortFlush(PreparedFlush preparedFlush) {
+        for (KvEntry entry : preparedFlush.entries) {
+            if (entry.state == EntryState.PREPARED) {
+                entry.state = EntryState.ACTIVE;
+            }
+        }
+    }
+
+    /**
+     * Resets all PREPARED entries back to ACTIVE. Used when orphaned PREPARED entries are detected
+     * from a previous incomplete flush cycle so the next prepareFlush starts clean.
+     */
+    public void abortAllPrepared() {
+        for (KvEntry entry : allKvEntries) {
+            if (entry.state == EntryState.PREPARED) {
+                entry.state = EntryState.ACTIVE;
+            }
+        }
+    }
+
+    private static long entryBytes(Key key, Value value) {
+        return (long) key.key.length + (value.value != null ? value.value.length : 0L);
+    }
+
+    /** Contribution of one entry to the table row count: +1 for INSERT, -1 for DELETE. */
+    private static int rowCountDelta(KvEntry entry) {
+        if (entry.getChangeType() == ChangeType.INSERT) {
+            return 1;
+        } else if (entry.getChangeType() == ChangeType.DELETE) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * Returns the given entry if it is still in the buffer, or null if it has been flushed.
+     *
+     * <p>No walk along the {@code previousEntry} chain is needed: entries are flushed strictly in
+     * list-prefix order ({@link #completeFlush}), and a previous entry of the same key always
+     * precedes this entry in the list, so once an entry is FLUSHED its whole previous chain is
+     * FLUSHED as well.
+     */
+    private static @Nullable KvEntry previousEntryInBuffer(@Nullable KvEntry entry) {
+        return entry != null && entry.state != EntryState.FLUSHED ? entry : null;
+    }
+
+    @VisibleForTesting
+    public Map<Key, KvEntry> getKvEntryMap() {
+        return kvEntryMap;
+    }
+
+    @VisibleForTesting
+    public LinkedList<KvEntry> getAllKvEntries() {
+        return allKvEntries;
+    }
+
+    @VisibleForTesting
+    public long getMaxLSN() {
+        return maxLogSequenceNumber;
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Inner classes
+    // -------------------------------------------------------------------------------------------
+
+    /**
+     * A class to wrap a key-value pair and the sequence number for the key-value pair. If the byte
+     * array in the value is null, it means the key in the entry is marked as deleted.
+     *
+     * <p>The log sequence number is to represent the log offset in the corresponding WAL for the
+     * key-value pair.
+     */
+    public static class KvEntry {
+
+        private final ChangeType changeType;
+        private final Key key;
+        private final Value value;
+        private final long logSequenceNumber;
+        private boolean endOfWalBatch;
+
+        // the previous mapped value in the buffer before this key-value put; null once the
+        // referenced entry has been flushed (see completeFlush)
+        @Nullable private KvEntry previousEntry;
+
+        // the newer version of the same key that references this entry as its previous version;
+        // null once that version has been truncated (see truncateTo)
+        @Nullable private KvEntry nextEntry;
+
+        private EntryState state = EntryState.ACTIVE;
+
+        public static KvEntry of(ChangeType changeType, Key key, Value value, long sequenceNumber) {
+            return new KvEntry(changeType, key, value, sequenceNumber, null);
+        }
+
+        public static KvEntry of(
+                ChangeType changeType,
+                Key key,
+                Value value,
+                long sequenceNumber,
+                KvEntry previousEntry) {
+            return new KvEntry(changeType, key, value, sequenceNumber, previousEntry);
+        }
+
+        private KvEntry(
+                ChangeType changeType,
+                Key key,
+                Value value,
+                long logSequenceNumber,
+                @Nullable KvEntry previousEntry) {
+            this.changeType = changeType;
+            this.key = key;
+            this.value = value;
+            this.logSequenceNumber = logSequenceNumber;
+            this.previousEntry = previousEntry;
+        }
+
+        public ChangeType getChangeType() {
+            return changeType;
+        }
+
+        public Key getKey() {
+            return key;
+        }
+
+        public Value getValue() {
+            return value;
+        }
+
+        /** Returns the WAL offset that produced this mutation. */
+        public long getLogSequenceNumber() {
+            return logSequenceNumber;
+        }
+
+        @VisibleForTesting
+        @Nullable
+        KvEntry getPreviousEntry() {
+            return previousEntry;
+        }
+
+        @VisibleForTesting
+        @Nullable
+        KvEntry getNextEntry() {
+            return nextEntry;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            KvEntry kvEntry = (KvEntry) o;
+            return logSequenceNumber == kvEntry.logSequenceNumber
+                    && changeType == kvEntry.changeType
+                    && Objects.equals(key, kvEntry.key)
+                    && Objects.equals(value, kvEntry.value)
+                    && Objects.equals(previousEntry, kvEntry.previousEntry);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(key, value, logSequenceNumber, previousEntry);
+        }
+
+        @Override
+        public String toString() {
+            return "KvEntry{"
+                    + "changeType="
+                    + changeType
+                    + ", key="
+                    + key
+                    + ", value="
+                    + value
+                    + ", lsn="
+                    + logSequenceNumber
+                    + ", previous="
+                    + previousEntry
+                    + '}';
+        }
+    }
+
+    /** Prepared entries for an asynchronous flush. */
+    public static final class PreparedFlush {
+        private final long exclusiveUpToLogSequenceNumber;
+        private final List<KvEntry> entries;
+        private final int rowCountDiff;
+
+        private PreparedFlush(
+                long exclusiveUpToLogSequenceNumber, List<KvEntry> entries, int rowCountDiff) {
+            this.exclusiveUpToLogSequenceNumber = exclusiveUpToLogSequenceNumber;
+            this.entries = entries;
+            this.rowCountDiff = rowCountDiff;
+        }
+
+        public long exclusiveUpToLogSequenceNumber() {
+            return exclusiveUpToLogSequenceNumber;
+        }
+
+        public List<KvEntry> entries() {
+            return entries;
+        }
+
+        public int rowCountDiff() {
+            return rowCountDiff;
+        }
+
+        public boolean isEmpty() {
+            return entries.isEmpty();
+        }
+
+        /**
+         * Splits the prepared prefix only between complete WAL batches. Each segment is one atomic
+         * native write and can therefore publish its end independently after success. Budgets are
+         * checked after adding each complete WAL batch.
+         *
+         * @param targetBytesPerSegment key/value payload budget, or non-positive for unlimited
+         * @param targetEntriesPerSegment KV entry budget; the final batch may exceed either budget
+         */
+        public List<PreparedFlush> split(long targetBytesPerSegment, int targetEntriesPerSegment) {
+            checkArgument(targetEntriesPerSegment > 0, "targetEntriesPerSegment must be positive.");
+            List<PreparedFlush> segments = null;
+            int segmentStart = 0;
+            long segmentBytes = 0;
+            int segmentRowCountDiff = 0;
+            for (int i = 0; i < entries.size(); i++) {
+                KvEntry entry = entries.get(i);
+                segmentBytes += entryBytes(entry.getKey(), entry.getValue());
+                segmentRowCountDiff += rowCountDelta(entry);
+                if (entry.endOfWalBatch
+                        && i + 1 < entries.size()
+                        && (i + 1 - segmentStart >= targetEntriesPerSegment
+                                || (targetBytesPerSegment > 0
+                                        && segmentBytes >= targetBytesPerSegment))) {
+                    if (segments == null) {
+                        segments = new ArrayList<>();
+                    }
+                    segments.add(
+                            new PreparedFlush(
+                                    entry.logSequenceNumber + 1,
+                                    entries.subList(segmentStart, i + 1),
+                                    segmentRowCountDiff));
+                    segmentStart = i + 1;
+                    segmentBytes = 0;
+                    segmentRowCountDiff = 0;
+                }
+            }
+            if (segments == null) {
+                return Collections.singletonList(this);
+            }
+            segments.add(
+                    new PreparedFlush(
+                            exclusiveUpToLogSequenceNumber,
+                            entries.subList(segmentStart, entries.size()),
+                            segmentRowCountDiff));
+            return segments;
+        }
+    }
+
+    private enum EntryState {
+        ACTIVE,
+        PREPARED,
+        FLUSHED
+    }
+
+    /** A key wrapper to wrap a byte array with overriding the hashCode and equals method. */
+    public static class Key {
+        private final byte[] key;
+
+        // Currently, in our design, the Key is always created for putting to a map, or getting from
+        // a map, which means the hash code for the Key will always be calculated.
+        // So, in here, we calculate the hash code eagerly for the key.
+        private final int hashCode;
+
+        public static Key of(byte[] key) {
+            return new Key(key);
+        }
+
+        private Key(byte[] key) {
+            this.key = key;
+            this.hashCode =
+                    MurmurHashUtils.hashUnsafeBytes(key, BYTE_ARRAY_BASE_OFFSET, key.length);
+        }
+
+        public byte[] get() {
+            return key;
+        }
+
+        @Override
+        public int hashCode() {
+            return hashCode;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            Key that = (Key) o;
+
+            // first compare hash code, if hash code is not equal,
+            // it must be not equal
+            if (this.hashCode != that.hashCode) {
+                return false;
+            }
+
+            // then, compare the key
+            // we use MemorySegment to compare the key since it's faster
+            // than Arrays.equals
+            MemorySegment s1 = MemorySegment.wrap(key);
+            MemorySegment s2 = MemorySegment.wrap(that.key);
+            return key.length == that.key.length && s1.equalTo(s2, 0, 0, key.length);
+        }
+
+        @Override
+        public String toString() {
+            return "[" + Base64.getEncoder().encodeToString(key) + "]";
+        }
+    }
+
+    /**
+     * A wrapper class to wrap a byte array value. If the wrapping byte array is null, it means the
+     * {@link KvEntry} with the value is for key deletion.
+     */
+    public static class Value {
+        private final @Nullable byte[] value;
+
+        private Value(@Nullable byte[] value) {
+            this.value = value;
+        }
+
+        public static Value of(@Nullable byte[] value) {
+            return new Value(value);
+        }
+
+        /** Return the value. Return null if marked as deleted. */
+        @Nullable
+        public byte[] get() {
+            return value;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            Value value1 = (Value) o;
+            return Arrays.equals(value, value1.value);
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(value);
+        }
+
+        @Override
+        public String toString() {
+            return value == null ? "null" : "[" + Base64.getEncoder().encodeToString(value) + "]";
+        }
+    }
+
+    /** The reason why we truncate the kv pre-write buffer. */
+    public enum TruncateReason {
+        DUPLICATED,
+        ERROR,
+    }
+}

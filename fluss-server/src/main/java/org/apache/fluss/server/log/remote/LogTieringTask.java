@@ -1,0 +1,603 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.log.remote;
+
+import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.RemoteStorageException;
+import org.apache.fluss.exception.RetriableException;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.remote.RemoteLogManifest;
+import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
+import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
+import org.apache.fluss.server.log.LogSegment;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metrics.group.TableMetricGroup;
+import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.utils.clock.Clock;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeCommitRemoteLogManifestRequest;
+
+/**
+ * A task to copy log segments to remote storage and delete expired remote log segments from remote.
+ */
+public class LogTieringTask implements Runnable {
+    private static final Logger LOG = LoggerFactory.getLogger(LogTieringTask.class);
+
+    private final Replica replica;
+    private final RemoteLogTablet remoteLog;
+    private final PhysicalTablePath physicalTablePath;
+    private final TableBucket tableBucket;
+    private final RemoteLogStorage remoteLogStorage;
+    private final RemoteLogIndexCache remoteLogIndexCache;
+    private final CoordinatorGateway coordinatorGateway;
+    private final Clock clock;
+    private final int maxUploadSegmentsPerTask;
+
+    // The copied offset is empty initially for a new leader LogTieringTask, and needs to
+    // be fetched inside the task's run() method.
+    private volatile Long copiedOffset = null;
+
+    private volatile boolean cancelled = false;
+
+    public LogTieringTask(
+            Replica replica,
+            RemoteLogTablet remoteLog,
+            RemoteLogStorage remoteLogStorage,
+            RemoteLogIndexCache remoteLogIndexCache,
+            CoordinatorGateway coordinatorGateway,
+            Clock clock,
+            int maxUploadSegmentsPerTask) {
+        this.replica = replica;
+        this.remoteLog = remoteLog;
+        this.physicalTablePath = replica.getPhysicalTablePath();
+        this.tableBucket = replica.getTableBucket();
+        this.remoteLogStorage = remoteLogStorage;
+        this.remoteLogIndexCache = remoteLogIndexCache;
+        this.coordinatorGateway = coordinatorGateway;
+        this.clock = clock;
+        this.maxUploadSegmentsPerTask = maxUploadSegmentsPerTask;
+    }
+
+    @Override
+    public void run() {
+        if (isCancelled()) {
+            return;
+        }
+
+        try {
+            // Try to copy these candidate copy log segments to remote storage and try to clean
+            // up these expired remote log segments from remote.
+            runOnce();
+        } catch (InterruptedException ex) {
+            if (!isCancelled()) {
+                LOG.warn(
+                        "Current thread for table-bucket {} is interrupted. Reason: {}",
+                        tableBucket,
+                        ex.getMessage());
+            }
+        } catch (RetriableException ex) {
+            LOG.debug(
+                    "Encountered a retryable error while executing current task for table-bucket {}",
+                    tableBucket,
+                    ex);
+        } catch (Exception ex) {
+            if (!isCancelled()) {
+                LOG.warn(
+                        "Current task for table-bucket {} received error but it will be scheduled. "
+                                + "Reason: {}",
+                        tableBucket,
+                        ex.getMessage());
+            }
+        }
+    }
+
+    private void runOnce() throws InterruptedException {
+        if (isCancelled()) {
+            LOG.info("Returning from LogTieringTask runOnes as the task state is changed");
+            return;
+        }
+
+        try {
+            LogTablet logTablet = replica.getLogTablet();
+            TableMetricGroup metricGroup = replica.tableMetrics();
+            maybeUpdateCopiedOffset(logTablet);
+
+            // Get these candidate log segments to copy and these expired remote log segments to
+            // clean up.
+            List<EnrichedLogSegment> candidateToCopySegments =
+                    candidateToCopyLogSegments(logTablet);
+            // Only delete segments that have been tiered to lake to ensure data safety
+            TableConfig tableConfig = replica.getTableInfo().getTableConfig();
+            List<RemoteLogSegment> expiredRemoteLogSegments =
+                    remoteLog.expiredRemoteLogSegments(
+                            clock.milliseconds(),
+                            tableConfig.isDataLakeEnabled()
+                                    ? logTablet.getLakeLogEndOffset()
+                                    : null,
+                            tableConfig.getLogTTLMs());
+
+            // 1. For these candidateToCopySegments, we will first copy segment files to
+            // remote before commit the remote log manifest.
+            List<RemoteLogSegment> copiedSegments = new ArrayList<>();
+            long endOffset =
+                    copyLogSegmentFilesToRemote(
+                            logTablet, candidateToCopySegments, copiedSegments, metricGroup);
+
+            // 2. try to commit the remote log manifest snapshot to coordinator server and
+            // update the local cache of remote log manifest.
+            if (!copiedSegments.isEmpty() || !expiredRemoteLogSegments.isEmpty()) {
+                RemoteLogManifest currentManifest = remoteLog.currentManifest();
+                RemoteLogManifest newManifest;
+                try {
+                    newManifest =
+                            currentManifest.trimAndMerge(expiredRemoteLogSegments, copiedSegments);
+                } catch (IllegalArgumentException mergeError) {
+                    deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
+                    throw mergeError;
+                }
+                boolean success = tryToCommitRemoteLogManifest(remoteLog, newManifest);
+
+                if (success) {
+                    List<RemoteLogSegment> segmentsToDelete =
+                            segmentsToDeleteAfterCommit(
+                                    currentManifest, copiedSegments, newManifest);
+                    if (!segmentsToDelete.isEmpty()) {
+                        // 3. For these expiredRemoteLogSegments, we will delete remote log
+                        // segment files from remote after commit the remote log manifest.
+                        // TODO introduce the read reference count to avoid deleting remote log
+                        // segments while there are readers is in progress.
+                        deleteRemoteLogSegmentFiles(segmentsToDelete, metricGroup);
+
+                        remoteLogIndexCache.removeAll(
+                                segmentsToDelete.stream()
+                                        .map(RemoteLogSegment::remoteLogSegmentId)
+                                        .collect(Collectors.toList()));
+                    }
+
+                    if (endOffset > 0) {
+                        // endOffset is the next segment base offset, so we need to decrement it
+                        // by 1 to get the last copied segment's highest offset.
+                        copiedOffset = endOffset - 1;
+                    }
+                } else {
+                    LOG.error(
+                            "Failed commit remote log manifest snapshot to coordinator server "
+                                    + "for bucket: {}, copied segments: {}, expired segments: {}",
+                            tableBucket,
+                            copiedSegments,
+                            expiredRemoteLogSegments);
+
+                    if (!copiedSegments.isEmpty()) {
+                        // 4. For these copiedSegments, if snapshot commit failed, we need to
+                        // delete remote log segment files already copied in step 1.
+                        deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
+                    }
+                }
+            }
+
+        } catch (InterruptedException | RetriableException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            if (!isCancelled()) {
+                LOG.error(
+                        "Error occurred while copying log segments of bucket: {}", tableBucket, ex);
+            }
+        }
+    }
+
+    private List<EnrichedLogSegment> candidateToCopyLogSegments(LogTablet log) {
+        List<EnrichedLogSegment> candidateLogSegments = new ArrayList<>();
+        // Get highWatermark.
+        long highWatermark = log.getHighWatermark();
+        if (highWatermark < 0) {
+            LOG.warn(
+                    "The highWatermark for bucket {} is {}, which should not be negative",
+                    tableBucket,
+                    highWatermark);
+        } else if (highWatermark > 0 && copiedOffset < highWatermark) {
+            // local-log-start-offset can be ahead of the copied-offset, when enabling the
+            // remote log for the first time
+            long fromOffset = Math.max(copiedOffset + 1, log.localLogStartOffset());
+            candidateLogSegments = candidateLogSegments(log, fromOffset, highWatermark);
+            LOG.debug(
+                    "Candidate log segments for bucket {}: logLocalStartOffset: {}, copiedOffset: {}, "
+                            + "fromOffset: {}, highWatermark: {} and candidateLogSegments: {}",
+                    tableBucket,
+                    log.localLogStartOffset(),
+                    copiedOffset,
+                    fromOffset,
+                    highWatermark,
+                    candidateLogSegments);
+            if (candidateLogSegments.isEmpty()) {
+                LOG.debug(
+                        "no segments found to be copied for bucket {} which copied-offset: {} and active segment's base-offset: {}",
+                        tableBucket,
+                        copiedOffset,
+                        log.activeLogSegment().getBaseOffset());
+            }
+        } else {
+            LOG.debug(
+                    "Skipping copying segments for bucket {} to remote, current read-offset:{}, and highWatermark:{}",
+                    tableBucket,
+                    copiedOffset,
+                    highWatermark);
+        }
+
+        return candidateLogSegments;
+    }
+
+    /**
+     * Copy the given log segments to remote and add the successfully copied segment to the {@code
+     * copiedSegments} parameter.
+     *
+     * <p>If a segment copy fails (e.g., due to rate limiting or transient errors), the method stops
+     * copying further segments but retains all previously successful copies so they can still be
+     * committed, avoiding wasted uploads.
+     *
+     * @return the end offset of the last segment successfully copied to remote, or -1 if no
+     *     segments were copied.
+     */
+    private long copyLogSegmentFilesToRemote(
+            LogTablet log,
+            List<EnrichedLogSegment> segments,
+            List<RemoteLogSegment> copiedSegments,
+            TableMetricGroup metricGroup)
+            throws Exception {
+        long endOffset = -1;
+        for (EnrichedLogSegment enrichedSegment : segments) {
+            LogSegment segment = enrichedSegment.logSegment;
+            File logFile = segment.getFileLogRecords().file();
+            String logFileName = logFile.getName();
+            LOG.info(
+                    "Copying {} of table {} bucket {} to remote storage.",
+                    logFileName,
+                    physicalTablePath,
+                    tableBucket.getBucket());
+            long segmentEndOffset = enrichedSegment.nextSegmentOffset;
+
+            File writerIdSnapshotFile =
+                    log.writerStateManager().fetchSnapshot(segmentEndOffset).orElse(null);
+            LogSegmentFiles logSegmentFiles =
+                    new LogSegmentFiles(
+                            logFile.toPath(),
+                            toPathIfExists(segment.offsetIndex().file()),
+                            toPathIfExists(segment.timeIndex().file()),
+                            writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null);
+
+            UUID remoteLogSegmentId = UUID.randomUUID();
+            int sizeInBytes = segment.getFileLogRecords().sizeInBytes();
+            RemoteLogSegment copyRemoteLogSegment =
+                    RemoteLogSegment.Builder.builder()
+                            .physicalTablePath(physicalTablePath)
+                            .tableBucket(tableBucket)
+                            .remoteLogSegmentId(remoteLogSegmentId)
+                            .remoteLogStartOffset(segment.getBaseOffset())
+                            .remoteLogEndOffset(segmentEndOffset)
+                            .maxTimestamp(segment.maxTimestampSoFar())
+                            .segmentSizeInBytes(sizeInBytes)
+                            .build();
+            try {
+                remoteLogStorage.copyLogSegmentFiles(copyRemoteLogSegment, logSegmentFiles);
+            } catch (RemoteStorageException e) {
+                metricGroup.remoteLogCopyErrors().inc();
+                LOG.warn(
+                        "Failed to copy {} of table {} bucket {} to remote storage. "
+                                + "Stopping further segment copies. "
+                                + "{} segment(s) already copied successfully will be committed.",
+                        logFileName,
+                        physicalTablePath,
+                        tableBucket.getBucket(),
+                        copiedSegments.size(),
+                        e);
+                break;
+            }
+            LOG.info(
+                    "Copied {} of table {} bucket {} to remote storage as remote log segment: {}.",
+                    logFileName,
+                    physicalTablePath,
+                    tableBucket,
+                    copyRemoteLogSegment.remoteLogSegmentId());
+            metricGroup.remoteLogCopyRequests().inc();
+            metricGroup.remoteLogCopyBytes().inc(sizeInBytes);
+            copiedSegments.add(copyRemoteLogSegment);
+            endOffset = segmentEndOffset;
+        }
+        return endOffset;
+    }
+
+    /**
+     * Try to commit remote log manifest. Including three steps.
+     *
+     * <pre>
+     *     1. apply the build snapshot method (may be copy to/delete from remote)
+     *     2. upload the remote log manifest file to remote storage.
+     *     3. sending the CommitRemoteLogManifestRequest to coordinator server to try to commit this snapshot.
+     *        - If commit success, we will apply the commit success action (e.g., delete expired remote segments), and return true.
+     *        - If commit failed, we will apply rollback action (i.e., delete the new added remote segments), and return false.
+     * </pre>
+     */
+    private boolean tryToCommitRemoteLogManifest(
+            RemoteLogTablet remoteLogTablet, RemoteLogManifest newRemoteLogManifest) {
+        FsPath remoteLogManifestPath;
+        try {
+            // 1. upload the remote log manifest file to remote storage.
+            remoteLogManifestPath =
+                    remoteLogStorage.writeRemoteLogManifestSnapshot(newRemoteLogManifest);
+        } catch (Exception e) {
+            LOG.error(
+                    "Write remote log manifest file to remote storage failed for bucket {}.",
+                    tableBucket,
+                    e);
+            return false;
+        }
+
+        // 2. sending the CommitRemoteLogManifestRequest to coordinator server
+        // to try to commit this snapshot.
+        long newRemoteLogStartOffset = newRemoteLogManifest.getRemoteLogStartOffset();
+        long newRemoteLogEndOffset = newRemoteLogManifest.getRemoteLogEndOffset();
+        long newRemoteLogSize = newRemoteLogManifest.getRemoteLogSize();
+        int retrySendCommitTimes = 1;
+        while (retrySendCommitTimes <= 10) {
+            try {
+                boolean success =
+                        commitRemoteLogManifest(
+                                new CommitRemoteLogManifestData(
+                                        tableBucket,
+                                        remoteLogManifestPath,
+                                        newRemoteLogStartOffset,
+                                        newRemoteLogEndOffset,
+                                        newRemoteLogManifest.getHighestCopiedEndOffset(),
+                                        // TODO: manifest snapshot should include the epoch info,
+                                        //  and this should be moved into Replica under read lock of
+                                        //  leaderIsrUpdateLock, see FLUSS-56282058
+                                        replica.getCoordinatorEpoch(),
+                                        replica.getBucketEpoch()));
+                if (!success) {
+                    // the commit failed, it means the commit snapshot is invalid or register zk
+                    // failed, we will revert this commit and delete the remote log manifest
+                    // file.
+                    // TODO: add the fail reason in the future.
+                    LOG.error(
+                            "Commit remote log manifest failed for table bucket {}. We will delete the"
+                                    + " written remote log manifest file",
+                            tableBucket);
+                    remoteLogStorage.deleteRemoteLogManifestSnapshot(remoteLogManifestPath);
+                    return false;
+                } else {
+                    // commit succeed.
+                    // TODO: commit with version to avoid the manifest has been updated
+                    remoteLogTablet.loadRemoteLogManifest(newRemoteLogManifest);
+                    LogTablet logTablet = replica.getLogTablet();
+
+                    logTablet.updateRemoteLogOffsets(
+                            newRemoteLogStartOffset,
+                            newRemoteLogEndOffset,
+                            newRemoteLogManifest.getHighestCopiedEndOffset());
+                    logTablet.updateRemoteLogSize(newRemoteLogSize);
+                    return true;
+                }
+            } catch (Exception e) {
+                // the commit failed with unexpected exception, like network error, we will
+                // retry send.
+                LOG.error(
+                        "The {} time try to commit remote log manifest failed for bucket {}.",
+                        retrySendCommitTimes,
+                        tableBucket,
+                        e);
+                retrySendCommitTimes++;
+            }
+        }
+
+        LOG.error(
+                "Commit remote log manifest failed after retry 10 times for table-bucket {}. "
+                        + "We will ignore this commit but don't delete the remote log "
+                        + "manifest file",
+                tableBucket);
+        return false;
+    }
+
+    private List<RemoteLogSegment> segmentsToDeleteAfterCommit(
+            RemoteLogManifest previousManifest,
+            List<RemoteLogSegment> copiedSegments,
+            RemoteLogManifest newManifest) {
+        List<RemoteLogSegment> segmentsToDelete = new ArrayList<>();
+        Set<UUID> activeSegmentIds =
+                newManifest.getRemoteLogSegmentList().stream()
+                        .map(RemoteLogSegment::remoteLogSegmentId)
+                        .collect(Collectors.toSet());
+        Set<UUID> segmentIdsToDelete = new HashSet<>();
+        addInactiveSegments(
+                segmentsToDelete,
+                segmentIdsToDelete,
+                activeSegmentIds,
+                previousManifest.getRemoteLogSegmentList());
+        addInactiveSegments(segmentsToDelete, segmentIdsToDelete, activeSegmentIds, copiedSegments);
+        return segmentsToDelete;
+    }
+
+    private void addInactiveSegments(
+            List<RemoteLogSegment> target,
+            Set<UUID> targetIds,
+            Set<UUID> activeSegmentIds,
+            List<RemoteLogSegment> candidates) {
+        for (RemoteLogSegment candidate : candidates) {
+            UUID segmentId = candidate.remoteLogSegmentId();
+            if (!activeSegmentIds.contains(segmentId) && targetIds.add(segmentId)) {
+                target.add(candidate);
+            }
+        }
+    }
+
+    private boolean commitRemoteLogManifest(CommitRemoteLogManifestData data) throws Exception {
+        CommitRemoteLogManifestRequest request = makeCommitRemoteLogManifestRequest(data);
+        return coordinatorGateway.commitRemoteLogManifest(request).get().isCommitSuccess();
+    }
+
+    private Path toPathIfExists(File file) {
+        return file.exists() ? file.toPath() : null;
+    }
+
+    private void maybeUpdateCopiedOffset(LogTablet logTablet) {
+        if (copiedOffset == null) {
+            copiedOffset = findCopiedOffset(logTablet);
+            LOG.info(
+                    "Found copied offset {} for bucket {} after becoming leader",
+                    copiedOffset,
+                    tableBucket);
+        }
+    }
+
+    private long findCopiedOffset(LogTablet logTablet) {
+        long highestCopiedEndOffset = remoteLog.getHighestCopiedEndOffset();
+        if (highestCopiedEndOffset < 0L) {
+            return -1L;
+        }
+
+        long localEndOffset = logTablet.localLogEndOffset();
+        if (localEndOffset < highestCopiedEndOffset) {
+            LOG.warn(
+                    "Local end offset is behind the highest copied end offset for bucket {}: "
+                            + "local={}, copied={}. Reset copied progress to the local end.",
+                    tableBucket,
+                    localEndOffset,
+                    highestCopiedEndOffset);
+        }
+        return Math.min(localEndOffset, highestCopiedEndOffset) - 1L;
+    }
+
+    /**
+     * Returns up to {@code maxUploadSegmentsPerTask} segments eligible for copying to remote
+     * storage. A segment is eligible if it meets the following criteria:
+     *
+     * <p>1. Segment is not the active segment.
+     *
+     * <p>2. Segment end-offset is less than the highWatermark as remote storage should contain only
+     * committed/acked records.
+     *
+     * <p>The number of returned segments is capped at {@code maxUploadSegmentsPerTask} to prevent
+     * overwhelming the remote storage when there is a large backlog.
+     */
+    private List<EnrichedLogSegment> candidateLogSegments(
+            LogTablet log, long fromOffset, long highWatermark) {
+        List<EnrichedLogSegment> candidateLogSegments = new ArrayList<>();
+        List<LogSegment> segments = log.logSegments(fromOffset, Long.MAX_VALUE);
+        if (!segments.isEmpty()) {
+            for (int idx = 1; idx < segments.size(); idx++) {
+                LogSegment previousSeg = segments.get(idx - 1);
+                LogSegment currentSeg = segments.get(idx);
+                long curSegBaseOffset = currentSeg.getBaseOffset();
+                if (curSegBaseOffset <= highWatermark) {
+                    candidateLogSegments.add(new EnrichedLogSegment(previousSeg, curSegBaseOffset));
+                    // Limit the number of segments to upload per task execution to prevent
+                    // overwhelming the remote storage when there is a large backlog.
+                    if (candidateLogSegments.size() >= maxUploadSegmentsPerTask) {
+                        break;
+                    }
+                }
+            }
+            // Discard the last active segment
+        }
+        return candidateLogSegments;
+    }
+
+    /** Delete the remote log segment files. */
+    private void deleteRemoteLogSegmentFiles(
+            List<RemoteLogSegment> remoteLogSegmentList, TableMetricGroup metricGroup) {
+        for (RemoteLogSegment remoteLogSegment : remoteLogSegmentList) {
+            try {
+                remoteLogStorage.deleteLogSegmentFiles(remoteLogSegment);
+                metricGroup.remoteLogDeleteRequests().inc();
+            } catch (Exception e) {
+                LOG.error(
+                        "Error occurred while deleting remote log segment files: {} for bucket {}, "
+                                + "the delete files operation will be skipped.",
+                        tableBucket,
+                        remoteLogSegment,
+                        e);
+                metricGroup.remoteLogDeleteErrors().inc();
+            }
+        }
+    }
+
+    public void cancel() {
+        cancelled = true;
+    }
+
+    public boolean isCancelled() {
+        return cancelled;
+    }
+
+    public String toString() {
+        return this.getClass() + "[" + tableBucket + "]";
+    }
+
+    private static class EnrichedLogSegment {
+        private final LogSegment logSegment;
+        private final long nextSegmentOffset;
+
+        public EnrichedLogSegment(LogSegment logSegment, long nextSegmentOffset) {
+            this.logSegment = logSegment;
+            this.nextSegmentOffset = nextSegmentOffset;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            EnrichedLogSegment that = (EnrichedLogSegment) o;
+            return nextSegmentOffset == that.nextSegmentOffset
+                    && Objects.equals(logSegment, that.logSegment);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(logSegment, nextSegmentOffset);
+        }
+
+        @Override
+        public String toString() {
+            return "EnrichedLogSegment{"
+                    + "logSegment="
+                    + logSegment
+                    + ", nextSegmentOffset="
+                    + nextSegmentOffset
+                    + '}';
+        }
+    }
+}

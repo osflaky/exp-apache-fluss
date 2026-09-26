@@ -1,0 +1,1358 @@
+---
+title: Monitor Metrics
+sidebar_position: 3
+---
+
+# Monitor Metrics
+
+Fluss has built a metrics system to measure the behaviours of cluster and table, like the active CoordinatorServer, 
+the number of table, the bytes written, the number of records written, etc.
+
+Fluss supports different metric types: **Counters**, **Gauges**, **Histograms**, and **Meters**.
+
+- `Gauge`: Provides a value of any type at a point in time.
+- `Counter`: Used to count values by incrementing and decrementing.
+- `Histogram`: Measure the statistical distribution of a set of values including the min, max, mean, standard deviation and percentile.
+- `Meter`: The gauge exports the meter's rate.
+
+Fluss client also has supported built-in metrics to measure operations of **write to**, **read from** fluss cluster, 
+which can be bridged to Flink use Flink connector standard metrics.
+
+## Scope
+
+Every metric is assigned an identifier and a set of key-value pairs under which the metric will be reported.
+
+The identifier is delimited by `metrics.scope.delimiter`. Currently, the `metrics.scope.delimiter` is not configurable, 
+it determined by the metric reporter. Take prometheus as example, the scope will delimited by `_`, so the scope like `A_B_C`, 
+while Fluss metrics will always begin with `fluss`, as `fluss_A_B_C`.
+
+The key-value pairs are called **variables** and are used to filter metrics. There are no restrictions on the 
+number of order of variables. Variables are case-sensitive.
+
+## Reporter
+
+For information on how to set up Fluss's metric reporters please take a look at the [Metric Reporters](metric-reporters.md) page.
+
+## Metrics List
+
+By default, Fluss provides **cluster state** metrics, **table state** metrics, and bridging to
+**Flink connector** standard metrics. This section is a reference of all these metrics.
+
+The tables below generally feature 5 columns:
+
+* The "Scope" column describes which scope format is used to generate the system scope.
+  For example, if the cell contains `tabletserver` then the scope format for `fluss_tabletserver` is used.
+  If the cell contains multiple values, separated by a slash, then the metrics are reported multiple
+  times for different entities, like for both `tabletserver` and `coordinator`.
+
+* The (optional)"Infix" column describes which infix is appended to the scope.
+
+* The "Metrics" column lists the names of all metrics that are registered for the given scope and infix.
+
+* The "Description" column provides information as to what a given metric is measuring.
+
+* The "Type" column describes which metric type is used for the measurement.
+
+Thus, in order to infer the metric identifier:
+
+1. Take the "fluss_" first.
+2. Take the scope-format based on the "Scope" column
+3. Append the value in the "Infix" column if present, and account for the `metrics.scope.delimiter` setting
+4. Append metric name.
+5. One metric for prometheus will be like `fluss_tabletserver_status_JVM_CPU_load`
+
+### CPU
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="2"><strong>coordinator/tabletserver</strong></th>
+      <td rowspan="2">status_JVM_CPU</td>
+      <td>load</td>
+      <td>The recent CPU usage of the JVM.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>time</td>
+      <td>The CPU time used by the JVM.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### Memory
+
+The memory-related metrics require Oracle's memory management (also included in OpenJDK's Hotspot implementation) to be in place.
+Some metrics might not be exposed when using other JVM implementations (e.g. IBM's J9).
+
+<table class="table table-bordered">                               
+  <thead>                                                          
+    <tr>                                                           
+      <th class="text-left">Scope</th>
+      <th class="text-left">Infix</th>
+      <th class="text-left">Metrics</th>
+      <th class="text-left">Description</th>
+      <th class="text-left">Type</th>               
+    </tr>                                                          
+  </thead>                                                         
+  <tbody>                                                          
+    <tr>                                                           
+      <th rowspan="17"><strong>coordinator/tabletserver</strong></th>
+      <td rowspan="15">status_JVM_memory</td>
+      <td>heap_used</td>
+      <td>The amount of heap memory currently used (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>heap_committed</td>
+      <td>The amount of heap memory guaranteed to be available to the JVM (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>heap_max</td>
+      <td>The maximum amount of heap memory that can be used for memory management (in bytes). <br/>
+      This value might not be necessarily equal to the maximum value specified through -Xmx or
+      the equivalent Fluss configuration parameter. Some GC algorithms allocate heap memory that won't
+      be available to the user code and, therefore, not being exposed through the heap metrics.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>nonHeap_used</td>
+      <td>The amount of non-heap memory currently used (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>nonHeap_committed</td>
+      <td>The amount of non-heap memory guaranteed to be available to the JVM (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>nonHeap_max</td>
+      <td>The maximum amount of non-heap memory that can be used for memory management (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>metaspace_used</td>
+      <td>The amount of memory currently used in the Metaspace memory pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>metaspace_committed</td>
+      <td>The amount of memory guaranteed to be available to the JVM in the Metaspace memory pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>metaspace_max</td>
+      <td>The maximum amount of memory that can be used in the Metaspace memory pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>direct_count</td>
+      <td>The number of buffers in the direct buffer pool.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>direct_memoryUsed</td>
+      <td>The amount of memory used by the JVM for the direct buffer pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>direct_totalCapacity</td>
+      <td>The total capacity of all buffers in the direct buffer pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>mapped_count</td>
+      <td>The number of buffers in the mapped buffer pool.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>mapped_memoryUsed</td>
+      <td>The amount of memory used by the JVM for the mapped buffer pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>mapped_totalCapacity</td>
+      <td>The number of buffers in the mapped buffer pool (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>                                                         
+</table>
+
+### Threads
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="1"><strong>coordinator/tabletserver</strong></th>
+      <td rowspan="1">status_JVM_threads</td>
+      <td>count</td>
+      <td>The total number of live threads.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### GarbageCollection
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="3"><strong>coordinator/tabletserver</strong></th>
+      <td rowspan="3">status_JVM_GC</td>
+      <td>&lt;Collector/all&gt;_count</td>
+      <td>The total number of collections that have occurred for the given (or all) collector.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>&lt;Collector/all&gt;_time</td>
+      <td>The total time spent performing garbage collection for the given (or all) collector.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>&lt;Collector/all&gt;_timeMsPerSecond</td>
+      <td>The time (in milliseconds) spent garbage collecting per second for the given (or all) collector.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### Netty
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="4"><strong>coordinator/tabletserver/client</strong></th>
+      <td rowspan="4">netty</td>
+      <td>usedDirectMemory</td>
+      <td>The number of bytes of direct memory used by netty.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>numDirectArenas</td>
+      <td>The number of direct arenas in netty.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>numAllocationsPerSecond</td>
+      <td>The number of allocations done via the arena per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>numHugeAllocationsPerSecond</td>
+      <td>The number of huge allocations done via the arena per second.</td>
+      <td>Meter</td>
+    </tr>
+  </tbody>
+</table>
+
+### Coordinator Server
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+       <th rowspan="28"><strong>coordinator</strong></th>
+      <td style={{textAlign: 'center', verticalAlign: 'middle' }} rowspan="11">-</td>
+      <td>activeCoordinatorCount</td>
+      <td>The number of active CoordinatorServer (only leader) in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>aliveCoordinatorCount</td>
+      <td>The number of alive (including leader and standby) CoordinatorServer in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>activeTabletServerCount</td>
+      <td>The number of active TabletServer in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>offlineBucketCount</td>
+      <td>The total number of offline buckets in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>tableCount</td>
+      <td>The total number of tables in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>bucketCount</td>
+      <td>The total number of buckets in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>partitionCount</td>
+      <td>The total number of partitions in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>kvSnapshotLeaseCount</td>
+      <td>The total number of kv snapshot leases in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>leasedKvSnapshotCount</td>
+      <td>The total number of leased kv snapshots in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>replicasToDeleteCount</td>
+      <td>The total number of replicas in the progress to be deleted in this cluster.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>pendingLeaderActivationCount</td>
+      <td>The number of buckets currently waiting for the leader-activation acknowledgement from the target tablet server. A non-zero, sustained value blocks the cluster-health API from reporting GREEN and will hold the readiness gate during a rolling upgrade; if it stays non-zero indefinitely it indicates a stuck activation that requires investigation.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="3">event</td>
+      <td>eventQueueSize</td>
+      <td>The number of events currently waiting to be processed in the coordinator event queue. This metric is labeled with <code>event_type</code> to distinguish between different types of coordinator events.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>eventQueueTimeMs</td>
+      <td>The time that an event spent waiting in the queue to be processed.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>eventProcessingTimeMs</td>
+      <td>The time that an event took to be processed by the coordinator event processor. This metric is labeled with <code>event_type</code> to distinguish between different types of coordinator events.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td rowspan="1">physicalStorage</td>
+      <td>remoteKvSize</td>
+      <td>The physical storage size of remote KV store.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td rowspan="2">table</td>
+      <td>bucketCount</td>
+      <td>The number of buckets of each table.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>partitionCount</td>
+      <td>The number of partitions of each table.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td rowspan="2">table_bucket</td>
+      <td>numKvSnapshots</td>
+      <td>The number of kv snapshots of each table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>allKvSnapshotSize</td>
+      <td>All kv snapshot size of each table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="2">lakeTiering</td>
+      <td>pendingTablesCount</td>
+      <td>The number of tables waiting to be tiered.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>runningTablesCount</td>
+      <td>The number of tables currently being tiered.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="8">lakeTiering_table</td>
+      <td>freshness</td>
+      <td>The user-configured data freshness interval (in milliseconds) for this table.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>tierLag</td>
+      <td>Time in milliseconds since the last successful tiering operation for this table. For newly registered tables that have never completed a tiering round, the lag is measured from the time the table was registered.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>tieredTimestamp</td>
+      <td>The epoch timestamp (in milliseconds) of the last successful tiering operation for this table. For newly registered tables that have never completed a tiering round, this is the time the table was registered.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>tierDuration</td>
+      <td>Duration in milliseconds of the last tiering operation for this table.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>failuresTotal</td>
+      <td>The total number of tiering failures for this table.</td>
+      <td>Counter</td>
+    </tr>
+    <tr>
+      <td>fileSize</td>
+      <td>Cumulative total file size (in bytes) of the lake table after the last tiering round. Returns -1 if no tiering has completed yet.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>recordCount</td>
+      <td>Cumulative total record count of the lake table after the last tiering round. Returns -1 if no tiering has completed yet.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>pendingTime</td>
+      <td>How long (in milliseconds) the table has been waiting in the pending queue for tiering. Returns 0 when the table is not currently pending.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### Tablet Server
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="39"><strong>tabletserver</strong></th>
+      <td style={{textAlign: 'center', verticalAlign: 'middle' }} rowspan="27">-</td>
+      <td>messagesInPerSecond</td>
+      <td>The number of messages written per second to this server.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>bytesInPerSecond</td>
+      <td>The number of bytes written per second to this server.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>bytesOutPerSecond</td>
+      <td>The number of bytes read per second from this server.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>replicationBytesInPerSecond</td>
+      <td>The bytes of data write into follower replica for data sync.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>replicationBytesOutPerSecond</td>
+      <td>The bytes of data read from leader replica for data sync.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>leaderCount</td>
+      <td>The total number of leader replicas in this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>replicaCount</td>
+      <td>The total number of replicas (include follower replicas) in this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>writerIdCount</td>
+      <td>The writer id count</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>delayedWriteCount</td>
+      <td>The delayed write count in this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>delayedFetchCount</td>
+      <td>The delayed fetch log operation count in this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>delayedWriteExpiresPerSecond</td>
+      <td>The delayed write operation expire count per second in this TabletServer.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>delayedFetchFromFollowerExpiresPerSecond</td>
+      <td>The delayed fetch log operation from follower expire count per second in this TabletServer.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>delayedFetchFromClientExpiresPerSecond</td>
+      <td>The delayed fetch log operation from client expire count per second in this TabletServer.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>underMinIsr</td>
+      <td>The count of buckets who is under min isr in this server.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>underReplicated</td>
+      <td>The count of buckets who is under replication factor in this server.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>atMinIsr</td>
+      <td>The count of buckets who is at min isr in this server.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>isrExpandsPerSecond</td>
+      <td>The number of isr expands per second.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>isrShrinksPerSecond</td>
+      <td>The number of isr shrinks per second.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>failedIsrUpdatesPerSecond</td>
+      <td>The failed isr updates per second.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>logFlushPerSecond</td>
+      <td>The log flush count per second.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>logFlushLatencyMs</td>
+      <td>The log flush latency in ms.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>kvFlushPerSecond</td>
+      <td>The kv pre-write buffer flush to underlying RocksDB count per second.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>kvFlushLatencyMs</td>
+      <td>The kv pre-write buffer flush to underlying RocksDB latency in ms.</td>
+      <td>Histogram</td>
+    </tr>
+     <tr>
+      <td>preWriteBufferTruncateAsDuplicatedPerSecond</td>
+      <td>The number of kv pre-write buffer truncate due to the batch duplicated per second.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>preWriteBufferTruncateAsErrorPerSecond</td>
+      <td>The number of kv pre-write buffer truncate due to the error happened when writing cdc to log per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>kvWalMemoryPoolUsage</td>
+      <td>Memory currently allocated from the server-wide WAL memory pool for primary key tables in this server (in bytes). The pool capacity is configured by <code>server.buffer.memory-size</code>.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>kvWalMemoryPoolCapacity</td>
+      <td>Total capacity of the server-wide WAL memory pool for primary key tables in this server (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="4">historical</td>
+      <td>inflightRequests</td>
+      <td>The number of accepted historical requests that have not completed.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>lookupCacheDiskSize</td>
+      <td>The current historical lookup cache footprint on local disk, in bytes.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>lookupCacheTableCount</td>
+      <td>The number of table lookupers currently retained in the historical lookup cache.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>lookupCacheCapacityEvictions</td>
+      <td>The cumulative number of cached table lookupers evicted because the cache retains at most ten tables.</td>
+      <td>Counter</td>
+    </tr>
+    <tr>
+      <td rowspan="2">logicalStorage</td>
+      <td>logSize</td>
+      <td>The logical storage size of log managed by this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>kvSize</td>
+      <td>The logical storage size of kv managed by this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="2">physicalStorage</td>
+      <td>localSize</td>
+      <td>The physical local storage size of this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>remoteLogSize</td>
+      <td>The physical remote log size managed by this TabletServer.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="4">user</td>
+      <td>bytesIn</td>
+      <td>The total number of bytes written to this server labeled with <code>user</code> name and <code>database</code> name and <code>table</code> name. </td>
+      <td>Counter</td>
+    </tr>
+    <tr>
+      <td>bytesOut</td>
+      <td>The total number of bytes read from this server labeled with <code>user</code> name and <code>database</code> name and <code>table</code> name. </td>
+      <td>Counter</td>
+    </tr>
+     <tr>
+      <td>bytesInPerSecond</td>
+      <td>The number of bytes written per second to this server labeled with <code>user</code>.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>bytesOutPerSecond</td>
+      <td>The number of bytes read per second from this server labeled with <code>user</code>.</td>
+      <td>Meter</td>
+    </tr>
+  </tbody>
+</table>
+
+### Request
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+     <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="2"><strong>coordinator</strong></th>
+      <td rowspan="1">request</td>
+      <td>requestQueueSize</td>
+      <td>The CoordinatorServer node network waiting queue size.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="1">request_processor_index</td>
+      <td>requestQueueSize</td>
+      <td>The CoordinatorServer node network waiting queue size labeled with <code>processor_index</code>.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <th rowspan="10">tabletserver</th>
+      <td rowspan="1">request</td>
+      <td>requestQueueSize</td>
+      <td>The TabletServer node network waiting queue size.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="1">request_processor_index</td>
+      <td>requestQueueSize</td>
+      <td>The TabletServer node network waiting queue size labeled with <code>processor_index</code>.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="7">
+          request_produceLog
+          request_putKv
+          request_historicalPutKv
+          request_lookup
+          request_historicalLookup
+          request_prefixLookup
+          request_metadata
+          request_fetchLogClient
+          request_fetchLogFollower
+      </td>
+      <td>requestsPerSecond</td>
+      <td>The total number of requests processed per second for each request type.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>errorsPerSecond</td>
+      <td>The total number of error requests processed per second for each request type.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>requestBytes</td>
+      <td>Size of requests for each request type.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>totalTimeMs</td>
+      <td>The total time it takes for each request type, it's requestQueueTimeMs + requestProcessTimeMs + responseSendTimeMs.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>requestProcessTimeMs</td>
+      <td>The time the current TabletServer node spends to process a request.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>requestQueueTimeMs</td>
+      <td>The wait time spent by the request in the network waiting queue for each request type.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>responseSendTimeMs</td>
+      <td>Time to send the response	for each request type.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td rowspan="1">request_error</td>
+      <td>errorsPerSecond</td>
+      <td>The number of failed RPC responses processed per second for each request type and <code>error</code> name. One event is recorded for each failed RPC response; <code>NONE</code> and errors in successful response buckets are excluded. A series appears only after its request/error first occurs.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <th rowspan="6">client</th>
+      <td rowspan="6">request</td>
+      <td>bytesInPerSecond</td>
+      <td>The data bytes return from another server per second.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>bytesOutPerSecond</td>
+      <td>The data bytes send from client to another server per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>requestsPerSecond</td>
+      <td>The requests count send from this client to another server per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>responsesPerSecond</td>
+      <td>The responses count return from another server per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>requestLatencyMs</td>
+      <td>The request latency.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>requestsInFlight</td>
+      <td>The in flight requests count send from client to another server.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### Table/Bucket
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+     <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="41"><strong>tabletserver</strong></th>
+      <td rowspan="22">table</td>
+      <td>messagesInPerSecond</td>
+      <td>The number of messages written per second to this table.</td>
+      <td>Meter</td>
+    </tr>
+     <tr>
+      <td>bytesInPerSecond</td>
+      <td>The number of bytes written per second to this table.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>bytesOutPerSecond</td>
+      <td>The number of bytes read per second from this table.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalProduceLogRequestsPerSecond</td>
+      <td>The number of produce log requests to write log to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedProduceLogRequestsPerSecond</td>
+      <td>The number of failed produce log requests to write log to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalFetchLogRequestsPerSecond</td>
+      <td>The number of fetch log requests to read log from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedFetchLogRequestsPerSecond</td>
+      <td>The number of failed fetch log requests to read log from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalPutKvRequestsPerSecond</td>
+      <td>The number of put kv requests to put kv to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedPutKvRequestsPerSecond</td>
+      <td>The number of failed put kv requests to put kv to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalLookupRequestsPerSecond</td>
+      <td>The number of lookup requests to lookup value by key from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedLookupRequestsPerSecond</td>
+      <td>The number of failed lookup requests to lookup value by key from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalLimitScanRequestsPerSecond</td>
+      <td>The number of limit scan requests to scan records with limit from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedLimitScanRequestsPerSecond</td>
+      <td>The number of failed limit scan requests to scan records with limit from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalPrefixLookupRequestsPerSecond</td>
+      <td>The number of prefix lookup requests to lookup value by prefix key from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedPrefixLookupRequestsPerSecond</td>
+      <td>The number of failed prefix lookup requests to lookup value by prefix key from this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>remoteLogCopyBytesPerSecond</td>
+      <td>The bytes of log data copied to remote per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>remoteLogCopyRequestsPerSecond</td>
+      <td>The number of remote log copy requests to copy local log to remote per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>remoteLogCopyErrorPerSecond</td>
+      <td>The number of error remote log copy requests to copy local log to remote per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>remoteLogDeleteRequestsPerSecond</td>
+      <td>The number of delete remote log requests to delete remote log after log ttl per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>remoteLogDeleteErrorPerSecond</td>
+      <td>The number of failed delete remote log requests to delete remote log after log ttl per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>remoteKvCopyBytesPerSecond</td>
+      <td>The bytes of kv snapshot data uploaded to remote per second for this table. Only available for primary key tables.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td rowspan="6">table_historical</td>
+      <td>totalPutKvRequestsPerSecond</td>
+      <td>The number of historical put kv requests to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedPutKvRequestsPerSecond</td>
+      <td>The number of historical put kv requests that failed unexpectedly for this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalLookupRequestsPerSecond</td>
+      <td>The number of historical lookup requests to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedLookupRequestsPerSecond</td>
+      <td>The number of historical lookup requests that failed unexpectedly for this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>lakeLookupsPerSecond</td>
+      <td>The number of historical lake point lookups performed for this table per second, labeled with <code>lookup_file_downloaded</code>.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>lakeLookupTimeMs</td>
+      <td>The time spent on a historical lake point lookup, in milliseconds, labeled with <code>lookup_file_downloaded</code>.</td>
+      <td>Histogram</td>
+    </tr>
+     <tr>
+      <td rowspan="3">table_bucket_log</td>
+      <td>numSegments</td>
+      <td>The number of segments in local storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>startOffset</td>
+      <td>The start offset in local storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>endOffset</td>
+      <td>The end offset in local storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td rowspan="3">table_bucket_lakeTiering</td>
+      <td>pendingRecords</td>
+      <td>The number of records lag between the latest log record and the latest tiered lake log record for this table bucket. Returns -1 if row count is disabled (WAL mode or v0.9 old table) and no tiering has completed.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>timestampLag</td>
+      <td>The timestamp lag between the latest log record and the latest tiered lake log record for this table bucket, in milliseconds.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>pendingRecordsLag</td>
+      <td>The elapsed time, in milliseconds, since the oldest committed record in this table bucket became pending for lake tiering. Returns 0 when no committed records are pending lake tiering.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td rowspan="4">table_bucket_remoteLog</td>
+      <td>numSegments</td>
+      <td>The number of segments in remote storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>startOffset</td>
+      <td>The start offset in remote storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>endOffset</td>
+      <td>The end offset in remote storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>size</td>
+      <td>The number of bytes written per second to this table.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>table_bucket_physicalStorage</td>
+      <td>localLogSize</td>
+      <td>The physical size, in bytes, of all local log segments for this table bucket on this TabletServer. The metric is reported for both leader and follower replicas and includes the partition and bucket variables. Sum it by partition or table, and across TabletServers, to obtain the corresponding local log footprint including replication.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td rowspan="2">table_bucket_logicalStorage</td>
+      <td>logSize</td>
+      <td>The logical storage size of log for this table bucket. </td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>kvSize</td>
+      <td>The logical storage size of kv for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+For <code>lakeLookupsPerSecond</code> and <code>lakeLookupTimeMs</code>,
+<code>lookup_file_downloaded="true"</code> means that the lookup downloaded at least one local
+lookup file; <code>false</code> means that it did not download a local lookup file.
+
+### RocksDB
+
+RocksDB metrics provide insights into the performance and health of the underlying RocksDB storage engine used by Fluss. These metrics are categorized into table-level metrics (aggregated from all buckets of a table) and server-level metrics (aggregated from all tables in a server).
+
+#### Table-level RocksDB Metrics (Max Aggregation)
+
+These metrics use Max aggregation to show the maximum value across all buckets of a table, which helps identify the worst-performing bucket.
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="7"><strong>tabletserver</strong></th>
+      <td rowspan="7">table</td>
+      <td>rocksdbWriteStallMicrosMax</td>
+      <td>Maximum write stall duration across all buckets of this table (in microseconds). Write stalls occur when RocksDB needs to slow down writes due to compaction pressure or memory limits.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbGetLatencyMicrosMax</td>
+      <td>Maximum get operation latency across all buckets of this table (in microseconds). This represents the slowest read operation among all buckets.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbWriteLatencyMicrosMax</td>
+      <td>Maximum write operation latency across all buckets of this table (in microseconds). This represents the slowest write operation among all buckets.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbNumFilesAtLevel0Max</td>
+      <td>Maximum number of L0 files across all buckets of this table. A high number of L0 files indicates compaction pressure and may impact read performance.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbFlushPendingMax</td>
+      <td>Maximum flush pending indicator across all buckets of this table. A value greater than 0 indicates that some buckets have pending flush operations.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbCompactionPendingMax</td>
+      <td>Maximum compaction pending indicator across all buckets of this table. A value greater than 0 indicates that some buckets have pending compaction operations.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbCompactionTimeMicrosMax</td>
+      <td>Maximum compaction time across all buckets of this table (in microseconds). This represents the longest compaction operation among all buckets.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Table-level RocksDB Metrics (Sum Aggregation)
+
+These metrics use Sum aggregation to show the total value across all buckets of a table, providing an overall view of table-level I/O and storage operations.
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="5"><strong>tabletserver</strong></th>
+      <td rowspan="5">table</td>
+      <td>rocksdbBytesReadTotal</td>
+      <td>Total bytes read across all buckets of this table. This includes both user reads and internal reads (e.g., compaction reads).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbBytesWrittenTotal</td>
+      <td>Total bytes written across all buckets of this table. This includes both user writes and internal writes (e.g., compaction writes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbFlushBytesWrittenTotal</td>
+      <td>Total flush bytes written across all buckets of this table. This represents the amount of data flushed from memtable to persistent storage.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbCompactionBytesReadTotal</td>
+      <td>Total compaction bytes read across all buckets of this table. This represents the amount of data read during compaction operations.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbCompactionBytesWrittenTotal</td>
+      <td>Total compaction bytes written across all buckets of this table. This represents the amount of data written during compaction operations.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Server-level RocksDB Metrics
+
+These metrics provide a server-wide view of RocksDB resource usage. The total memory metric sums usage across tables, while the shared block cache metrics report the single cache owned by the server.
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="6"><strong>tabletserver</strong></th>
+      <td style={{textAlign: 'center', verticalAlign: 'middle' }} rowspan="6">-</td>
+      <td>rocksdbMemoryUsageTotal</td>
+      <td>Total memory usage across all RocksDB instances in this server (in bytes). This includes memtables, table readers, and block cache. When <code>kv.rocksdb.shared-block-cache.size</code> is greater than 0, the shared block cache usage is counted once to avoid double-counting across tablets.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbSharedBlockCacheUsage</td>
+      <td>Memory usage of the shared RocksDB block cache in this server (in bytes). Reports 0 when the shared block cache is disabled.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbSharedBlockCacheCapacity</td>
+      <td>Configured soft capacity of the shared RocksDB block cache in this server (in bytes). Reports 0 when the shared block cache is disabled. This is not a hard limit on process memory.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbSharedBlockCachePinnedUsage</td>
+      <td>Pinned memory usage of the shared RocksDB block cache in this server (in bytes). Reports 0 when the shared block cache is disabled.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbSharedWriteBufferUsage</td>
+      <td>Approximate memory charged to the shared RocksDB write buffer manager in this server (in bytes). This is a logical accounting value, not process RSS or a hard memory bound. It is not added to <code>rocksdbMemoryUsageTotal</code>, whose memtable component already reports the same memory.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbSharedWriteBufferCapacity</td>
+      <td>Configured soft capacity of the shared RocksDB write buffer manager in this server (in bytes). Reports 0 when the shared write buffer manager is disabled.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Table-level RocksDB Memory Metrics (Sum Aggregation)
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="6"><strong>tabletserver</strong></th>
+      <td rowspan="6">table</td>
+      <td>rocksdbMemTableMemoryUsageTotal</td>
+      <td>Total memtable memory usage across all buckets of this table (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbMemTableUnFlushedMemoryUsageTotal</td>
+      <td>Total unflushed memtable memory usage across all buckets of this table (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbTableReadersMemoryUsageTotal</td>
+      <td>Total table readers (indexes and filters) memory usage across all buckets of this table (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbBlockCacheMemoryUsageTotal</td>
+      <td>Total block cache memory usage across all buckets of this table (in bytes). When <code>kv.rocksdb.shared-block-cache.size</code> is greater than 0, this metric reports 0 because shared cache usage is not attributable to an individual table; it is reported at the server level via <code>rocksdbSharedBlockCacheUsage</code>.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>rocksdbBlockCachePinnedUsageTotal</td>
+      <td>Total pinned memory in block cache across all buckets of this table (in bytes). When <code>kv.rocksdb.shared-block-cache.size</code> is greater than 0, this metric reports 0 because shared pinned usage is not attributable to an individual table; it is reported at the server level via <code>rocksdbSharedBlockCachePinnedUsage</code>.</td>
+      <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### KV Backpressure
+
+KV backpressure metrics report the cooperative backpressure signal computed by primary-key tables on top of RocksDB. These metrics are aggregated from all buckets of a table and expose two core signals: peak intensity and cumulative hard rejections.
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="2"><strong>tabletserver</strong></th>
+      <td rowspan="2">table</td>
+      <td>kvBackpressureMaxPressure</td>
+      <td>Maximum normalized backpressure value across all buckets of this table, in <code>[0, 1)</code>. A value approaching <code>1</code> indicates the hottest bucket is close to the storage engine's hard-rejection trigger.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>kvBackpressureRejectionsTotal</td>
+      <td>Total number of write requests rejected with <code>StorageBackpressureException</code> on this table since process start.</td>
+      <td>Counter</td>
+    </tr>
+  </tbody>
+</table>
+
+### Flink connector standard metrics
+
+When using Flink to read and write, Fluss has implemented some key standard Flink connector metrics 
+to measure the source latency and output of sink, see [FLIP-33: Standardize Connector Metrics](https://cwiki.apache.org/confluence/display/FLINK/FLIP-33%3A+Standardize+Connector+Metrics). 
+Flink source / sink metrics implemented are listed here.
+
+How to Use Flink Metrics, you can see [Flink Metrics](https://nightlies.apache.org/flink/flink-docs-release-1.20/docs/ops/metrics/#system-metrics) for more details.
+
+#### Source Metrics
+
+<table class="table table-bordered">
+    <thead>
+    <tr>
+      <th class="text-left" style={{width: '225pt'}}>Metrics Name</th>
+      <th class="text-left" style={{width: '165pt'}}>Level</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '70pt'}}>Type</th>
+    </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>currentEmitEventTimeLag</td>
+            <td>Flink Source Operator</td>
+            <td>Time difference between sending the record out of source and file creation.</td>
+            <td>Gauge</td>
+        </tr>
+        <tr>
+            <td>currentFetchEventTimeLag</td>
+            <td>Flink Source Operator</td>
+            <td>Time difference between reading the data file and file creation.</td>
+            <td>Gauge</td>
+        </tr>
+        <tr>
+            <td>pendingRecords</td>
+            <td>Flink Source Operator</td>
+            <td>The number of log records that are available after the current source fetch offset. Only the streaming log part is counted, snapshot and lake records are excluded.</td>
+            <td>Gauge</td>
+        </tr>
+    </tbody>
+</table>
+
+#### Sink Metrics
+
+<table class="table table-bordered">
+    <thead>
+    <tr>
+      <th class="text-left" style={{width: '225pt'}}>Metrics Name</th>
+      <th class="text-left" style={{width: '165pt'}}>Level</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '70pt'}}>Type</th>
+    </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>numBytesOut</td>
+            <td>Table</td>
+            <td>The total number of output bytes.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>numBytesOutPerSecond</td>
+            <td>Table</td>
+            <td>The output bytes per second.</td>
+            <td>Meter</td>
+        </tr>
+        <tr>
+            <td>numRecordsOut</td>
+            <td>Table</td>
+            <td>The total number of output records.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>numRecordsOutPerSecond</td>
+            <td>Table</td>
+            <td>The output records per second.</td>
+            <td>Meter</td>
+        </tr>
+    </tbody>
+</table>
+
+### Tiering Service Metrics
+
+These metrics are exposed by the Flink-based tiering source reader when running the Lake Tiering Service.
+All metrics are registered under the `fluss.tieringService` metric group, which is a child of the Flink `SourceReaderMetricGroup`.
+
+<table class="table table-bordered">
+    <thead>
+    <tr>
+      <th class="text-left" style={{width: '225pt'}}>Metrics Name</th>
+      <th class="text-left" style={{width: '165pt'}}>Level</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '70pt'}}>Type</th>
+    </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>readBytes</td>
+            <td>Flink Source Operator</td>
+            <td>The cumulative bytes read from Fluss records since the tiering job started. For the snapshot path, this measures per-record BinaryRow size; for the log path, this measures batch-level byte size from log fetches.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>readBytesPerSecond</td>
+            <td>Flink Source Operator</td>
+            <td>The read throughput rate in bytes per second, derived from the readBytes counter using a 60-second sliding window.</td>
+            <td>Meter</td>
+        </tr>
+    </tbody>
+</table>

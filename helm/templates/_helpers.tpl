@@ -1,0 +1,133 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "fluss.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+*/}}
+{{- define "fluss.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "fluss.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels
+*/}}
+{{- define "fluss.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_") | quote }}
+app.kubernetes.io/name: {{ include "fluss.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+{{- end -}}
+
+{{/*
+Selector labels
+*/}}
+{{- define "fluss.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "fluss.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Image name
+*/}}
+{{- define "fluss.image" -}}
+
+{{- $registry := .Values.image.registry | default "" -}}
+{{- $repo := required "image.repository is required" .Values.image.repository -}}
+{{- $tag := .Values.image.tag | default "" | toString -}}
+
+{{- $image := $repo -}}
+
+{{- if $registry -}}
+  {{- $image = printf "%s/%s" $registry $image -}}
+{{- end -}}
+
+{{- if $tag -}}
+  {{- $image = printf "%s:%s" $image $tag -}}
+{{- end -}}
+
+{{- $image -}}
+{{- end -}}
+
+{{/*
+Render pull secrets
+*/}}
+{{- define "fluss.imagePullSecrets" -}}
+{{- $secrets := .Values.image.pullSecrets -}}
+{{- if $secrets -}}
+imagePullSecrets:
+{{- range $secrets }}
+  - name: {{ . }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+  Validate PodDisruptionBudget for a given component.
+  Usage: include "fluss.pdb.validate" (dict "component" "tablet" "pdb" .Values.tablet.podDisruptionBudget)
+*/}}
+{{- define "fluss.pdb.validate" -}}
+{{- if .pdb.enabled -}}
+  {{- $hasMin := hasKey .pdb "minAvailable" -}}
+  {{- $hasMax := hasKey .pdb "maxUnavailable" -}}
+  {{- if and $hasMin $hasMax -}}
+    {{- printf "%s.podDisruptionBudget: cannot set both minAvailable and maxUnavailable" .component -}}
+  {{- else if not (or $hasMin $hasMax) -}}
+    {{- printf "%s.podDisruptionBudget: must set either minAvailable or maxUnavailable when enabled" .component -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  Aggregate PDB validation for all components.
+  include "fluss.pdb.validateValues" .
+*/}}
+{{- define "fluss.pdb.validateValues" -}}
+{{- $errMessages := list -}}
+{{- $errMessages = append $errMessages (include "fluss.pdb.validate" (dict "component" "tablet" "pdb" .Values.tablet.podDisruptionBudget)) -}}
+{{- $errMessages = append $errMessages (include "fluss.pdb.validate" (dict "component" "coordinator" "pdb" .Values.coordinator.podDisruptionBudget)) -}}
+{{- $errMessages = without $errMessages "" -}}
+{{- $errMessage := join "\n" $errMessages -}}
+{{- if $errMessage -}}
+{{-   printf "\nPDB VALIDATION:\n%s" $errMessage | fail -}}
+{{- end -}}
+{{- end -}}
+

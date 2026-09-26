@@ -1,0 +1,486 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.kv.rocksdb;
+
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.config.ConfigOption;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.ReadableConfig;
+import org.apache.fluss.server.kv.KvManager;
+import org.apache.fluss.utils.FileUtils;
+import org.apache.fluss.utils.IOUtils;
+
+import org.rocksdb.BlockBasedTableConfig;
+import org.rocksdb.BloomFilter;
+import org.rocksdb.Cache;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.CompactionStyle;
+import org.rocksdb.CompressionType;
+import org.rocksdb.DBOptions;
+import org.rocksdb.InfoLogLevel;
+import org.rocksdb.LRUCache;
+import org.rocksdb.PlainTableConfig;
+import org.rocksdb.RateLimiter;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.Statistics;
+import org.rocksdb.TableFormatConfig;
+import org.rocksdb.WriteBufferManager;
+import org.rocksdb.WriteOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+
+/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
+
+/**
+ * The container for RocksDB resources, including predefined options, option factory and shared
+ * resource among instances.
+ *
+ * <p>This should be the only entrance for {@link RocksDBKv} to get RocksDB options, and should be
+ * properly (and necessarily) closed to prevent resource leak.
+ */
+public class RocksDBResourceContainer implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(RocksDBResourceContainer.class);
+
+    // the filename length limit is 255 on most operating systems
+    private static final int INSTANCE_PATH_LENGTH_LIMIT = 255 - "_LOG".length();
+
+    @Nullable private final File instanceRocksDBPath;
+
+    /** The configurations from file. */
+    private final ReadableConfig configuration;
+
+    private final boolean enableStatistics;
+
+    /** The shared rate limiter for all RocksDB instances. */
+    private final RateLimiter sharedRateLimiter;
+
+    /** The shared block cache from KvManager, null if not using shared cache. */
+    @Nullable private final Cache sharedBlockCache;
+
+    /** The TabletServer-scoped shared write buffer manager, null for standalone containers. */
+    @Nullable private final WriteBufferManager sharedWriteBufferManager;
+
+    /** The statistics object for RocksDB, null if statistics is disabled. */
+    @Nullable private Statistics statistics;
+
+    /** The block cache for RocksDB, shared across column families. */
+    @Nullable private Cache blockCache;
+
+    /** The handles to be closed when the container is closed. */
+    private final ArrayList<AutoCloseable> handlesToClose;
+
+    @VisibleForTesting
+    RocksDBResourceContainer() {
+        this(new Configuration(), null, false, KvManager.getDefaultRateLimiter(), null, null);
+    }
+
+    public RocksDBResourceContainer(ReadableConfig configuration, @Nullable File instanceBasePath) {
+        this(configuration, instanceBasePath, false, KvManager.getDefaultRateLimiter(), null, null);
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics) {
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                KvManager.getDefaultRateLimiter(),
+                null,
+                null);
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            RateLimiter sharedRateLimiter) {
+        this(configuration, instanceBasePath, enableStatistics, sharedRateLimiter, null, null);
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            RateLimiter sharedRateLimiter,
+            @Nullable Cache sharedBlockCache) {
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                sharedRateLimiter,
+                sharedBlockCache,
+                null);
+    }
+
+    /**
+     * Creates a resource container that borrows TabletServer-scoped RocksDB resources.
+     *
+     * <p>The caller owns the shared rate limiter, block cache, and write buffer manager and must
+     * keep them alive until this container is closed.
+     */
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            RateLimiter sharedRateLimiter,
+            @Nullable Cache sharedBlockCache,
+            @Nullable WriteBufferManager sharedWriteBufferManager) {
+        this.configuration = configuration;
+
+        this.instanceRocksDBPath =
+                instanceBasePath != null
+                        ? RocksDBKvBuilder.getInstanceRocksDBPath(instanceBasePath)
+                        : null;
+        this.enableStatistics = enableStatistics;
+        this.sharedRateLimiter =
+                checkNotNull(sharedRateLimiter, "sharedRateLimiter must not be null");
+        this.sharedBlockCache = sharedBlockCache;
+        this.sharedWriteBufferManager = sharedWriteBufferManager;
+
+        this.handlesToClose = new ArrayList<>();
+    }
+
+    /** Gets the RocksDB {@link DBOptions} to be used for RocksDB instances. */
+    public DBOptions getDbOptions() throws IOException {
+        // initial options from common profile
+        DBOptions opt = createBaseCommonDBOptions();
+        handlesToClose.add(opt);
+
+        // load configurable options on top of pre-defined profile
+        setDBOptionsFromConfigurableOptions(opt);
+
+        // todo: maybe we can allow user define options factory and some predefined options
+        //  just like Flink
+
+        // add necessary default options
+        opt = opt.setCreateIfMissing(true);
+
+        // set shared rate limiter
+        opt.setRateLimiter(sharedRateLimiter);
+        if (sharedWriteBufferManager != null) {
+            opt.setWriteBufferManager(sharedWriteBufferManager);
+        }
+
+        if (enableStatistics) {
+            statistics = new Statistics();
+            opt.setStatistics(statistics);
+            handlesToClose.add(statistics);
+        }
+
+        return opt;
+    }
+
+    /** Gets the Statistics object if statistics is enabled, null otherwise. */
+    @Nullable
+    public Statistics getStatistics() {
+        return statistics;
+    }
+
+    /** Gets the block cache used by RocksDB, null if not yet initialized. */
+    @Nullable
+    public Cache getBlockCache() {
+        return blockCache;
+    }
+
+    /** Gets the RocksDB {@link ColumnFamilyOptions} to be used for all RocksDB instances. */
+    public ColumnFamilyOptions getColumnOptions() {
+        // initial options from common profile
+        ColumnFamilyOptions opt = createBaseCommonColumnOptions();
+        handlesToClose.add(opt);
+
+        // load configurable options on top of pre-defined profile
+        setColumnFamilyOptionsFromConfigurableOptions(opt, handlesToClose);
+
+        return opt;
+    }
+
+    /** Gets the RocksDB {@link WriteOptions} to be used for write operations. */
+    public WriteOptions getWriteOptions() {
+        // Disable WAL by default
+        WriteOptions opt = new WriteOptions().setDisableWAL(true);
+        handlesToClose.add(opt);
+
+        return opt;
+    }
+
+    /** Gets the RocksDB {@link ReadOptions} to be used for read operations. */
+    public ReadOptions getReadOptions() {
+        ReadOptions opt = new ReadOptions();
+        handlesToClose.add(opt);
+
+        return opt;
+    }
+
+    void registerCloseableResource(AutoCloseable resource) {
+        handlesToClose.add(checkNotNull(resource, "resource must not be null"));
+    }
+
+    @Override
+    public void close() throws Exception {
+        handlesToClose.forEach(IOUtils::closeQuietly);
+        handlesToClose.clear();
+    }
+
+    /** Create a {@link DBOptions} for RocksDB, including some common settings. */
+    DBOptions createBaseCommonDBOptions() {
+        return new DBOptions().setUseFsync(false).setStatsDumpPeriodSec(0);
+    }
+
+    /** Create a {@link ColumnFamilyOptions} for RocksDB, including some common settings. */
+    ColumnFamilyOptions createBaseCommonColumnOptions() {
+        return new ColumnFamilyOptions();
+    }
+
+    @Nullable
+    private <T> T internalGetOption(ConfigOption<T> option) {
+        return configuration.get(option);
+    }
+
+    @SuppressWarnings("ConstantConditions")
+    private DBOptions setDBOptionsFromConfigurableOptions(DBOptions currentOptions)
+            throws IOException {
+        currentOptions.setMaxBackgroundJobs(
+                internalGetOption(ConfigOptions.KV_MAX_BACKGROUND_THREADS));
+
+        currentOptions.setMaxOpenFiles(internalGetOption(ConfigOptions.KV_MAX_OPEN_FILES));
+
+        currentOptions.setInfoLogLevel(
+                toRocksDbInfoLogLevel(internalGetOption(ConfigOptions.KV_LOG_LEVEL)));
+
+        String logDir = internalGetOption(ConfigOptions.KV_LOG_DIR);
+        if (logDir == null || logDir.isEmpty()) {
+            if (instanceRocksDBPath == null
+                    || instanceRocksDBPath.getAbsolutePath().length()
+                            <= INSTANCE_PATH_LENGTH_LIMIT) {
+                relocateDefaultDbLogDir(currentOptions);
+            } else {
+                // disable log relocate when instance path length exceeds limit to prevent rocksdb
+                // log file creation failure, details in FLINK-31743
+                LOG.warn(
+                        "RocksDB instance path length exceeds limit : {}, disable log relocate.",
+                        instanceRocksDBPath);
+            }
+        } else {
+            currentOptions.setDbLogDir(logDir);
+        }
+
+        currentOptions.setMaxLogFileSize(
+                internalGetOption(ConfigOptions.KV_LOG_MAX_FILE_SIZE).getBytes());
+
+        currentOptions.setKeepLogFileNum(internalGetOption(ConfigOptions.KV_LOG_FILE_NUM));
+
+        return currentOptions;
+    }
+
+    @SuppressWarnings("ConstantConditions")
+    private ColumnFamilyOptions setColumnFamilyOptionsFromConfigurableOptions(
+            ColumnFamilyOptions currentOptions, Collection<AutoCloseable> handlesToClose) {
+
+        currentOptions.setCompactionStyle(
+                toRocksDbCompactionStyle(internalGetOption(ConfigOptions.KV_COMPACTION_STYLE)));
+
+        currentOptions.setCompressionPerLevel(
+                toRocksDbCompressionTypes(
+                        internalGetOption(ConfigOptions.KV_COMPRESSION_PER_LEVEL)));
+
+        currentOptions.setLevelCompactionDynamicLevelBytes(
+                internalGetOption(ConfigOptions.KV_USE_DYNAMIC_LEVEL_SIZE));
+
+        currentOptions.setTargetFileSizeBase(
+                internalGetOption(ConfigOptions.KV_TARGET_FILE_SIZE_BASE).getBytes());
+
+        currentOptions.setMaxBytesForLevelBase(
+                internalGetOption(ConfigOptions.KV_MAX_SIZE_LEVEL_BASE).getBytes());
+
+        currentOptions.setWriteBufferSize(
+                internalGetOption(ConfigOptions.KV_WRITE_BUFFER_SIZE).getBytes());
+
+        currentOptions.setMaxWriteBufferNumber(
+                internalGetOption(ConfigOptions.KV_MAX_WRITE_BUFFER_NUMBER));
+
+        currentOptions.setMinWriteBufferNumberToMerge(
+                internalGetOption(ConfigOptions.KV_MIN_WRITE_BUFFER_NUMBER_TO_MERGE));
+
+        TableFormatConfig tableFormatConfig = currentOptions.tableFormatConfig();
+
+        BlockBasedTableConfig blockBasedTableConfig;
+        if (tableFormatConfig == null) {
+            blockBasedTableConfig = new BlockBasedTableConfig();
+        } else {
+            if (tableFormatConfig instanceof PlainTableConfig) {
+                // if the table format config is PlainTableConfig, we just return current
+                // column-family options
+                return currentOptions;
+            } else {
+                blockBasedTableConfig = (BlockBasedTableConfig) tableFormatConfig;
+            }
+        }
+
+        blockBasedTableConfig.setBlockSize(
+                internalGetOption(ConfigOptions.KV_BLOCK_SIZE).getBytes());
+
+        blockBasedTableConfig.setMetadataBlockSize(
+                internalGetOption(ConfigOptions.KV_METADATA_BLOCK_SIZE).getBytes());
+
+        // Create explicit LRUCache for accurate memory tracking
+        if (sharedBlockCache != null) {
+            // Use shared block cache, do NOT add to handlesToClose (managed by KvManager)
+            blockCache = sharedBlockCache;
+            blockBasedTableConfig.setBlockCache(sharedBlockCache);
+        } else {
+            long blockCacheSize = internalGetOption(ConfigOptions.KV_BLOCK_CACHE_SIZE).getBytes();
+            blockCache = new LRUCache(blockCacheSize);
+            handlesToClose.add(blockCache);
+            blockBasedTableConfig.setBlockCache(blockCache);
+        }
+
+        // Configure index and filter blocks caching
+        blockBasedTableConfig.setCacheIndexAndFilterBlocks(
+                internalGetOption(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS));
+        blockBasedTableConfig.setCacheIndexAndFilterBlocksWithHighPriority(
+                internalGetOption(
+                        ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY));
+        blockBasedTableConfig.setPinL0FilterAndIndexBlocksInCache(
+                internalGetOption(ConfigOptions.KV_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE));
+        blockBasedTableConfig.setPinTopLevelIndexAndFilter(
+                internalGetOption(ConfigOptions.KV_PIN_TOP_LEVEL_INDEX_AND_FILTER));
+
+        if (internalGetOption(ConfigOptions.KV_USE_BLOOM_FILTER)) {
+            final double bitsPerKey = internalGetOption(ConfigOptions.KV_BLOOM_FILTER_BITS_PER_KEY);
+            final boolean blockBasedMode =
+                    internalGetOption(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE);
+            BloomFilter bloomFilter = new BloomFilter(bitsPerKey, blockBasedMode);
+            handlesToClose.add(bloomFilter);
+            blockBasedTableConfig.setFilterPolicy(bloomFilter);
+        }
+
+        return currentOptions.setTableFormatConfig(blockBasedTableConfig);
+    }
+
+    /**
+     * Relocates the default log directory of RocksDB with the Fluss log directory. Finds the Fluss
+     * log directory using log.file Java property that is set during startup.
+     *
+     * @param dbOptions The RocksDB {@link DBOptions}.
+     */
+    private void relocateDefaultDbLogDir(DBOptions dbOptions) throws IOException {
+        String logFilePath = System.getProperty("log.file");
+        if (logFilePath != null) {
+            File logFile = resolveFileLocation(logFilePath);
+            if (logFile != null && resolveFileLocation(logFile.getParent()) != null) {
+                File logFileDirectory = logFile.getParentFile();
+                File rocksDbLogDirectory = FileUtils.createDirectory(logFileDirectory, "rocksdb");
+                if (resolveFileLocation(rocksDbLogDirectory.getAbsolutePath()) != null) {
+                    dbOptions.setDbLogDir(rocksDbLogDirectory.getAbsolutePath());
+                }
+            }
+        }
+    }
+
+    File getInstanceRocksDBPath() {
+        return instanceRocksDBPath;
+    }
+
+    private List<CompressionType> toRocksDbCompressionTypes(
+            List<ConfigOptions.KvCompressionType> compressionTypes) {
+        List<CompressionType> rocksdbCompressionTypes = new ArrayList<>();
+        for (ConfigOptions.KvCompressionType compressionType : compressionTypes) {
+            rocksdbCompressionTypes.add(toRocksDbCompressionType(compressionType));
+        }
+        return rocksdbCompressionTypes;
+    }
+
+    private CompressionType toRocksDbCompressionType(
+            ConfigOptions.KvCompressionType compressionType) {
+        switch (compressionType) {
+            case NO:
+                return CompressionType.NO_COMPRESSION;
+            case LZ4:
+                return CompressionType.LZ4_COMPRESSION;
+            case SNAPPY:
+                return CompressionType.SNAPPY_COMPRESSION;
+            case ZSTD:
+                return CompressionType.ZSTD_COMPRESSION;
+            default:
+                throw new IllegalArgumentException(
+                        "Unsupported compression type: " + compressionType);
+        }
+    }
+
+    private CompactionStyle toRocksDbCompactionStyle(
+            ConfigOptions.CompactionStyle compactionStyle) {
+        switch (compactionStyle) {
+            case LEVEL:
+                return CompactionStyle.LEVEL;
+            case UNIVERSAL:
+                return CompactionStyle.UNIVERSAL;
+            case FIFO:
+                return CompactionStyle.FIFO;
+            case NONE:
+                return CompactionStyle.NONE;
+        }
+        return CompactionStyle.NONE;
+    }
+
+    private InfoLogLevel toRocksDbInfoLogLevel(ConfigOptions.InfoLogLevel infoLogLevel) {
+        switch (infoLogLevel) {
+            case DEBUG_LEVEL:
+                return InfoLogLevel.DEBUG_LEVEL;
+            case INFO_LEVEL:
+                return InfoLogLevel.INFO_LEVEL;
+            case WARN_LEVEL:
+                return InfoLogLevel.WARN_LEVEL;
+            case ERROR_LEVEL:
+                return InfoLogLevel.ERROR_LEVEL;
+            case FATAL_LEVEL:
+                return InfoLogLevel.FATAL_LEVEL;
+            case HEADER_LEVEL:
+                return InfoLogLevel.HEADER_LEVEL;
+            case NUM_INFO_LOG_LEVELS:
+                return InfoLogLevel.NUM_INFO_LOG_LEVELS;
+        }
+        return InfoLogLevel.INFO_LEVEL;
+    }
+
+    /**
+     * Verify log file location.
+     *
+     * @param logFilePath Path to log file
+     * @return File or null if not a valid log file
+     */
+    private File resolveFileLocation(String logFilePath) {
+        File logFile = new File(logFilePath);
+        return (logFile.exists() && logFile.canRead()) ? logFile : null;
+    }
+}

@@ -1,0 +1,948 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.tiering.source.enumerator;
+
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.NetworkException;
+import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
+import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
+import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
+import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
+import org.apache.fluss.flink.tiering.source.TieringTestBase;
+import org.apache.fluss.flink.tiering.source.split.TieringLogSplit;
+import org.apache.fluss.flink.tiering.source.split.TieringSnapshotSplit;
+import org.apache.fluss.flink.tiering.source.split.TieringSplit;
+import org.apache.fluss.flink.tiering.source.split.TieringSplitGenerator;
+import org.apache.fluss.lake.writer.LakeTieringFactory;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableChange;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.PbLakeTableOffsetForBucket;
+import org.apache.fluss.rpc.messages.PbLakeTableSnapshotInfo;
+
+import org.apache.flink.api.connector.source.SourceEvent;
+import org.apache.flink.api.connector.source.SplitsAssignment;
+import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
+import org.apache.flink.util.FlinkRuntimeException;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.apache.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
+import static org.apache.fluss.config.ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Unit tests for {@link TieringSourceEnumerator} and {@link TieringSplitGenerator}. */
+class TieringSourceEnumeratorTest extends TieringTestBase {
+
+    private static Configuration flussConf;
+
+    @BeforeAll
+    protected static void beforeAll() {
+        TieringTestBase.beforeAll();
+        flussConf = new Configuration(clientConf);
+    }
+
+    @BeforeEach
+    protected void beforeEach() throws Exception {
+        super.beforeEach();
+    }
+
+    @Test
+    void testPrimaryKeyTableWithNoSnapshotSplits() throws Throwable {
+        TablePath tablePath = DEFAULT_TABLE_PATH;
+        long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        int numSubtasks = 4;
+        int expectNumberOfSplits = 3;
+        // test get snapshot split & log split and the assignment
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register all readers
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+
+            // try to assign splits
+            context.runPeriodicCallable(0);
+
+            List<TieringSplit> actualAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualAssignment::addAll));
+
+            // no split assignment for empty buckets
+            assertThat(actualAssignment).isEmpty();
+
+            // mock finished tiered this round, check second round
+            context.getSplitsAssignmentSequence().clear();
+            final Map<Integer, Long> bucketOffsetOfInitialWrite = new HashMap<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                bucketOffsetOfInitialWrite.put(tableBucket, 0L);
+            }
+            // commit and notify this table tiering task finished
+            coordinatorGateway
+                    .commitLakeTableSnapshot(
+                            genCommitLakeTableSnapshotRequest(
+                                    tableId, null, 0, bucketOffsetOfInitialWrite))
+                    .get();
+
+            enumerator.handleSourceEvent(1, new FinishedTieringEvent(tableId));
+
+            Map<Integer, Long> bucketOffsetOfSecondWrite =
+                    upsertRow(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR, 0, 10);
+            triggerAndWaitSnapshot(tableId);
+
+            // request tiering table splits
+            for (int subtaskId = 0; subtaskId < 3; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 500L);
+
+            List<TieringSplit> expectedLogAssignment = new ArrayList<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                expectedLogAssignment.add(
+                        new TieringLogSplit(
+                                tablePath,
+                                new TableBucket(tableId, tableBucket),
+                                null,
+                                bucketOffsetOfInitialWrite.get(tableBucket),
+                                bucketOffsetOfInitialWrite.get(tableBucket)
+                                        + bucketOffsetOfSecondWrite.get(tableBucket),
+                                expectNumberOfSplits));
+            }
+            List<TieringSplit> actualLogAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualLogAssignment::addAll));
+            assertTieringSplitsMatch(actualLogAssignment, expectedLogAssignment);
+        }
+    }
+
+    @Test
+    void testPrimaryKeyTableWithSnapshotSplits() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-test-pk-table");
+        long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        int numSubtasks = 3;
+        final Map<Integer, Long> bucketOffsetOfInitialWrite =
+                upsertRow(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR, 0, 10);
+        long snapshotId = 0;
+        triggerAndWaitSnapshot(tableId);
+
+        int expectNumberOfSplits = 3;
+
+        // test get snapshot split assignment
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register all readers
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 3000L);
+
+            List<TieringSplit> expectedSnapshotAssignment = new ArrayList<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                expectedSnapshotAssignment.add(
+                        new TieringSnapshotSplit(
+                                tablePath,
+                                new TableBucket(tableId, tableBucket),
+                                null,
+                                snapshotId,
+                                bucketOffsetOfInitialWrite.get(tableBucket),
+                                expectNumberOfSplits));
+            }
+            List<TieringSplit> actualAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualAssignment::addAll));
+            assertTieringSplitsMatch(actualAssignment, expectedSnapshotAssignment);
+
+            // mock finished tiered this round, check second round
+            context.getSplitsAssignmentSequence().clear();
+            final Map<Integer, Long> initialBucketOffsets = new HashMap<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                initialBucketOffsets.put(tableBucket, EARLIEST_OFFSET);
+            }
+            // commit and notify this table tiering task finished
+            coordinatorGateway
+                    .commitLakeTableSnapshot(
+                            genCommitLakeTableSnapshotRequest(
+                                    tableId, null, 1, bucketOffsetOfInitialWrite))
+                    .get();
+
+            enumerator.handleSourceEvent(1, new FinishedTieringEvent(tableId));
+
+            Map<Integer, Long> bucketOffsetOfSecondWrite =
+                    upsertRow(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR, 10, 20);
+            triggerAndWaitSnapshot(tableId);
+
+            // request tiering table splits
+            for (int subtaskId = 0; subtaskId < 3; subtaskId++) {
+                String hostName = "localhost-" + subtaskId;
+                enumerator.handleSplitRequest(subtaskId, hostName);
+            }
+
+            // three log splits will be ready soon
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 500L);
+            List<TieringSplit> expectedLogAssignment = new ArrayList<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                expectedLogAssignment.add(
+                        new TieringLogSplit(
+                                tablePath,
+                                new TableBucket(tableId, tableBucket),
+                                null,
+                                bucketOffsetOfInitialWrite.get(tableBucket),
+                                bucketOffsetOfInitialWrite.get(tableBucket)
+                                        + bucketOffsetOfSecondWrite.get(tableBucket),
+                                expectNumberOfSplits));
+            }
+            List<TieringSplit> actualLogAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualLogAssignment::addAll));
+            assertTieringSplitsMatch(actualLogAssignment, expectedLogAssignment);
+        }
+    }
+
+    @Test
+    void testLogTableSplits() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-test-log-table");
+        long tableId = createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        int numSubtasks = 4;
+        int expectNumberOfSplits = 3;
+        // test get log split and the assignment
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register all readers
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+
+            // write one row to one bucket, keep the other buckets empty
+            Map<Integer, Long> bucketOffsetOfFirstWrite =
+                    appendRow(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 0, 1);
+
+            // only non-empty buckets should generate splits
+            waitUntilTieringTableSplitAssignmentReady(context, 1, 200L);
+            List<TieringSplit> expectedAssignment = new ArrayList<>();
+            for (int bucketId : bucketOffsetOfFirstWrite.keySet()) {
+                expectedAssignment.add(
+                        new TieringLogSplit(
+                                tablePath,
+                                new TableBucket(tableId, bucketId),
+                                null,
+                                EARLIEST_OFFSET,
+                                bucketOffsetOfFirstWrite.get(bucketId),
+                                bucketOffsetOfFirstWrite.size()));
+            }
+            List<TieringSplit> actualAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualAssignment::addAll));
+
+            assertTieringSplitsMatch(actualAssignment, expectedAssignment);
+
+            // mock finished tiered this round, check second round
+            context.getSplitsAssignmentSequence().clear();
+            final Map<Integer, Long> bucketOffsetOfInitialWrite = new HashMap<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                bucketOffsetOfInitialWrite.put(
+                        tableBucket, bucketOffsetOfFirstWrite.getOrDefault(tableBucket, 0L));
+            }
+            // commit and notify this table tiering task finished
+            coordinatorGateway
+                    .commitLakeTableSnapshot(
+                            genCommitLakeTableSnapshotRequest(
+                                    tableId, null, 0, bucketOffsetOfInitialWrite))
+                    .get();
+            enumerator.handleSourceEvent(1, new FinishedTieringEvent(tableId));
+
+            // write rows to every bucket
+            Map<Integer, Long> bucketOffsetOfSecondWrite =
+                    appendRow(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 1, 10);
+
+            // request tiering table splits
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 500L);
+
+            List<TieringSplit> expectedLogAssignment = new ArrayList<>();
+            for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                expectedLogAssignment.add(
+                        new TieringLogSplit(
+                                tablePath,
+                                new TableBucket(tableId, tableBucket),
+                                null,
+                                bucketOffsetOfInitialWrite.get(tableBucket),
+                                bucketOffsetOfInitialWrite.get(tableBucket)
+                                        + bucketOffsetOfSecondWrite.get(tableBucket),
+                                expectNumberOfSplits));
+            }
+            List<TieringSplit> actualLogAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualLogAssignment::addAll));
+            assertTieringSplitsMatch(actualLogAssignment, expectedLogAssignment);
+        }
+    }
+
+    @Test
+    void testPartitionedPrimaryKeyTable() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-test-partitioned-pk-table");
+        long tableId =
+                createPartitionedTable(tablePath, DEFAULT_AUTO_PARTITIONED_PK_TABLE_DESCRIPTOR);
+        Map<String, Long> partitionNameByIds =
+                FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                        tablePath, TABLE_AUTO_PARTITION_NUM_PRECREATE.defaultValue());
+
+        int numSubtasks = 6;
+        int expectNumberOfSplits = 6;
+        // test get snapshot split assignment
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register all readers
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+
+            // try to assign splits
+            context.runPeriodicCallable(0);
+
+            List<TieringSplit> actualSnapshotAssignment = new ArrayList<>();
+            for (SplitsAssignment<TieringSplit> splitsAssignment :
+                    context.getSplitsAssignmentSequence()) {
+                splitsAssignment.assignment().values().forEach(actualSnapshotAssignment::addAll);
+            }
+
+            // no snapshot split should be assigned for empty buckets
+            assertThat(actualSnapshotAssignment).isEmpty();
+
+            // mock finished tiered this round, check second round
+            context.getSplitsAssignmentSequence().clear();
+            long snapshotId = 1;
+            final Map<Long, Map<Integer, Long>> bucketOffsetOfInitialWrite = new HashMap<>();
+            for (Map.Entry<String, Long> partitionNameById : partitionNameByIds.entrySet()) {
+                Map<Integer, Long> partitionBucketOffsetOfEarliest = new HashMap<>();
+                Map<Integer, Long> partitionBucketOffsetOfInitialWrite = new HashMap<>();
+                for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                    partitionBucketOffsetOfEarliest.put(tableBucket, EARLIEST_OFFSET);
+                    partitionBucketOffsetOfInitialWrite.put(tableBucket, 0L);
+                }
+                bucketOffsetOfInitialWrite.put(
+                        partitionNameById.getValue(), partitionBucketOffsetOfInitialWrite);
+                // commit lake table partition
+                coordinatorGateway
+                        .commitLakeTableSnapshot(
+                                genCommitLakeTableSnapshotRequest(
+                                        tableId,
+                                        partitionNameById.getValue(),
+                                        snapshotId++,
+                                        bucketOffsetOfInitialWrite.get(
+                                                partitionNameById.getValue())))
+                        .get();
+            }
+            // notify this table tiering task finished
+            enumerator.handleSourceEvent(1, new FinishedTieringEvent(tableId));
+
+            Map<Long, Map<Integer, Long>> bucketOffsetOfSecondWrite =
+                    upsertRowForPartitionedTable(
+                            tablePath, DEFAULT_PK_TABLE_DESCRIPTOR, partitionNameByIds, 10, 20);
+            triggerAndWaitUntilPartitionTableSnapshot(tableId, partitionNameByIds);
+
+            // request tiering table splits
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+
+            waitUntilTieringTableSplitAssignmentReady(
+                    context, DEFAULT_BUCKET_NUM * partitionNameByIds.size(), 500L);
+            List<TieringSplit> expectedLogAssignment = new ArrayList<>();
+            for (Map.Entry<String, Long> partitionNameById : partitionNameByIds.entrySet()) {
+                for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                    long partitionId = partitionNameById.getValue();
+                    expectedLogAssignment.add(
+                            new TieringLogSplit(
+                                    tablePath,
+                                    new TableBucket(tableId, partitionId, tableBucket),
+                                    partitionNameById.getKey(),
+                                    bucketOffsetOfInitialWrite.get(partitionId).get(tableBucket),
+                                    bucketOffsetOfInitialWrite.get(partitionId).get(tableBucket)
+                                            + bucketOffsetOfSecondWrite
+                                                    .get(partitionId)
+                                                    .get(tableBucket),
+                                    expectNumberOfSplits));
+                }
+            }
+            List<TieringSplit> actualLogAssignment = new ArrayList<>();
+            for (SplitsAssignment<TieringSplit> splitsAssignment :
+                    context.getSplitsAssignmentSequence()) {
+                splitsAssignment.assignment().values().forEach(actualLogAssignment::addAll);
+            }
+            assertTieringSplitsMatch(actualLogAssignment, expectedLogAssignment);
+        }
+    }
+
+    @Test
+    void testPartitionedLogTableSplits() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-test-partitioned-log-table");
+        long tableId =
+                createPartitionedTable(tablePath, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
+        Map<String, Long> partitionNameByIds =
+                FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                        tablePath, TABLE_AUTO_PARTITION_NUM_PRECREATE.defaultValue());
+
+        int numSubtasks = 6;
+        int expectNumberOfSplits = 6;
+        // test get log split assignment
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register all readers
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+
+            Map<Long, Map<Integer, Long>> bucketOffsetOfFirstWrite =
+                    appendRowForPartitionedTable(
+                            tablePath,
+                            DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR,
+                            partitionNameByIds,
+                            0,
+                            1);
+
+            waitUntilTieringTableSplitAssignmentReady(context, partitionNameByIds.size(), 3000L);
+
+            List<TieringSplit> expectedAssignment = new ArrayList<>();
+            for (Map.Entry<String, Long> partitionNameById : partitionNameByIds.entrySet()) {
+                long partitionId = partitionNameById.getValue();
+                for (int tableBucket : bucketOffsetOfFirstWrite.get(partitionId).keySet()) {
+                    expectedAssignment.add(
+                            new TieringLogSplit(
+                                    tablePath,
+                                    new TableBucket(tableId, partitionId, tableBucket),
+                                    partitionNameById.getKey(),
+                                    EARLIEST_OFFSET,
+                                    bucketOffsetOfFirstWrite.get(partitionId).get(tableBucket),
+                                    bucketOffsetOfFirstWrite.size()));
+                }
+            }
+            List<TieringSplit> actualAssignment = new ArrayList<>();
+            for (SplitsAssignment<TieringSplit> splitsAssignment :
+                    context.getSplitsAssignmentSequence()) {
+                splitsAssignment.assignment().values().forEach(actualAssignment::addAll);
+            }
+            assertTieringSplitsMatch(actualAssignment, expectedAssignment);
+
+            // mock finished tiered this round, check second round
+            context.getSplitsAssignmentSequence().clear();
+            final Map<Long, Map<Integer, Long>> bucketOffsetOfInitialWrite = new HashMap<>();
+            long snapshot = 1;
+            for (Map.Entry<String, Long> partitionNameById : partitionNameByIds.entrySet()) {
+                long partitionId = partitionNameById.getValue();
+                Map<Integer, Long> partitionBucketOffsetOfInitialWrite = new HashMap<>();
+                for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                    partitionBucketOffsetOfInitialWrite.put(
+                            tableBucket,
+                            bucketOffsetOfFirstWrite
+                                    .getOrDefault(partitionId, Collections.emptyMap())
+                                    .getOrDefault(tableBucket, 0L));
+                }
+                bucketOffsetOfInitialWrite.put(partitionId, partitionBucketOffsetOfInitialWrite);
+                // commit lake table partition
+                coordinatorGateway
+                        .commitLakeTableSnapshot(
+                                genCommitLakeTableSnapshotRequest(
+                                        tableId,
+                                        partitionId,
+                                        snapshot++,
+                                        bucketOffsetOfInitialWrite.get(partitionId)))
+                        .get();
+            }
+            // notify this table tiering task finished
+            enumerator.handleSourceEvent(1, new FinishedTieringEvent(tableId));
+
+            Map<Long, Map<Integer, Long>> bucketOffsetOfSecondWrite =
+                    appendRowForPartitionedTable(
+                            tablePath,
+                            DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR,
+                            partitionNameByIds,
+                            1,
+                            10);
+
+            // request tiering table splits
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+
+            waitUntilTieringTableSplitAssignmentReady(
+                    context, DEFAULT_BUCKET_NUM * partitionNameByIds.size(), 500L);
+            List<TieringSplit> expectedLogAssignment = new ArrayList<>();
+            for (Map.Entry<String, Long> partitionNameById : partitionNameByIds.entrySet()) {
+                for (int tableBucket = 0; tableBucket < DEFAULT_BUCKET_NUM; tableBucket++) {
+                    long partionId = partitionNameById.getValue();
+                    expectedLogAssignment.add(
+                            new TieringLogSplit(
+                                    tablePath,
+                                    new TableBucket(tableId, partionId, tableBucket),
+                                    partitionNameById.getKey(),
+                                    bucketOffsetOfInitialWrite.get(partionId).get(tableBucket),
+                                    bucketOffsetOfInitialWrite.get(partionId).get(tableBucket)
+                                            + bucketOffsetOfSecondWrite
+                                                    .get(partionId)
+                                                    .get(tableBucket),
+                                    expectNumberOfSplits));
+                }
+            }
+            List<TieringSplit> actualLogAssignment = new ArrayList<>();
+            for (SplitsAssignment<TieringSplit> splitsAssignment :
+                    context.getSplitsAssignmentSequence()) {
+                splitsAssignment.assignment().values().forEach(actualLogAssignment::addAll);
+            }
+            assertTieringSplitsMatch(actualLogAssignment, expectedLogAssignment);
+        }
+    }
+
+    @Test
+    void testHandleFailedTieringTableEvent() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-fail-test-log-table");
+        long tableId = createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        int numSubtasks = 4;
+        int expectNumberOfSplits = 3;
+        Map<Integer, Long> bucketOffsetOfWrite =
+                appendRow(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 0, 10);
+        // test get log split and the assignment
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register all readers
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 200);
+
+            List<TieringSplit> expectedAssignment = new ArrayList<>();
+            for (int bucketId = 0; bucketId < DEFAULT_BUCKET_NUM; bucketId++) {
+                expectedAssignment.add(
+                        new TieringLogSplit(
+                                tablePath,
+                                new TableBucket(tableId, bucketId),
+                                null,
+                                EARLIEST_OFFSET,
+                                bucketOffsetOfWrite.get(bucketId),
+                                expectNumberOfSplits));
+            }
+            List<TieringSplit> actualAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualAssignment::addAll));
+
+            assertTieringSplitsMatch(actualAssignment, expectedAssignment);
+
+            // mock tiering fail by send tiering fail event
+            context.getSplitsAssignmentSequence().clear();
+            enumerator.handleSourceEvent(1, new FailedTieringEvent(tableId, "test_reason"));
+
+            // request tiering table splits, should get splits
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 500L);
+            List<TieringSplit> actualAssignment1 = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(actualAssignment1::addAll));
+            assertTieringSplitsMatch(actualAssignment1, expectedAssignment);
+        }
+    }
+
+    @Test
+    void testHandleReaderFailOver() throws Throwable {
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder(DEFAULT_LOG_TABLE_DESCRIPTOR)
+                        .distributedBy(4, "id")
+                        .build();
+        TablePath tablePath1 = TablePath.of(DEFAULT_DB, "tiering-failover-test-log-table1");
+        createTable(tablePath1, tableDescriptor);
+        appendRow(tablePath1, tableDescriptor, 0, 10);
+
+        TablePath tablePath2 = TablePath.of(DEFAULT_DB, "tiering-failover-test-log-table2");
+        createTable(tablePath2, tableDescriptor);
+        appendRow(tablePath2, tableDescriptor, 0, 10);
+
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(3)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+
+            enumerator.start();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // register readers and handle split requests for attempt 0
+            registerReaderAndHandleSplitRequests(context, enumerator, 3, 0);
+
+            // Assign three of the four splits, leaving one pending when failover starts.
+            verifyTieringSplitAssignment(context, 3, tablePath1);
+            assertThat(context.getSplitsAssignmentSequence())
+                    .flatExtracting(assignment -> assignment.assignment().values())
+                    .flatExtracting(splits -> splits)
+                    .extracting(TieringSplit::getNumberOfSplits)
+                    .containsOnly(4);
+
+            // clean assignment
+            context.getSplitsAssignmentSequence().clear();
+
+            // readers failover: Enumerator marks tablePath1 as failed and clears its splits
+            // register readers and handle split requests (attempt 1)
+            registerReaderAndHandleSplitRequests(context, enumerator, 3, 1);
+
+            // Only tablePath2 splits are assigned; the pending tablePath1 split was cleared.
+            verifyTieringSplitAssignment(context, 3, tablePath2);
+
+            // clean assignment
+            context.getSplitsAssignmentSequence().clear();
+
+            // readers failover again: Enumerator marks tablePath2 as failed and clears its splits
+            // register readers and process split requests for attempt 2
+            registerReaderAndHandleSplitRequests(context, enumerator, 2, 2);
+
+            // now, should get no tiering split, since all pending split for tablePath1 and
+            // tablePath2 is clear and there still one sub-task is not registered
+            verifyTieringSplitAssignment(context, 0, tablePath2);
+
+            // Once reader 2 restarts, failover completes and tablePath1 splits can be assigned.
+            registerSingleReaderAndHandleSplitRequests(context, enumerator, 2, 2);
+            verifyTieringSplitAssignment(context, 3, tablePath1);
+        }
+    }
+
+    private static CommitLakeTableSnapshotRequest genCommitLakeTableSnapshotRequest(
+            long tableId,
+            @Nullable Long partitionId,
+            long snapshotId,
+            Map<Integer, Long> bucketLogEndOffsets) {
+        CommitLakeTableSnapshotRequest commitLakeTableSnapshotRequest =
+                new CommitLakeTableSnapshotRequest();
+        PbLakeTableSnapshotInfo reqForTable = commitLakeTableSnapshotRequest.addTablesReq();
+        reqForTable.setTableId(tableId);
+        reqForTable.setSnapshotId(snapshotId);
+        for (Map.Entry<Integer, Long> bucketLogEndOffset : bucketLogEndOffsets.entrySet()) {
+            int bucketId = bucketLogEndOffset.getKey();
+            TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+            PbLakeTableOffsetForBucket lakeTableOffsetForBucket = reqForTable.addBucketsReq();
+            if (tb.getPartitionId() != null) {
+                lakeTableOffsetForBucket.setPartitionId(tb.getPartitionId());
+            }
+            lakeTableOffsetForBucket.setBucketId(tb.getBucket());
+            lakeTableOffsetForBucket.setLogEndOffset(bucketLogEndOffset.getValue());
+        }
+        return commitLakeTableSnapshotRequest;
+    }
+
+    // --------------------- Test Utils ---------------------
+
+    /**
+     * Asserts that the actual assigned splits match the expected ones. {@code splitIndex} and
+     * {@code tieringRoundTimestamp} are assigned at split-generation time and unknown to the
+     * expected splits constructed in tests, so they are validated as round metadata via {@link
+     * #assertValidTieringRound} and then normalized away before comparing the remaining fields with
+     * the regular {@code equals}.
+     */
+    private static void assertTieringSplitsMatch(
+            List<TieringSplit> actualSplits, List<TieringSplit> expectedSplits) {
+        assertValidTieringRound(actualSplits);
+        List<TieringSplit> normalizedActualSplits =
+                actualSplits.stream()
+                        .map(
+                                split ->
+                                        split.copy(
+                                                split.getNumberOfSplits(),
+                                                TieringSplit.UNKNOWN_SPLIT_INDEX,
+                                                TieringSplit.UNKNOWN_TIERING_ROUND_TIMESTAMP))
+                        .collect(Collectors.toList());
+        assertThat(normalizedActualSplits).containsExactlyInAnyOrderElementsOf(expectedSplits);
+    }
+
+    /**
+     * Validates the per-round metadata of the assigned splits: the split indexes cover {@code
+     * 0..size-1} with exactly one first split, every split reports the round size as its number of
+     * splits, and all splits share the same positive tiering round timestamp.
+     */
+    private static void assertValidTieringRound(List<TieringSplit> tieringSplits) {
+        assertThat(tieringSplits).isNotEmpty();
+        assertThat(tieringSplits).filteredOn(TieringSplit::isFirstSplit).hasSize(1);
+        assertThat(tieringSplits)
+                .extracting(TieringSplit::getSplitIndex)
+                .containsExactlyInAnyOrderElementsOf(
+                        IntStream.range(0, tieringSplits.size())
+                                .boxed()
+                                .collect(Collectors.toList()));
+        long tieringRoundTimestamp = tieringSplits.get(0).getTieringRoundTimestamp();
+        assertThat(tieringRoundTimestamp).isPositive();
+        assertThat(tieringSplits)
+                .allSatisfy(
+                        split -> {
+                            assertThat(split.getNumberOfSplits()).isEqualTo(tieringSplits.size());
+                            assertThat(split.getTieringRoundTimestamp())
+                                    .isEqualTo(tieringRoundTimestamp);
+                        });
+    }
+
+    private void registerReaderAndHandleSplitRequests(
+            FlussMockSplitEnumeratorContext<TieringSplit> context,
+            TieringSourceEnumerator enumerator,
+            int numSubtasks,
+            int attemptNumber) {
+        for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+            registerSingleReaderAndHandleSplitRequests(
+                    context, enumerator, subtaskId, attemptNumber);
+        }
+    }
+
+    private void registerSingleReaderAndHandleSplitRequests(
+            FlussMockSplitEnumeratorContext<TieringSplit> context,
+            TieringSourceEnumerator enumerator,
+            int subtaskId,
+            int attemptNumber) {
+        context.registerSourceReader(subtaskId, attemptNumber, "localhost-" + subtaskId);
+        enumerator.addReader(subtaskId);
+        enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+    }
+
+    private void waitUntilTieringTableSplitAssignmentReady(
+            FlussMockSplitEnumeratorContext<TieringSplit> context,
+            int expectedSplitsNum,
+            long sleepMs)
+            throws Throwable {
+        while (context.getSplitsAssignmentSequence().size() < expectedSplitsNum) {
+            if (!context.getPeriodicCallables().isEmpty()) {
+                context.runPeriodicCallable(0);
+            } else {
+                context.runNextOneTimeCallable();
+            }
+            Thread.sleep(sleepMs);
+        }
+    }
+
+    private void verifyTieringSplitAssignment(
+            FlussMockSplitEnumeratorContext<TieringSplit> context,
+            int expectedSplitSize,
+            TablePath expectedTablePath)
+            throws Throwable {
+        waitUntilTieringTableSplitAssignmentReady(context, expectedSplitSize, 200);
+        List<SplitsAssignment<TieringSplit>> actualAssignment =
+                context.getSplitsAssignmentSequence();
+
+        List<TieringSplit> allTieringSplits =
+                actualAssignment.stream()
+                        .flatMap(assignments -> assignments.assignment().values().stream())
+                        .flatMap(List::stream)
+                        .collect(Collectors.toList());
+        assertThat(allTieringSplits).hasSize(expectedSplitSize);
+        assertThat(allTieringSplits)
+                .allMatch(tieringSplit -> tieringSplit.getTablePath().equals(expectedTablePath));
+    }
+
+    private TieringSourceEnumerator createTieringSourceEnumerator(
+            Configuration flussConf, MockSplitEnumeratorContext<TieringSplit> context) {
+        return createTieringSourceEnumerator(flussConf, context, new TestingLakeTieringFactory());
+    }
+
+    private TieringSourceEnumerator createTieringSourceEnumerator(
+            Configuration flussConf,
+            MockSplitEnumeratorContext<TieringSplit> context,
+            LakeTieringFactory<?, ?> lakeTieringFactory) {
+        return new TieringSourceEnumerator(flussConf, context, lakeTieringFactory, 500);
+    }
+
+    @Test
+    void testTableValidationFailureDoesNotAssignSplits() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-validation-failure");
+        createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        AtomicReference<TableInfo> validatedTable = new AtomicReference<>();
+        TestingLakeTieringFactory lakeTieringFactory =
+                new TestingLakeTieringFactory() {
+                    @Override
+                    public void validateTable(TableInfo tableInfo) throws IOException {
+                        validatedTable.set(tableInfo);
+                        throw new IOException("expected validation failure");
+                    }
+                };
+
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                        new FlussMockSplitEnumeratorContext<>(1);
+                TieringSourceEnumerator enumerator =
+                        createTieringSourceEnumerator(flussConf, context, lakeTieringFactory)) {
+            enumerator.start();
+            registerSingleReaderAndHandleSplitRequests(context, enumerator, 0, 0);
+
+            assertThat(validatedTable.get()).isNotNull();
+            assertThat(validatedTable.get().getTablePath()).isEqualTo(tablePath);
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+        }
+    }
+
+    @Test
+    void testNetworkErrorInHeartbeatTriggersFailover() throws Exception {
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(1)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+            FlinkRuntimeException networkError =
+                    new FlinkRuntimeException(
+                            "Failed to wait heartbeat response due to ",
+                            new NetworkException("coordinator disconnected"));
+            assertThatThrownBy(() -> enumerator.generateAndAssignSplits(null, networkError))
+                    .isSameAs(networkError);
+        }
+    }
+
+    @Test
+    void testTableReachMaxTieringDuration() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-max-duration-test-log-table");
+        long tableId = createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        int numSubtasks = 2;
+
+        try (FlussMockSplitEnumeratorContext<TieringSplit> context =
+                        new FlussMockSplitEnumeratorContext<>(numSubtasks);
+                TieringSourceEnumerator enumerator =
+                        createTieringSourceEnumerator(flussConf, context)) {
+            enumerator.start();
+
+            // Register all readers
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                context.registerSourceReader(subtaskId, subtaskId, "localhost-" + subtaskId);
+            }
+
+            appendRow(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 0, 10);
+
+            for (int subTask = 0; subTask < numSubtasks; subTask++) {
+                enumerator.handleSplitRequest(subTask, "localhost-" + subTask);
+            }
+
+            // Wait for initial assignment
+            waitUntilTieringTableSplitAssignmentReady(context, 2, 200L);
+
+            retry(
+                    Duration.ofSeconds(30),
+                    () -> {
+                        // Verify that TieringReachMaxDurationEvent was sent to all readers
+                        // Use reflection to access events sent to readers
+                        Map<Integer, List<SourceEvent>> eventsToReaders =
+                                context.getSentSourceEvent();
+                        assertThat(eventsToReaders).hasSize(numSubtasks);
+                        for (Map.Entry<Integer, List<SourceEvent>> entry :
+                                eventsToReaders.entrySet()) {
+                            assertThat(entry.getValue())
+                                    .containsExactly(new TieringReachMaxDurationEvent(tableId));
+                        }
+                    });
+
+            // clear split assignment
+            context.getSplitsAssignmentSequence().clear();
+
+            // request a split again
+            enumerator.handleSplitRequest(0, "localhost-0");
+
+            // the split should be marked as skipCurrentRound
+            waitUntilTieringTableSplitAssignmentReady(context, 1, 100L);
+
+            List<TieringSplit> assignedSplits = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(assignedSplits::addAll));
+            assertThat(assignedSplits).hasSize(1);
+            assertThat(assignedSplits.get(0).shouldSkipCurrentRound()).isTrue();
+
+            // alter table freshness to 10 min to make sure we won't assign in
+            // normal finish
+            conn.getAdmin()
+                    .alterTable(
+                            tablePath,
+                            Collections.singletonList(
+                                    TableChange.set(
+                                            ConfigOptions.TABLE_DATALAKE_FRESHNESS.key(), "10min")),
+                            false)
+                    .get();
+
+            // Mock tiering finished
+            // This simulates the reader finishing tiering after reaching max duration
+            enumerator.handleSourceEvent(0, new FinishedTieringEvent(tableId));
+
+            // Clear split assignment to prepare for next round
+            context.getSplitsAssignmentSequence().clear();
+
+            // Run periodic callable to trigger heartbeat, which will report force finish to
+            // coordinator
+            // The coordinator will move the table from Tiered to Pending state
+            if (!context.getPeriodicCallables().isEmpty()) {
+                context.runPeriodicCallable(0);
+            }
+
+            // Request table again - since the table was force finished, it should be immediately
+            // available in Pending state
+            for (int subTask = 0; subTask < numSubtasks; subTask++) {
+                enumerator.handleSplitRequest(subTask, "localhost-" + subTask);
+            }
+
+            // Run periodic callable again to request table from coordinator
+            if (!context.getPeriodicCallables().isEmpty()) {
+                context.runPeriodicCallable(0);
+            }
+
+            // The table should be immediately requested again (epoch should be 2)
+            // Wait for the table to be assigned again
+            waitUntilTieringTableSplitAssignmentReady(context, 2, 500L);
+
+            List<TieringSplit> reassignedSplits = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(reassignedSplits::addAll));
+            assertThat(reassignedSplits).hasSize(2);
+            // Verify that the table is requested again with a new epoch (epoch 2)
+            assertThat(reassignedSplits)
+                    .allMatch(
+                            split ->
+                                    split.getTableBucket().getTableId() == tableId
+                                            && !split.shouldSkipCurrentRound());
+        }
+    }
+}

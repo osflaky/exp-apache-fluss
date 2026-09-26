@@ -1,0 +1,754 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.metrics.group;
+
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.CharacterFilter;
+import org.apache.fluss.metrics.Counter;
+import org.apache.fluss.metrics.DescriptiveStatisticsHistogram;
+import org.apache.fluss.metrics.Histogram;
+import org.apache.fluss.metrics.MeterView;
+import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.NoOpCounter;
+import org.apache.fluss.metrics.ThreadSafeSimpleCounter;
+import org.apache.fluss.metrics.groups.AbstractMetricGroup;
+import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.metrics.registry.MetricRegistry;
+import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
+
+import javax.annotation.Nullable;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
+
+import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
+
+/**
+ * Metrics for the tables(tables or partitions) in server with {@link TabletServerMetricGroup} as
+ * parent group.
+ */
+public class TableMetricGroup extends AbstractMetricGroup {
+
+    private final Map<TableBucket, BucketMetricGroup> buckets = new ConcurrentHashMap<>();
+
+    private final TablePath tablePath;
+
+    // server-level metrics
+    private final TabletServerMetricGroup serverMetrics;
+
+    // table-level metrics for log, when the table is for kv, it's for cdc log
+    private final LogMetricGroup logMetrics;
+
+    // table-level  metrics for kv, will be null if the table isn't a kv table
+    private final @Nullable KvMetricGroup kvMetrics;
+
+    // Cumulative count of write requests rejected by KV backpressure
+    // (StorageBackpressureException),
+    // aggregated across all buckets of this table. Null when the table isn't a KV table, since
+    // backpressure is only emitted by primary-key tables backed by RocksDB.
+    private final @Nullable Counter kvBackpressureRejectedRequests;
+
+    public TableMetricGroup(
+            MetricRegistry registry,
+            TablePath tablePath,
+            boolean isKvTable,
+            TabletServerMetricGroup serverMetricGroup) {
+        super(
+                registry,
+                makeScope(serverMetricGroup, tablePath.getDatabaseName(), tablePath.getTableName()),
+                serverMetricGroup);
+        this.serverMetrics = serverMetricGroup;
+        this.tablePath = tablePath;
+
+        // if is kv table, create kv metrics
+        if (isKvTable) {
+            kvMetrics = new KvMetricGroup(this);
+            logMetrics = new LogMetricGroup(this, TabletType.CDC_LOG);
+            // Register RocksDB aggregated metrics for kv tables
+            registerRocksDBMetrics();
+            // Register KV backpressure aggregated metrics for kv tables
+            kvBackpressureRejectedRequests = new ThreadSafeSimpleCounter();
+            counter(MetricNames.KV_BACKPRESSURE_REJECTIONS_TOTAL, kvBackpressureRejectedRequests);
+            registerKvBackpressureGauges();
+        } else {
+            // otherwise, create log produce metrics
+            kvMetrics = null;
+            logMetrics = new LogMetricGroup(this, TabletType.LOG);
+            kvBackpressureRejectedRequests = null;
+        }
+    }
+
+    @Override
+    protected void putVariables(Map<String, String> variables) {
+        variables.put("database", tablePath.getDatabaseName());
+        variables.put("table", tablePath.getTableName());
+    }
+
+    @Override
+    protected String getGroupName(CharacterFilter filter) {
+        // partition and table share same logic group name
+        return "table";
+    }
+
+    /** Closes this table metric group and its directly created tablet metric groups. */
+    @Override
+    public void close() {
+        if (kvMetrics != null) {
+            kvMetrics.close();
+        }
+        logMetrics.close();
+        super.close();
+    }
+
+    public void incLogMessageIn(long n) {
+        logMetrics.messagesIn.inc(n);
+        serverMetrics.messageIn().inc(n);
+    }
+
+    public void incLogBytesIn(long n) {
+        logMetrics.bytesIn.inc(n);
+        serverMetrics.bytesIn().inc(n);
+    }
+
+    public void incLogBytesOut(long n) {
+        logMetrics.bytesOut.inc(n);
+        serverMetrics.bytesOut().inc(n);
+    }
+
+    public Counter totalFetchLogRequests() {
+        return logMetrics.totalFetchLogRequests;
+    }
+
+    public Counter failedFetchLogRequests() {
+        return logMetrics.failedFetchLogRequests;
+    }
+
+    public Counter totalProduceLogRequests() {
+        return logMetrics.totalProduceLogRequests;
+    }
+
+    public Counter failedProduceLogRequests() {
+        return logMetrics.failedProduceLogRequests;
+    }
+
+    public Counter remoteLogCopyBytes() {
+        return logMetrics.remoteLogCopyBytes;
+    }
+
+    public Counter remoteLogCopyRequests() {
+        return logMetrics.remoteLogCopyRequests;
+    }
+
+    public Counter remoteLogCopyErrors() {
+        return logMetrics.remoteLogCopyErrors;
+    }
+
+    public Counter remoteLogDeleteRequests() {
+        return logMetrics.remoteLogDeleteRequests;
+    }
+
+    public Counter remoteLogDeleteErrors() {
+        return logMetrics.remoteLogDeleteErrors;
+    }
+
+    /** Returns the successful KV snapshot upload byte counter, or a no-op for log tables. */
+    public Counter remoteKvCopyBytes() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.remoteKvCopyBytes;
+        }
+    }
+
+    public void incKvMessageIn(long n) {
+        if (kvMetrics == null) {
+            NoOpCounter.INSTANCE.inc(n);
+        } else {
+            kvMetrics.messagesIn.inc(n);
+            serverMetrics.messageIn().inc(n);
+        }
+    }
+
+    public void incKvBytesIn(long n) {
+        if (kvMetrics == null) {
+            NoOpCounter.INSTANCE.inc(n);
+        } else {
+            kvMetrics.bytesIn.inc(n);
+            serverMetrics.bytesIn().inc(n);
+        }
+    }
+
+    public Counter totalLookupRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.totalLookupRequests;
+        }
+    }
+
+    public Counter failedLookupRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.failedLookupRequests;
+        }
+    }
+
+    /** Returns the counter for historical lookup requests received by this table. */
+    public Counter totalHistoricalLookupRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.totalHistoricalLookupRequests;
+        }
+    }
+
+    /** Returns the counter for failed historical lookup requests for this table. */
+    public Counter failedHistoricalLookupRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.failedHistoricalLookupRequests;
+        }
+    }
+
+    /** Returns the counter for historical put-KV requests received by this table. */
+    public Counter totalHistoricalPutKvRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.totalHistoricalPutKvRequests;
+        }
+    }
+
+    /** Returns the counter for failed historical put-KV requests for this table. */
+    public Counter failedHistoricalPutKvRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.failedHistoricalPutKvRequests;
+        }
+    }
+
+    /**
+     * Records a historical lake table point lookup.
+     *
+     * @param lookupTimeNanos time spent on the lake table point lookup, in nanoseconds
+     * @param lookupFileDownloaded whether the lookup downloaded a lookup file
+     */
+    public void recordHistoricalLakeLookup(long lookupTimeNanos, boolean lookupFileDownloaded) {
+        if (kvMetrics != null) {
+            kvMetrics.recordHistoricalLakeLookup(lookupTimeNanos, lookupFileDownloaded);
+        }
+    }
+
+    public Counter totalPutKvRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.totalPutKvRequests;
+        }
+    }
+
+    public Counter failedPutKvRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.failedPutKvRequests;
+        }
+    }
+
+    public Counter totalLimitScanRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.totalLimitScanRequests;
+        }
+    }
+
+    public Counter failedLimitScanRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.failedLimitScanRequests;
+        }
+    }
+
+    public Counter totalPrefixLookupRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.totalPrefixLookupRequests;
+        }
+    }
+
+    public Counter failedPrefixLookupRequests() {
+        if (kvMetrics == null) {
+            return NoOpCounter.INSTANCE;
+        } else {
+            return kvMetrics.failedPrefixLookupRequests;
+        }
+    }
+
+    /**
+     * Increment the table-level counter of write requests rejected by KV backpressure ({@code
+     * StorageBackpressureException}). Called by the pre-write KV backpressure gate when the storage
+     * engine has crossed its hard-rejection trigger. No-op for non-KV tables.
+     */
+    public void incKvBackpressureRejectedRequests() {
+        if (kvBackpressureRejectedRequests != null) {
+            kvBackpressureRejectedRequests.inc();
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    //  bucket groups
+    // ------------------------------------------------------------------------
+    public BucketMetricGroup addBucketMetricGroup(
+            @Nullable String partitionName, TableBucket tableBucket) {
+        return buckets.computeIfAbsent(
+                tableBucket,
+                (bucket) ->
+                        new BucketMetricGroup(
+                                registry, partitionName, tableBucket.getBucket(), this));
+    }
+
+    public void removeBucketMetricGroup(TableBucket tableBucket) {
+        BucketMetricGroup metricGroup = buckets.remove(tableBucket);
+        if (metricGroup != null) {
+            // BucketMetricGroup.close() will automatically clean up RocksDB statistics
+            metricGroup.close();
+        }
+    }
+
+    public int bucketGroupsCount() {
+        return buckets.size();
+    }
+
+    public java.util.Collection<BucketMetricGroup> getBucketMetricGroups() {
+        return buckets.values();
+    }
+
+    /**
+     * Get all RocksDB statistics from bucket metric groups for table-level and server-level
+     * aggregation.
+     *
+     * <p>This method dynamically collects statistics from all buckets, allowing automatic cleanup
+     * when buckets are removed without maintaining a separate map.
+     *
+     * @return stream of RocksDB statistics from all buckets in this table
+     */
+    public Stream<RocksDBStatistics> allRocksDBStatistics() {
+        return buckets.values().stream()
+                .map(BucketMetricGroup::getRocksDBStatistics)
+                .filter(stats -> stats != null);
+    }
+
+    public TabletServerMetricGroup getServerMetricGroup() {
+        return (TabletServerMetricGroup) parent;
+    }
+
+    /**
+     * Register RocksDB aggregated metrics at table level. These metrics aggregate values from all
+     * buckets of this table.
+     *
+     * <p>This method is called once during TableMetricGroup construction for KV tables.
+     */
+    private void registerRocksDBMetrics() {
+        // Max aggregation metrics - track the maximum value across all buckets
+        gauge(
+                MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getWriteStallMicros)
+                                .max()
+                                .orElse(0L));
+        gauge(
+                MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getGetLatencyMicros)
+                                .max()
+                                .orElse(0L));
+        gauge(
+                MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getWriteLatencyMicros)
+                                .max()
+                                .orElse(0L));
+        gauge(
+                MetricNames.ROCKSDB_NUM_FILES_AT_LEVEL0_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getNumFilesAtLevel0)
+                                .max()
+                                .orElse(0L));
+        gauge(
+                MetricNames.ROCKSDB_FLUSH_PENDING_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getFlushPending)
+                                .max()
+                                .orElse(0L));
+        gauge(
+                MetricNames.ROCKSDB_COMPACTION_PENDING_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionPending)
+                                .max()
+                                .orElse(0L));
+        gauge(
+                MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionTimeMicros)
+                                .max()
+                                .orElse(0L));
+        // Sum aggregation metrics - track the total value across all buckets
+        gauge(
+                MetricNames.ROCKSDB_BYTES_READ_TOTAL,
+                () -> allRocksDBStatistics().mapToLong(RocksDBStatistics::getBytesRead).sum());
+        gauge(
+                MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL,
+                () -> allRocksDBStatistics().mapToLong(RocksDBStatistics::getBytesWritten).sum());
+        gauge(
+                MetricNames.ROCKSDB_FLUSH_BYTES_WRITTEN_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getFlushBytesWritten)
+                                .sum());
+        gauge(
+                MetricNames.ROCKSDB_COMPACTION_BYTES_READ_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionBytesRead)
+                                .sum());
+        gauge(
+                MetricNames.ROCKSDB_COMPACTION_BYTES_WRITTEN_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionBytesWritten)
+                                .sum());
+
+        // Fine-grained memory metrics - track memory usage by component type
+        gauge(
+                MetricNames.ROCKSDB_MEMTABLE_MEMORY_USAGE_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getMemTableMemoryUsage)
+                                .sum());
+        gauge(
+                MetricNames.ROCKSDB_MEMTABLE_UNFLUSHED_MEMORY_USAGE_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getMemTableUnFlushedMemoryUsage)
+                                .sum());
+        gauge(
+                MetricNames.ROCKSDB_TABLE_READERS_MEMORY_USAGE_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getTableReadersMemoryUsage)
+                                .sum());
+        gauge(
+                MetricNames.ROCKSDB_BLOCK_CACHE_MEMORY_USAGE_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getBlockCacheMemoryUsage)
+                                .sum());
+        gauge(
+                MetricNames.ROCKSDB_BLOCK_CACHE_PINNED_USAGE_TOTAL,
+                () ->
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getBlockCachePinnedUsage)
+                                .sum());
+    }
+
+    /**
+     * Register table-level KV backpressure gauge. Reports the peak normalized pressure across all
+     * buckets, in {@code [0, 1)}. Per-bucket pressure values are written from successful PutKv
+     * response sampling; the gauge reads them via {@link
+     * BucketMetricGroup#getKvBackpressureLevel()} without going through RocksDB.
+     */
+    private void registerKvBackpressureGauges() {
+        gauge(
+                MetricNames.KV_BACKPRESSURE_MAX_PRESSURE,
+                () ->
+                        (float)
+                                buckets.values().stream()
+                                        .mapToDouble(BucketMetricGroup::getKvBackpressureLevel)
+                                        .max()
+                                        .orElse(0d));
+    }
+
+    /** Metric group for specific kind of tablet of a table. */
+    private static class TabletMetricGroup extends AbstractMetricGroup {
+        private final TabletType tabletType;
+
+        // general metrics for all kinds of tablets
+        protected final Counter messagesIn;
+        protected final Counter bytesIn;
+        protected final Counter bytesOut;
+
+        private TabletMetricGroup(TableMetricGroup tableMetricGroup, TabletType tabletType) {
+            super(
+                    tableMetricGroup.registry,
+                    makeScope(tableMetricGroup, tabletType.name),
+                    tableMetricGroup);
+            this.tabletType = tabletType;
+
+            messagesIn = new ThreadSafeSimpleCounter();
+            meter(MetricNames.MESSAGES_IN_RATE, new MeterView(messagesIn));
+            bytesIn = new ThreadSafeSimpleCounter();
+            meter(MetricNames.BYTES_IN_RATE, new MeterView(bytesIn));
+            bytesOut = new ThreadSafeSimpleCounter();
+            meter(MetricNames.BYTES_OUT_RATE, new MeterView(bytesOut));
+        }
+
+        @Override
+        protected void putVariables(Map<String, String> variables) {
+            variables.put("tablet_type", tabletType.name);
+        }
+
+        @Override
+        protected String getGroupName(CharacterFilter filter) {
+            // make the group name be "" to make the different kinds of tablet
+            // has same logic scope
+            return "";
+        }
+    }
+
+    private static class LogMetricGroup extends TabletMetricGroup {
+
+        private final Counter totalFetchLogRequests;
+        private final Counter failedFetchLogRequests;
+
+        // will be NOP when it's for cdc log
+        private final Counter totalProduceLogRequests;
+        private final Counter failedProduceLogRequests;
+
+        // remote log metrics
+        private final Counter remoteLogCopyBytes;
+        private final Counter remoteLogCopyRequests;
+        private final Counter remoteLogCopyErrors;
+        private final Counter remoteLogDeleteRequests;
+        private final Counter remoteLogDeleteErrors;
+
+        private LogMetricGroup(TableMetricGroup tableMetricGroup, TabletType groupType) {
+            super(tableMetricGroup, groupType);
+            // for fetch log requests
+            totalFetchLogRequests = new ThreadSafeSimpleCounter();
+            meter(MetricNames.TOTAL_FETCH_LOG_REQUESTS_RATE, new MeterView(totalFetchLogRequests));
+            failedFetchLogRequests = new ThreadSafeSimpleCounter();
+            meter(
+                    MetricNames.FAILED_FETCH_LOG_REQUESTS_RATE,
+                    new MeterView(failedFetchLogRequests));
+            if (groupType == TabletType.LOG) {
+                // for produce log request
+                totalProduceLogRequests = new ThreadSafeSimpleCounter();
+                meter(
+                        MetricNames.TOTAL_PRODUCE_FETCH_LOG_REQUESTS_RATE,
+                        new MeterView(totalProduceLogRequests));
+                failedProduceLogRequests = new ThreadSafeSimpleCounter();
+                meter(
+                        MetricNames.FAILED_PRODUCE_FETCH_LOG_REQUESTS_RATE,
+                        new MeterView(failedProduceLogRequests));
+            } else {
+                totalProduceLogRequests = NoOpCounter.INSTANCE;
+                failedProduceLogRequests = NoOpCounter.INSTANCE;
+            }
+
+            // remote log copy metrics.
+            remoteLogCopyBytes = new ThreadSafeSimpleCounter();
+            meter(MetricNames.REMOTE_LOG_COPY_BYTES_RATE, new MeterView(remoteLogCopyBytes));
+            remoteLogCopyRequests = new ThreadSafeSimpleCounter();
+            meter(MetricNames.REMOTE_LOG_COPY_REQUESTS_RATE, new MeterView(remoteLogCopyRequests));
+            remoteLogCopyErrors = new ThreadSafeSimpleCounter();
+            meter(MetricNames.REMOTE_LOG_COPY_ERROR_RATE, new MeterView(remoteLogCopyErrors));
+            remoteLogDeleteRequests = new ThreadSafeSimpleCounter();
+            meter(
+                    MetricNames.REMOTE_LOG_DELETE_REQUESTS_RATE,
+                    new MeterView(remoteLogDeleteRequests));
+            remoteLogDeleteErrors = new ThreadSafeSimpleCounter();
+            meter(MetricNames.REMOTE_LOG_DELETE_ERROR_RATE, new MeterView(remoteLogDeleteErrors));
+        }
+
+        @Override
+        protected String getGroupName(CharacterFilter filter) {
+            return super.getGroupName(filter);
+        }
+    }
+
+    private static class KvMetricGroup extends TabletMetricGroup {
+
+        private static final String LOOKUP_FILE_DOWNLOADED = "lookup_file_downloaded";
+
+        private final Counter remoteKvCopyBytes;
+
+        private final Counter totalLookupRequests;
+        private final Counter failedLookupRequests;
+        private final Counter totalHistoricalLookupRequests;
+        private final Counter failedHistoricalLookupRequests;
+        private final Counter totalHistoricalPutKvRequests;
+        private final Counter failedHistoricalPutKvRequests;
+        private final LookupFileDownloadedMetricGroup downloadedHistoricalLookupMetrics;
+        private final LookupFileDownloadedMetricGroup nonDownloadedHistoricalLookupMetrics;
+        private final Counter totalPutKvRequests;
+        private final Counter failedPutKvRequests;
+        private final Counter totalLimitScanRequests;
+        private final Counter failedLimitScanRequests;
+        private final Counter totalPrefixLookupRequests;
+        private final Counter failedPrefixLookupRequests;
+
+        public KvMetricGroup(TableMetricGroup tableMetricGroup) {
+            super(tableMetricGroup, TabletType.KV);
+
+            // for kv snapshot upload
+            remoteKvCopyBytes = new ThreadSafeSimpleCounter();
+            meter(MetricNames.REMOTE_KV_COPY_BYTES_RATE, new MeterView(remoteKvCopyBytes));
+
+            // for lookup request
+            totalLookupRequests = new ThreadSafeSimpleCounter();
+            meter(MetricNames.TOTAL_LOOKUP_REQUESTS_RATE, new MeterView(totalLookupRequests));
+            failedLookupRequests = new ThreadSafeSimpleCounter();
+            meter(MetricNames.FAILED_LOOKUP_REQUESTS_RATE, new MeterView(failedLookupRequests));
+            // for historical lookup request
+            MetricGroup historicalMetrics = addGroup("historical");
+            totalHistoricalLookupRequests = new ThreadSafeSimpleCounter();
+            historicalMetrics.meter(
+                    MetricNames.TOTAL_LOOKUP_REQUESTS_RATE,
+                    new MeterView(totalHistoricalLookupRequests));
+            failedHistoricalLookupRequests = new ThreadSafeSimpleCounter();
+            historicalMetrics.meter(
+                    MetricNames.FAILED_LOOKUP_REQUESTS_RATE,
+                    new MeterView(failedHistoricalLookupRequests));
+            // for historical put kv request
+            totalHistoricalPutKvRequests = new ThreadSafeSimpleCounter();
+            historicalMetrics.meter(
+                    MetricNames.TOTAL_PUT_KV_REQUESTS_RATE,
+                    new MeterView(totalHistoricalPutKvRequests));
+            failedHistoricalPutKvRequests = new ThreadSafeSimpleCounter();
+            historicalMetrics.meter(
+                    MetricNames.FAILED_PUT_KV_REQUESTS_RATE,
+                    new MeterView(failedHistoricalPutKvRequests));
+            // Separate groups expose the same metric names with different downloaded-file labels
+            // without adding the label key to the logical metric scope.
+            downloadedHistoricalLookupMetrics =
+                    new LookupFileDownloadedMetricGroup(registry, this, true);
+            nonDownloadedHistoricalLookupMetrics =
+                    new LookupFileDownloadedMetricGroup(registry, this, false);
+            // for put kv request
+            totalPutKvRequests = new ThreadSafeSimpleCounter();
+            meter(MetricNames.TOTAL_PUT_KV_REQUESTS_RATE, new MeterView(totalPutKvRequests));
+            failedPutKvRequests = new ThreadSafeSimpleCounter();
+            meter(MetricNames.FAILED_PUT_KV_REQUESTS_RATE, new MeterView(failedPutKvRequests));
+            // for limit scan request
+            totalLimitScanRequests = new ThreadSafeSimpleCounter();
+            meter(
+                    MetricNames.TOTAL_LIMIT_SCAN_REQUESTS_RATE,
+                    new MeterView(totalLimitScanRequests));
+            failedLimitScanRequests = new ThreadSafeSimpleCounter();
+            meter(
+                    MetricNames.FAILED_LIMIT_SCAN_REQUESTS_RATE,
+                    new MeterView(failedLimitScanRequests));
+
+            // for prefix lookup request
+            totalPrefixLookupRequests = new ThreadSafeSimpleCounter();
+            meter(
+                    MetricNames.TOTAL_PREFIX_LOOKUP_REQUESTS_RATE,
+                    new MeterView(totalPrefixLookupRequests));
+            failedPrefixLookupRequests = new ThreadSafeSimpleCounter();
+            meter(
+                    MetricNames.FAILED_PREFIX_LOOKUP_REQUESTS_RATE,
+                    new MeterView(failedPrefixLookupRequests));
+        }
+
+        @Override
+        public void close() {
+            downloadedHistoricalLookupMetrics.close();
+            nonDownloadedHistoricalLookupMetrics.close();
+            super.close();
+        }
+
+        private void recordHistoricalLakeLookup(
+                long lookupTimeNanos, boolean lookupFileDownloaded) {
+            LookupFileDownloadedMetricGroup metricGroup =
+                    lookupFileDownloaded
+                            ? downloadedHistoricalLookupMetrics
+                            : nonDownloadedHistoricalLookupMetrics;
+            metricGroup.recordLookup(lookupTimeNanos);
+        }
+
+        @Override
+        protected String getGroupName(CharacterFilter filter) {
+            return super.getGroupName(filter);
+        }
+    }
+
+    private static final class LookupFileDownloadedMetricGroup extends AbstractMetricGroup {
+
+        private static final int WINDOW_SIZE = 64;
+
+        private final boolean lookupFileDownloaded;
+        private final Counter lakeLookups;
+        private final Histogram lakeLookupTimeMs;
+
+        private LookupFileDownloadedMetricGroup(
+                MetricRegistry registry, KvMetricGroup parent, boolean lookupFileDownloaded) {
+            super(registry, makeScope(parent, "historical"), parent);
+            this.lookupFileDownloaded = lookupFileDownloaded;
+            lakeLookups = new ThreadSafeSimpleCounter();
+            meter(MetricNames.LAKE_LOOKUPS_RATE, new MeterView(lakeLookups));
+            lakeLookupTimeMs =
+                    histogram(
+                            MetricNames.LAKE_LOOKUP_TIME_MS,
+                            new DescriptiveStatisticsHistogram(WINDOW_SIZE));
+        }
+
+        private void recordLookup(long lookupTimeNanos) {
+            lakeLookups.inc();
+            lakeLookupTimeMs.update(TimeUnit.NANOSECONDS.toMillis(lookupTimeNanos));
+        }
+
+        @Override
+        protected void putVariables(Map<String, String> variables) {
+            variables.put(
+                    KvMetricGroup.LOOKUP_FILE_DOWNLOADED, String.valueOf(lookupFileDownloaded));
+        }
+
+        @Override
+        protected String getGroupName(CharacterFilter filter) {
+            return "historical";
+        }
+    }
+
+    private enum TabletType {
+        LOG("log"),
+        KV("kv"),
+        CDC_LOG("cdc_log");
+
+        private final String name;
+
+        TabletType(String name) {
+            this.name = name;
+        }
+    }
+}

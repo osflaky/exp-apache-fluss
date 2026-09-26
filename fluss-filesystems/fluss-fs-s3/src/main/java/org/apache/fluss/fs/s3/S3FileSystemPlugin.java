@@ -1,0 +1,222 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.fs.s3;
+
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.config.ConfigBuilder;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FileSystemPlugin;
+import org.apache.fluss.fs.s3.token.S3ADelegationTokenReceiver;
+import org.apache.fluss.fs.s3.token.S3DelegationTokenProvider;
+import org.apache.fluss.fs.s3.token.S3DelegationTokenReceiver;
+import org.apache.fluss.utils.StringUtils;
+
+import org.apache.hadoop.fs.s3a.Constants;
+import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.apache.fluss.fs.s3.token.S3DelegationTokenReceiver.PROVIDER_CONFIG_NAME;
+
+/** Simple factory for the s3 file system. */
+public class S3FileSystemPlugin implements FileSystemPlugin {
+
+    private static final Logger LOG = LoggerFactory.getLogger(S3FileSystemPlugin.class);
+
+    private static final String[] FLUSS_CONFIG_PREFIXES = {"s3.", "s3a.", "fs.s3a."};
+
+    private static final String[] CREDENTIAL_PROVIDER_CONFIG_KEYS = {
+        "s3.aws.credentials.provider", "s3a.aws.credentials.provider", PROVIDER_CONFIG_NAME
+    };
+
+    private static final String HADOOP_CONFIG_PREFIX = "fs.s3a.";
+
+    private static final String ACCESS_KEY_ID = "fs.s3a.access.key";
+    private static final String ACCESS_KEY_SECRET = "fs.s3a.secret.key";
+    private static final String REGION_KEY = "fs.s3a.region";
+
+    private static final String ROLE_ARN_KEY = "fs.s3a.assumed.role.arn";
+
+    private static final String[][] MIRRORED_CONFIG_KEYS = {
+        {"fs.s3a.access-key", "fs.s3a.access.key"},
+        {"fs.s3a.secret-key", "fs.s3a.secret.key"},
+        {"fs.s3a.path-style-access", "fs.s3a.path.style.access"}
+    };
+
+    @Override
+    public String getScheme() {
+        return "s3";
+    }
+
+    @Override
+    public FileSystem create(URI fsUri, Configuration flussConfig) throws IOException {
+        org.apache.hadoop.conf.Configuration hadoopConfig = buildHadoopConfiguration(flussConfig);
+
+        // create the Hadoop FileSystem
+        org.apache.hadoop.fs.FileSystem fs = new S3AFileSystem();
+        fs.initialize(getInitURI(fsUri, hadoopConfig), hadoopConfig);
+        return new S3FileSystem(getScheme(), fs, hadoopConfig);
+    }
+
+    @VisibleForTesting
+    org.apache.hadoop.conf.Configuration buildHadoopConfiguration(Configuration flussConfig) {
+        org.apache.hadoop.conf.Configuration hadoopConfig =
+                mirrorCertainHadoopConfig(getHadoopConfiguration(flussConfig));
+        setDefaultInputStreamType(hadoopConfig);
+        boolean hasCredentialProvider = hasConfiguredCredentialProvider(flussConfig);
+        // Preserve whether the provider came from Fluss config. Token providers should not infer
+        // explicit server-side provider mode from Hadoop default resources.
+        hadoopConfig.setBoolean(
+                S3DelegationTokenProvider.CREDENTIAL_PROVIDER_EXPLICITLY_CONFIGURED,
+                hasCredentialProvider);
+        setCredentialProvider(hadoopConfig);
+        mirrorRegionToEndpointRegion(hadoopConfig);
+        return hadoopConfig;
+    }
+
+    private void setDefaultInputStreamType(org.apache.hadoop.conf.Configuration hadoopConfig) {
+        // hadoop-aws 3.4 defaults to the S3 Analytics Accelerator input stream, which changes
+        // resource usage and S3 read patterns. Keep the previous classic behavior unless users
+        // explicitly configure another stream or enable the legacy prefetch option.
+        if (hadoopConfig.get(Constants.INPUT_STREAM_TYPE) == null
+                && !hadoopConfig.getBoolean(
+                        Constants.PREFETCH_ENABLED_KEY, Constants.PREFETCH_ENABLED_DEFAULT)) {
+            hadoopConfig.set(Constants.INPUT_STREAM_TYPE, Constants.INPUT_STREAM_TYPE_CLASSIC);
+        }
+    }
+
+    org.apache.hadoop.conf.Configuration getHadoopConfiguration(Configuration flussConfig) {
+        org.apache.hadoop.conf.Configuration conf = new org.apache.hadoop.conf.Configuration();
+        if (flussConfig == null) {
+            return conf;
+        }
+
+        for (String key : flussConfig.keySet()) {
+            for (String prefix : FLUSS_CONFIG_PREFIXES) {
+                if (key.startsWith(prefix)) {
+                    String newKey = HADOOP_CONFIG_PREFIX + key.substring(prefix.length());
+                    String newValue =
+                            flussConfig.getString(
+                                    ConfigBuilder.key(key).stringType().noDefaultValue(), null);
+                    conf.set(newKey, newValue);
+
+                    LOG.debug(
+                            "Adding Fluss config entry for {} as {} to Hadoop config", key, newKey);
+                }
+            }
+        }
+        return conf;
+    }
+
+    // mirror certain keys to make use more uniform across implementations
+    // with different keys
+    private org.apache.hadoop.conf.Configuration mirrorCertainHadoopConfig(
+            org.apache.hadoop.conf.Configuration hadoopConfig) {
+        for (String[] mirrored : MIRRORED_CONFIG_KEYS) {
+            String value = hadoopConfig.get(mirrored[0], null);
+            if (value != null) {
+                hadoopConfig.set(mirrored[1], value);
+            }
+        }
+        return hadoopConfig;
+    }
+
+    private void mirrorRegionToEndpointRegion(org.apache.hadoop.conf.Configuration hadoopConfig) {
+        // Hadoop 3.4 reads the S3 client region from fs.s3a.endpoint.region. Mirror after
+        // configuring credentials because delegated tokens may supply the documented s3.region
+        // alias. Do not override the new Hadoop key when it is explicit.
+        String legacyRegion = hadoopConfig.get(REGION_KEY, null);
+        if (legacyRegion != null && hadoopConfig.get(Constants.AWS_REGION, null) == null) {
+            hadoopConfig.set(Constants.AWS_REGION, legacyRegion);
+        }
+    }
+
+    private URI getInitURI(URI fsUri, org.apache.hadoop.conf.Configuration hadoopConfig) {
+        final String scheme = fsUri.getScheme();
+        final String authority = fsUri.getAuthority();
+
+        if (scheme == null && authority == null) {
+            fsUri = org.apache.hadoop.fs.FileSystem.getDefaultUri(hadoopConfig);
+        } else if (scheme != null && authority == null) {
+            URI defaultUri = org.apache.hadoop.fs.FileSystem.getDefaultUri(hadoopConfig);
+            if (scheme.equals(defaultUri.getScheme()) && defaultUri.getAuthority() != null) {
+                fsUri = defaultUri;
+            }
+        }
+        return fsUri;
+    }
+
+    private void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
+        boolean hasCredentialProvider =
+                hadoopConfig.getBoolean(
+                        S3DelegationTokenProvider.CREDENTIAL_PROVIDER_EXPLICITLY_CONFIGURED, false);
+        boolean hasStaticKeys =
+                hadoopConfig.get(ACCESS_KEY_ID) != null
+                        && hadoopConfig.get(ACCESS_KEY_SECRET) != null;
+        boolean hasRoleArn = hadoopConfig.get(ROLE_ARN_KEY) != null;
+
+        if (hasCredentialProvider) {
+            if (hasRoleArn) {
+                throw new IllegalArgumentException(
+                        "AssumeRole and a custom AWS credentials provider cannot be configured together.");
+            }
+            LOG.info(
+                    "Using configured AWS credential provider(s) for server-side S3 access: {}",
+                    hadoopConfig.get(PROVIDER_CONFIG_NAME));
+            return;
+        }
+
+        if (hasStaticKeys || hasRoleArn) {
+            LOG.info(
+                    hasStaticKeys
+                            ? "Using provided static credentials."
+                            : "Using default AWS credential chain with AssumeRole.");
+            return;
+        }
+
+        if (Objects.equals(getScheme(), "s3")) {
+            S3DelegationTokenReceiver.updateHadoopConfig(hadoopConfig);
+        } else if (Objects.equals(getScheme(), "s3a")) {
+            S3ADelegationTokenReceiver.updateHadoopConfig(hadoopConfig);
+        } else {
+            throw new IllegalArgumentException("Unsupported scheme: " + getScheme());
+        }
+        LOG.info(
+                "Using credential provider {} for delegated tokens.",
+                hadoopConfig.get(PROVIDER_CONFIG_NAME));
+    }
+
+    private boolean hasConfiguredCredentialProvider(Configuration flussConfig) {
+        if (flussConfig == null) {
+            return false;
+        }
+        Map<String, String> configMap = flussConfig.toMap();
+        for (String key : CREDENTIAL_PROVIDER_CONFIG_KEYS) {
+            if (!StringUtils.isNullOrWhitespaceOnly(configMap.get(key))) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

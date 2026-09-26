@@ -1,0 +1,93 @@
+################################################################################
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+# .github/workflows/ci-template.yaml
+name: CI Template
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        required: true
+        type: string
+      maven-parameters:
+        description: "Any parameters of the Maven command."
+        required: false
+        type: string
+        default: ""
+jobs:
+  build:
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [core, flink1, flink2, spark3, spark3-lake, spark3-scala213, 
+            lake]
+        include:
+        - module: flink1
+          test-profile: "test-flink1"
+        - module: flink2
+          test-profile: "test-flink2"
+        - module: spark3-lake
+          test-profile: "test-spark3"
+        - module: spark3-scala213
+          scala-profile: "-Pscala-2.13"
+          test-profile: "test-spark3"
+    name: "${{ matrix.module }}"
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.java-version }}
+        distribution: 'temurin'
+    - name: Build
+      run: |
+        mvn -T 1C -B clean install -DskipTests ${{ matrix.scala-profile }} ${{ inputs.maven-parameters }}
+    - name: Test
+      timeout-minutes: 60
+      run: |
+        TEST_MODULES=$(./.github/workflows/stage.sh ${{ matrix.module }})
+        echo "github ref: ${{ github.ref }}"
+        echo "Start testing modules: $TEST_MODULES"
+        mvn -B verify $TEST_MODULES -Ptest-coverage -P${{ matrix.test-profile || format('test-{0}', matrix.module) }} ${{ matrix.scala-profile }} -Dlog.dir=${{ runner.temp }}/fluss-logs -Dlog4j.configurationFile=${{ github.workspace }}/tools/ci/log4j.properties ${{ inputs.maven-parameters }}
+      env:
+        MAVEN_OPTS: -Xmx4096m
+        ARTIFACTS_OSS_ENDPOINT: ${{ secrets.ARTIFACTS_OSS_ENDPOINT }}
+        ARTIFACTS_OSS_REGION: ${{ secrets.ARTIFACTS_OSS_REGION }}
+        ARTIFACTS_OSS_BUCKET: ${{ secrets.ARTIFACTS_OSS_BUCKET }}
+        ARTIFACTS_OSS_ACCESS_KEY: ${{ secrets.ARTIFACTS_OSS_ACCESS_KEY }}
+        ARTIFACTS_OSS_SECRET_KEY: ${{ secrets.ARTIFACTS_OSS_SECRET_KEY }}
+        ARTIFACTS_OSS_STS_ENDPOINT: ${{ secrets.ARTIFACTS_OSS_STS_ENDPOINT }}
+        ARTIFACTS_OSS_ROLE_ARN: ${{ secrets.ARTIFACTS_OSS_ROLE_ARN }}
+    - name: Upload build logs
+      uses: actions/upload-artifact@v6
+      if: ${{ failure() }}
+      with:
+        name: logs-test-${{ matrix.module }}-${{ github.run_number}}#${{ 
+          github.run_attempt }}
+        path: ${{ runner.temp }}/fluss-logs/*
+    - name: Upload JaCoCo coverage report
+      uses: actions/upload-artifact@v6
+      if: ${{ success() && github.ref == 'refs/heads/main' }}
+      with:
+        name: jacoco-report-${{ matrix.module }}-${{ github.run_number}}#${{ 
+          github.run_attempt }}
+        path: ${{ github.workspace 
+          }}/fluss-test-coverage/target/site/jacoco-aggregate/*
