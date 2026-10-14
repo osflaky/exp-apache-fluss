@@ -1,0 +1,694 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.tablet;
+
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.Endpoint;
+import org.apache.fluss.cluster.ServerType;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metrics.registry.MetricRegistry;
+import org.apache.fluss.rpc.GatewayClientProxy;
+import org.apache.fluss.rpc.RpcClient;
+import org.apache.fluss.rpc.RpcServer;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.ControlledShutdownRequest;
+import org.apache.fluss.rpc.messages.ControlledShutdownResponse;
+import org.apache.fluss.rpc.metrics.ClientMetricGroup;
+import org.apache.fluss.rpc.netty.server.RequestsMetrics;
+import org.apache.fluss.server.DynamicConfigManager;
+import org.apache.fluss.server.ServerBase;
+import org.apache.fluss.server.authorizer.Authorizer;
+import org.apache.fluss.server.authorizer.AuthorizerLoader;
+import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
+import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.kv.KvCloseMode;
+import org.apache.fluss.server.kv.KvManager;
+import org.apache.fluss.server.kv.scan.ScannerManager;
+import org.apache.fluss.server.kv.snapshot.DefaultCompletedKvSnapshotCommitter;
+import org.apache.fluss.server.log.LogManager;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.metadata.TabletServerMetadataCache;
+import org.apache.fluss.server.metadata.TabletServerResource;
+import org.apache.fluss.server.metrics.ServerMetricUtils;
+import org.apache.fluss.server.metrics.UserMetrics;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.storage.LocalDiskManager;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.ZooKeeperUtils;
+import org.apache.fluss.server.zk.data.TabletServerRegistration;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
+import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.ExecutorUtils;
+import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.clock.SystemClock;
+import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
+import org.apache.fluss.utils.concurrent.FlussScheduler;
+import org.apache.fluss.utils.concurrent.FutureUtils;
+import org.apache.fluss.utils.concurrent.Scheduler;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.apache.fluss.config.ConfigOptions.BACKGROUND_THREADS;
+import static org.apache.fluss.config.FlussConfigUtils.validateTabletConfigs;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableBucket;
+
+/**
+ * Tablet server implementation. The tablet server is responsible to manage the log tablet and kv
+ * tablet.
+ */
+public class TabletServer extends ServerBase {
+
+    private static final String SERVER_NAME = "TabletServer";
+
+    private static final Logger LOG = LoggerFactory.getLogger(TabletServer.class);
+
+    private final int serverId;
+
+    /**
+     * The rack info of the tabletServer. If not configured, the value will be null, and the
+     * tabletServer will not be able to perceive the underlying rack it resides in. In some
+     * rack-aware scenarios, this may lead to an inability to guarantee proper awareness
+     * capabilities.
+     *
+     * <p>Rack-aware assignment is enabled only when all live tabletServers are configured with rack
+     * information. During a rolling configuration update, assignment falls back to rack-unaware
+     * mode until all live tabletServers report rack information.
+     */
+    private final @Nullable String rack;
+
+    /** The lock to guard startup / shutdown / manipulation methods. */
+    private final Object lock = new Object();
+
+    private final CompletableFuture<Result> terminationFuture;
+
+    private final AtomicBoolean isShutDown = new AtomicBoolean(false);
+    private final String interListenerName;
+    private final Clock clock;
+
+    @GuardedBy("lock")
+    private RpcServer rpcServer;
+
+    @GuardedBy("lock")
+    private RpcClient rpcClient;
+
+    @GuardedBy("lock")
+    private ClientMetricGroup clientMetricGroup;
+
+    @GuardedBy("lock")
+    private TabletService tabletService;
+
+    @GuardedBy("lock")
+    private MetricRegistry metricRegistry;
+
+    @GuardedBy("lock")
+    private UserMetrics userMetrics;
+
+    @GuardedBy("lock")
+    private TabletServerMetricGroup tabletServerMetricGroup;
+
+    @GuardedBy("lock")
+    private TabletServerMetadataCache metadataCache;
+
+    @GuardedBy("lock")
+    private LogManager logManager;
+
+    @GuardedBy("lock")
+    private KvManager kvManager;
+
+    @GuardedBy("lock")
+    private LocalDiskManager localDiskManager;
+
+    @GuardedBy("lock")
+    private ReplicaManager replicaManager;
+
+    @GuardedBy("lock")
+    private ScannerManager scannerManager;
+
+    @GuardedBy("lock")
+    private @Nullable RemoteLogManager remoteLogManager = null;
+
+    @GuardedBy("lock")
+    private Scheduler scheduler;
+
+    @GuardedBy("lock")
+    private ZooKeeperClient zkClient;
+
+    @GuardedBy("lock")
+    @Nullable
+    private Authorizer authorizer;
+
+    @GuardedBy("lock")
+    private DynamicConfigManager dynamicConfigManager;
+
+    @GuardedBy("lock")
+    private LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
+
+    @GuardedBy("lock")
+    private CoordinatorGateway coordinatorGateway;
+
+    @GuardedBy("lock")
+    private ExecutorService ioExecutor;
+
+    /**
+     * Runs replica state changes outside RPC worker threads to prevent potentially slow state
+     * transitions from blocking other RPCs. A single thread is sufficient because replica state
+     * changes are serialized by the replica state change lock.
+     */
+    @GuardedBy("lock")
+    private ExecutorService replicaStateChangeExecutor;
+
+    public TabletServer(Configuration conf) {
+        this(conf, SystemClock.getInstance());
+    }
+
+    public TabletServer(Configuration conf, Clock clock) {
+        super(conf);
+        validateTabletConfigs(conf);
+        this.terminationFuture = new CompletableFuture<>();
+        this.serverId = conf.getInt(ConfigOptions.TABLET_SERVER_ID);
+        this.rack = conf.getString(ConfigOptions.TABLET_SERVER_RACK);
+        this.interListenerName = conf.getString(ConfigOptions.INTERNAL_LISTENER_NAME);
+        this.clock = clock;
+    }
+
+    public static void main(String[] args) {
+        Configuration configuration = loadConfiguration(args, TabletServer.class.getSimpleName());
+        applyServerDefaultConfigurations(configuration);
+        TabletServer tabletServer = new TabletServer(configuration);
+        startServer(tabletServer);
+    }
+
+    @Override
+    protected void startServices() throws Exception {
+        synchronized (lock) {
+            LOG.info("Initializing Tablet services.");
+
+            List<Endpoint> endpoints = Endpoint.loadBindEndpoints(conf, ServerType.TABLET_SERVER);
+
+            this.scheduler = new FlussScheduler(conf.get(BACKGROUND_THREADS));
+            scheduler.startup();
+
+            // for metrics
+            this.metricRegistry = MetricRegistry.create(conf, pluginManager);
+            this.tabletServerMetricGroup =
+                    ServerMetricUtils.createTabletServerGroup(
+                            metricRegistry,
+                            ServerMetricUtils.validateAndGetClusterId(conf),
+                            rack,
+                            endpoints.get(0).getHost(),
+                            serverId);
+            this.userMetrics = new UserMetrics(scheduler, metricRegistry, tabletServerMetricGroup);
+
+            this.zkClient = ZooKeeperUtils.startZookeeperClient(conf, this);
+
+            this.lakeCatalogDynamicLoader =
+                    new LakeCatalogDynamicLoader(conf, pluginManager, false);
+            MetadataManager metadataManager =
+                    new MetadataManager(zkClient, conf, lakeCatalogDynamicLoader);
+            this.dynamicConfigManager = new DynamicConfigManager(zkClient, conf);
+
+            this.metadataCache = new TabletServerMetadataCache(metadataManager);
+
+            this.localDiskManager = LocalDiskManager.create(conf);
+            this.logManager =
+                    LogManager.create(
+                            conf,
+                            zkClient,
+                            scheduler,
+                            clock,
+                            tabletServerMetricGroup,
+                            localDiskManager);
+            logManager.startup();
+
+            this.kvManager =
+                    KvManager.create(
+                            conf,
+                            zkClient,
+                            logManager,
+                            tabletServerMetricGroup,
+                            localDiskManager,
+                            clock);
+            kvManager.startup();
+
+            this.authorizer = AuthorizerLoader.createAuthorizer(conf, zkClient, pluginManager);
+            if (authorizer != null) {
+                authorizer.startup();
+            }
+            // rpc client to sent request to the tablet server where the leader replica is located
+            // to fetch log.
+            this.clientMetricGroup =
+                    new ClientMetricGroup(metricRegistry, SERVER_NAME + "-" + serverId);
+            this.rpcClient = RpcClient.create(conf, clientMetricGroup);
+
+            this.coordinatorGateway =
+                    GatewayClientProxy.createGatewayProxy(
+                            () -> metadataCache.getCoordinatorServer(interListenerName),
+                            rpcClient,
+                            CoordinatorGateway.class);
+
+            this.ioExecutor =
+                    Executors.newFixedThreadPool(
+                            conf.get(ConfigOptions.SERVER_IO_POOL_SIZE),
+                            new ExecutorThreadFactory("tablet-server-io"));
+            this.replicaStateChangeExecutor =
+                    Executors.newSingleThreadExecutor(
+                            new ExecutorThreadFactory("tablet-server-replica-state-change"));
+
+            this.scannerManager = new ScannerManager(conf, scheduler);
+
+            this.replicaManager =
+                    new ReplicaManager(
+                            conf,
+                            scheduler,
+                            logManager,
+                            kvManager,
+                            zkClient,
+                            serverId,
+                            metadataCache,
+                            rpcClient,
+                            coordinatorGateway,
+                            DefaultCompletedKvSnapshotCommitter.create(
+                                    rpcClient, metadataCache, interListenerName),
+                            this,
+                            tabletServerMetricGroup,
+                            userMetrics,
+                            scannerManager,
+                            clock,
+                            ioExecutor,
+                            localDiskManager,
+                            pluginManager);
+            replicaManager.startup();
+
+            this.tabletService =
+                    new TabletService(
+                            serverId,
+                            remoteFileSystem,
+                            zkClient,
+                            replicaManager,
+                            metadataCache,
+                            metadataManager,
+                            authorizer,
+                            dynamicConfigManager,
+                            ioExecutor,
+                            replicaStateChangeExecutor,
+                            scannerManager,
+                            coordinatorGateway,
+                            interListenerName);
+
+            RequestsMetrics requestsMetrics =
+                    RequestsMetrics.createTabletServerRequestMetrics(tabletServerMetricGroup);
+            this.rpcServer =
+                    RpcServer.create(
+                            conf,
+                            endpoints,
+                            tabletService,
+                            tabletServerMetricGroup,
+                            requestsMetrics);
+
+            dynamicConfigManager.register(lakeCatalogDynamicLoader);
+            // Register logManager for dynamic log retention configuration.
+            dynamicConfigManager.register(logManager);
+            // Register kvManager to dynamicConfigManager for dynamic reconfiguration
+            dynamicConfigManager.register(kvManager);
+            // Register DefaultSnapshotContext for dynamic kv.snapshot.interval
+            dynamicConfigManager.register(replicaManager.getKvSnapshotContext());
+            // Register replicaManager to dynamicConfigManager for dynamic config
+            dynamicConfigManager.register(replicaManager);
+            // Register localDiskManager for dynamic disk write-limit and recover ratios.
+            dynamicConfigManager.register(localDiskManager);
+            rpcServer.getServerReconfigurables().forEach(dynamicConfigManager::register);
+
+            // Start dynamicConfigManager after all reconfigurable components are registered
+            dynamicConfigManager.startup();
+
+            rpcServer.start();
+
+            registerTabletServer();
+            // when init session, register tablet server again
+            ZooKeeperUtils.registerZookeeperClientReInitSessionListener(
+                    zkClient, this::registerTabletServer, this);
+        }
+    }
+
+    @Override
+    protected CompletableFuture<Result> closeAsync(Result result) {
+        if (isShutDown.compareAndSet(false, true)) {
+            LOG.info("Shutting down Tablet server ({}).", result);
+            controlledShutDown();
+
+            CompletableFuture<Void> serviceShutdownFuture = stopServices();
+
+            serviceShutdownFuture.whenComplete(
+                    ((Void ignored2, Throwable serviceThrowable) -> {
+                        if (serviceThrowable != null) {
+                            terminationFuture.completeExceptionally(serviceThrowable);
+                        } else {
+                            terminationFuture.complete(result);
+                        }
+                    }));
+        }
+
+        return terminationFuture;
+    }
+
+    @Override
+    protected CompletableFuture<Result> getTerminationFuture() {
+        return terminationFuture;
+    }
+
+    private void registerTabletServer() throws Exception {
+        long startTime = System.currentTimeMillis();
+        List<Endpoint> bindEndpoints = rpcServer.getBindEndpoints();
+        TabletServerResource tabletServerResource = new TabletServerResourceProbe(conf).probe();
+        TabletServerRegistration tabletServerRegistration =
+                new TabletServerRegistration(
+                        rack,
+                        Endpoint.loadAdvertisedEndpoints(bindEndpoints, conf),
+                        startTime,
+                        tabletServerResource);
+
+        while (true) {
+            try {
+                zkClient.registerTabletServer(serverId, tabletServerRegistration);
+                break;
+            } catch (KeeperException.NodeExistsException nodeExistsException) {
+                long elapsedTime = System.currentTimeMillis() - startTime;
+                if (elapsedTime >= ZOOKEEPER_REGISTER_TOTAL_WAIT_TIME_MS) {
+                    LOG.error(
+                            "Tablet server id {} register to Zookeeper exceeded total retry time of {} ms. "
+                                    + "Aborting registration attempts.",
+                            serverId,
+                            ZOOKEEPER_REGISTER_TOTAL_WAIT_TIME_MS);
+                    throw nodeExistsException;
+                }
+
+                LOG.warn(
+                        "Tablet server id {} already registered in Zookeeper. "
+                                + "retrying register after {} ms....",
+                        serverId,
+                        ZOOKEEPER_REGISTER_RETRY_INTERVAL_MS);
+                try {
+                    Thread.sleep(ZOOKEEPER_REGISTER_RETRY_INTERVAL_MS);
+                } catch (InterruptedException interruptedException) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+    }
+
+    CompletableFuture<Void> stopServices() {
+        synchronized (lock) {
+            Throwable exception = null;
+
+            try {
+                if (tabletServerMetricGroup != null) {
+                    tabletServerMetricGroup.close();
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            final Collection<CompletableFuture<Void>> terminationFutures = new ArrayList<>(1);
+            try {
+                if (metricRegistry != null) {
+                    terminationFutures.add(metricRegistry.closeAsync());
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            CompletableFuture<Void> rpcServerTerminationFuture =
+                    CompletableFuture.completedFuture(null);
+            try {
+                rpcServerTerminationFuture = shutdownRpcServer();
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            // Stop dispatching new RPC calls and drain the request processors before shutting down
+            // the components that can access tablets. RPC calls may leave delayed operations
+            // behind; ReplicaManager is shut down below before the tablet managers to stop those
+            // operations as well as snapshot and replica-fetcher activity.
+            try {
+                rpcServerTerminationFuture.join();
+            } catch (Throwable t) {
+                exception =
+                        ExceptionUtils.firstOrSuppressed(
+                                ExceptionUtils.stripCompletionException(t), exception);
+            }
+
+            try {
+                if (tabletService != null) {
+                    tabletService.shutdown();
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                if (replicaStateChangeExecutor != null) {
+                    ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, replicaStateChangeExecutor);
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                // TODO currently, rpc client don't have timeout logic. After implementing the
+                // timeout logic, we need to move the closure of rpc client to after the closure of
+                // replica manager.
+                if (rpcClient != null) {
+                    rpcClient.close();
+                }
+
+                if (clientMetricGroup != null) {
+                    clientMetricGroup.close();
+                }
+
+                if (userMetrics != null) {
+                    userMetrics.close();
+                }
+
+                // We must shut down the scheduler early because otherwise, the scheduler could
+                // touch other resources that might have been shutdown and cause exceptions.
+                if (scheduler != null) {
+                    scheduler.shutdown();
+                }
+
+                if (scannerManager != null) {
+                    scannerManager.close();
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                shutdownReplicaManager();
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                shutdownTabletManagers();
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                if (localDiskManager != null) {
+                    localDiskManager.close();
+                }
+
+                if (authorizer != null) {
+                    authorizer.close();
+                }
+
+                if (dynamicConfigManager != null) {
+                    dynamicConfigManager.close();
+                }
+
+                if (lakeCatalogDynamicLoader != null) {
+                    lakeCatalogDynamicLoader.close();
+                }
+
+                if (zkClient != null) {
+                    zkClient.close();
+                }
+
+                if (ioExecutor != null) {
+                    // shutdown io executor
+                    ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, ioExecutor);
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            if (exception != null) {
+                terminationFutures.add(FutureUtils.completedExceptionally(exception));
+            }
+            return FutureUtils.completeAll(terminationFutures);
+        }
+    }
+
+    @VisibleForTesting
+    CompletableFuture<Void> shutdownRpcServer() {
+        if (rpcServer != null) {
+            return rpcServer.closeAsync();
+        }
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @VisibleForTesting
+    void shutdownReplicaManager() throws InterruptedException {
+        if (replicaManager != null) {
+            replicaManager.shutdown();
+        }
+    }
+
+    @VisibleForTesting
+    void shutdownTabletManagers() throws IOException {
+        shutdownKvManager(KvCloseMode.DISCARD_UNPERSISTED_STATE);
+
+        if (remoteLogManager != null) {
+            remoteLogManager.close();
+        }
+
+        if (logManager != null) {
+            logManager.shutdown();
+        }
+    }
+
+    @VisibleForTesting
+    void shutdownKvManager(KvCloseMode closeMode) {
+        if (kvManager != null) {
+            kvManager.shutdown(closeMode);
+        }
+    }
+
+    private void controlledShutDown() {
+        long startTime = System.currentTimeMillis();
+        LOG.info("Starting controlled shutdown.");
+
+        // We request the CoordinatorServer to do a controlled shutdown. On failure, we backoff for
+        // a period of time and try again for a number of retries. If all the attempt fails, we
+        // simply force the shutdown.
+        boolean shutdownSucceeded = false;
+        int remainingRetries =
+                conf.getInt(ConfigOptions.TABLET_SERVER_CONTROLLED_SHUTDOWN_MAX_RETRIES);
+        long retryIntervalMs =
+                conf.get(ConfigOptions.TABLET_SERVER_CONTROLLED_SHUTDOWN_RETRY_INTERVAL).toMillis();
+
+        while (!shutdownSucceeded && remainingRetries > 0) {
+            remainingRetries--;
+
+            ControlledShutdownRequest controlledShutdownRequest =
+                    new ControlledShutdownRequest()
+                            .setTabletServerId(serverId)
+                            .setTabletServerEpoch(-1); // TODO, set correct tabletServer epoch.
+            try {
+                ControlledShutdownResponse response =
+                        coordinatorGateway.controlledShutdown(controlledShutdownRequest).get();
+                if (response.getRemainingLeaderBucketsCount() > 0) {
+                    List<TableBucket> remainingLeaderBuckets = new ArrayList<>();
+                    response.getRemainingLeaderBucketsList()
+                            .forEach(
+                                    pbTableBucket ->
+                                            remainingLeaderBuckets.add(
+                                                    toTableBucket(pbTableBucket)));
+                    LOG.warn(
+                            "TabletServer {} is still the leader for the following buckets: {} after Controlled Shutdown",
+                            serverId,
+                            remainingLeaderBuckets);
+                } else {
+                    shutdownSucceeded = true;
+                }
+            } catch (Exception e) {
+                LOG.warn("Failed to do controlled shutdown: {}", e.getMessage());
+                // do nothing and retry.
+            }
+
+            if (!shutdownSucceeded && remainingRetries > 0) {
+                try {
+                    Thread.sleep(retryIntervalMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                LOG.info("Retrying controlled shutdown ({} retries remaining).", remainingRetries);
+            }
+        }
+
+        if (!shutdownSucceeded) {
+            LOG.warn(
+                    "Proceeding to do an unclean shutdown as all the controlled shutdown attempts failed.");
+        }
+
+        LOG.info(
+                "Controlled shutdown attempts finished in {} ms, succeeded: {}.",
+                System.currentTimeMillis() - startTime,
+                shutdownSucceeded);
+    }
+
+    @Override
+    protected String getServerName() {
+        return SERVER_NAME;
+    }
+
+    @VisibleForTesting
+    public int getServerId() {
+        return serverId;
+    }
+
+    @VisibleForTesting
+    public TabletServerMetadataCache getMetadataCache() {
+        return metadataCache;
+    }
+
+    @VisibleForTesting
+    public ReplicaManager getReplicaManager() {
+        return replicaManager;
+    }
+
+    @VisibleForTesting
+    public @Nullable Authorizer getAuthorizer() {
+        return authorizer;
+    }
+
+    @VisibleForTesting
+    public RpcServer getRpcServer() {
+        return rpcServer;
+    }
+}

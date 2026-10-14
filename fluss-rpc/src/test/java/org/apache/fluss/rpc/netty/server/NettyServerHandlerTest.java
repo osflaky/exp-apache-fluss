@@ -1,0 +1,568 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.rpc.netty.server;
+
+import org.apache.fluss.cluster.ServerType;
+import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.metrics.Meter;
+import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.groups.GenericMetricGroup;
+import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.metrics.util.NOPMetricsGroup;
+import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
+import org.apache.fluss.rpc.TestingTabletGatewayService;
+import org.apache.fluss.rpc.messages.ApiVersionsRequest;
+import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.LookupRequest;
+import org.apache.fluss.rpc.messages.LookupResponse;
+import org.apache.fluss.rpc.messages.PbApiVersion;
+import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
+import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
+import org.apache.fluss.rpc.messages.PbProduceLogReqForBucket;
+import org.apache.fluss.rpc.messages.PbValue;
+import org.apache.fluss.rpc.messages.ProduceLogRequest;
+import org.apache.fluss.rpc.messages.ProduceLogResponse;
+import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.rpc.protocol.ApiManager;
+import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.MessageCodec;
+import org.apache.fluss.rpc.protocol.RequestType;
+import org.apache.fluss.security.auth.PlainTextAuthenticationPlugin;
+import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
+import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBufAllocator;
+import org.apache.fluss.shaded.netty4.io.netty.channel.Channel;
+import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelHandlerContext;
+import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelId;
+import org.apache.fluss.shaded.netty4.io.netty.channel.embedded.EmbeddedChannel;
+import org.apache.fluss.shaded.netty4.io.netty.util.concurrent.DefaultEventExecutor;
+import org.apache.fluss.shaded.netty4.io.netty.util.concurrent.ImmediateEventExecutor;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.apache.fluss.record.TestData.DATA1;
+import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/** Test for {@link NettyServerHandler}. */
+final class NettyServerHandlerTest {
+
+    private NettyServerHandler serverHandler;
+    private TestingRequestChannel requestChannel;
+    private ChannelHandlerContext ctx;
+
+    @BeforeEach
+    void beforeEach() throws Exception {
+        this.requestChannel = new TestingRequestChannel(100);
+        MetricGroup metricGroup = NOPMetricsGroup.newInstance();
+        this.serverHandler =
+                new NettyServerHandler(
+                        requestChannel,
+                        new ApiManager(ServerType.TABLET_SERVER),
+                        "FLUSS",
+                        true,
+                        RequestsMetrics.createCoordinatorServerRequestMetrics(metricGroup),
+                        new PlainTextAuthenticationPlugin.PlainTextServerAuthenticator());
+        this.ctx = mockChannelHandlerContext();
+        serverHandler.channelActive(ctx);
+    }
+
+    @Test
+    void testInactiveLazyRequestIsRejectedBeforeQueuing() throws Exception {
+        RecordingRequestChannel channel = new RecordingRequestChannel();
+        NettyServerHandler handler = newServerHandler(channel);
+        TestEmbeddedChannel embeddedChannel = new TestEmbeddedChannel(handler);
+        ByteBuf requestBuffer = encodeProduceLogRequest();
+
+        try {
+            ChannelHandlerContext context = embeddedChannel.pipeline().context(handler);
+            handler.exceptionCaught(context, new RuntimeException("close connection"));
+            handler.channelRead(context, requestBuffer);
+
+            assertThat(channel.getPutRequestInvocations()).isZero();
+            assertThat(channel.requestsCount()).isZero();
+            assertThat(requestBuffer.refCnt()).isZero();
+        } finally {
+            embeddedChannel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void testActiveLazyRequestRetainsBufferUntilProcessed() throws Exception {
+        TestingRequestChannel channel = new TestingRequestChannel(100);
+        NettyServerHandler handler = newServerHandler(channel);
+        TestEmbeddedChannel embeddedChannel = new TestEmbeddedChannel(handler);
+        ByteBuf requestBuffer = encodeProduceLogRequest();
+
+        try {
+            handler.channelRead(embeddedChannel.pipeline().context(handler), requestBuffer);
+
+            assertThat(channel.requestsCount()).isOne();
+            assertThat(requestBuffer.refCnt()).isOne();
+
+            RpcRequest request = channel.pollRequest(0);
+            assertThat(request).isNotNull();
+            request.releaseBuffer();
+            assertThat(requestBuffer.refCnt()).isZero();
+        } finally {
+            embeddedChannel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void testInactiveProduceRequestCannotAppendReleasedBuffer(@TempDir Path tempDir)
+            throws Exception {
+        CompletableFuture<MemoryLogRecords> capturedRecords = new CompletableFuture<>();
+        CompletableFuture<Void> continueAppend = new CompletableFuture<>();
+        AtomicInteger produceInvocations = new AtomicInteger();
+        AtomicReference<Boolean> validBeforeRelease = new AtomicReference<>();
+        AtomicReference<Throwable> appendFailure = new AtomicReference<>();
+        AtomicReference<Throwable> coordinationFailure = new AtomicReference<>();
+        RequestChannel channel =
+                new CoordinatedRequestChannel(capturedRecords, coordinationFailure);
+        NettyServerHandler handler = newServerHandler(channel);
+        TestEmbeddedChannel embeddedChannel = new TestEmbeddedChannel(handler);
+        ChannelHandlerContext context = embeddedChannel.pipeline().context(handler);
+        ByteBuf requestBuffer = encodeProduceLogRequest();
+
+        try (FileLogRecords fileRecords =
+                FileLogRecords.open(tempDir.resolve("inactive-request.log").toFile())) {
+            TestingTabletGatewayService service =
+                    new TestingTabletGatewayService() {
+                        @Override
+                        public CompletableFuture<ProduceLogResponse> produceLog(
+                                ProduceLogRequest request) {
+                            produceInvocations.incrementAndGet();
+                            ByteBuf recordsSlice = request.getBucketsReqAt(0).getRecordsSlice();
+                            MemoryLogRecords records =
+                                    MemoryLogRecords.pointToByteBuffer(recordsSlice.nioBuffer());
+                            validBeforeRelease.set(records.batches().iterator().next().isValid());
+                            capturedRecords.complete(records);
+                            try {
+                                getWithTimeout(continueAppend, "permission to append records");
+                                fileRecords.append(records);
+                            } catch (Throwable t) {
+                                appendFailure.set(t);
+                            }
+                            return CompletableFuture.completedFuture(new ProduceLogResponse());
+                        }
+                    };
+            RequestHandler<?>[] requestHandlers =
+                    new RequestHandler<?>[RequestType.values().length - 1];
+            requestHandlers[RequestType.FLUSS.id] = new FlussRequestHandler(service);
+            RequestProcessor processor = new RequestProcessor(0, channel, service, requestHandlers);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            Future<?> processorTask = executor.submit(processor);
+
+            try {
+                handler.exceptionCaught(context, new RuntimeException("close connection"));
+                handler.channelRead(context, requestBuffer);
+
+                assertThat(requestBuffer.refCnt()).isZero();
+                MemoryLogRecords records = capturedRecords.getNow(null);
+                if (records != null) {
+                    int lastByte = records.getPosition() + records.sizeInBytes() - 1;
+                    byte value = records.getMemorySegment().get(lastByte);
+                    // Model the Netty pool reusing released request memory before the append.
+                    records.getMemorySegment().put(lastByte, (byte) (value ^ 1));
+                }
+
+                processor.initiateShutdown();
+                continueAppend.complete(null);
+                processor.getShutdownFuture().get(5, TimeUnit.SECONDS);
+                processorTask.get(5, TimeUnit.SECONDS);
+
+                boolean validOnDisk =
+                        fileRecords.sizeInBytes() == 0
+                                || fileRecords.batches().iterator().next().isValid();
+                assertThat(coordinationFailure.get()).isNull();
+                assertThat(appendFailure.get()).isNull();
+                if (fileRecords.sizeInBytes() > 0) {
+                    assertThat(validBeforeRelease).hasValue(true);
+                    assertThat(validOnDisk).isFalse();
+                }
+                assertThat(fileRecords.sizeInBytes())
+                        .withFailMessage(
+                                "Inactive ProduceLogRequest appended %s bytes; valid before release: "
+                                        + "%s, valid on disk: %s",
+                                fileRecords.sizeInBytes(), validBeforeRelease.get(), validOnDisk)
+                        .isZero();
+                assertThat(produceInvocations)
+                        .as("inactive requests must not reach the RPC service")
+                        .hasValue(0);
+            } finally {
+                continueAppend.complete(null);
+                if (!processor.getShutdownFuture().isDone()) {
+                    processor.initiateShutdown();
+                }
+                executor.shutdownNow();
+                embeddedChannel.finishAndReleaseAll();
+            }
+        }
+    }
+
+    @Test
+    void testFailedRequestMarksAggregateAndErrorMetrics() throws Exception {
+        RequestsMetricsTest.RecordingMetricRegistry metricRegistry =
+                new RequestsMetricsTest.RecordingMetricRegistry();
+        MetricGroup metricGroup = new GenericMetricGroup(metricRegistry, null, "tabletserver");
+        TestingRequestChannel tabletRequestChannel = new TestingRequestChannel(100);
+        NettyServerHandler tabletServerHandler =
+                new NettyServerHandler(
+                        tabletRequestChannel,
+                        new ApiManager(ServerType.TABLET_SERVER),
+                        "FLUSS",
+                        true,
+                        RequestsMetrics.createTabletServerRequestMetrics(metricGroup),
+                        new PlainTextAuthenticationPlugin.PlainTextServerAuthenticator());
+        ChannelHandlerContext tabletContext = mockImmediateChannelHandlerContext();
+        tabletServerHandler.channelActive(tabletContext);
+
+        LookupRequest lookupRequest = new LookupRequest().setTableId(1);
+        PbLookupReqForBucket bucketRequest =
+                new PbLookupReqForBucket().setPartitionId(1).setBucketId(1);
+        bucketRequest.addKey("key".getBytes());
+        lookupRequest.addAllBucketsReqs(Collections.singleton(bucketRequest));
+        ByteBuf byteBuf =
+                MessageCodec.encodeRequest(
+                        ByteBufAllocator.DEFAULT,
+                        ApiKeys.LOOKUP.id,
+                        ApiKeys.LOOKUP.highestSupportedVersion,
+                        1001,
+                        lookupRequest);
+
+        tabletServerHandler.channelRead(tabletContext, byteBuf);
+        FlussRequest request = (FlussRequest) tabletRequestChannel.getAndRemoveRequest(0);
+        request.fail(new TableNotExistException("table does not exist"));
+
+        assertThat(metricRegistry.metrics(MetricNames.ERRORS_RATE, "lookup"))
+                .hasSize(2)
+                .allSatisfy(
+                        registered ->
+                                assertThat(((Meter) registered.metric).getCount()).isEqualTo(1))
+                .anySatisfy(
+                        registered ->
+                                assertThat(registered.group.getAllVariables())
+                                        .doesNotContainKey("error"))
+                .anySatisfy(
+                        registered ->
+                                assertThat(registered.group.getAllVariables())
+                                        .containsEntry("error", Errors.TABLE_NOT_EXIST.name()));
+    }
+
+    @Test
+    @Disabled("TODO: add back in https://github.com/apache/fluss/issues/771")
+    void testResponseReturnInOrder() throws Exception {
+        // first write 10 requests to serverHandler.
+        for (int i = 0; i < 10; i++) {
+            ApiVersionsRequest request = new ApiVersionsRequest();
+            request.setClientSoftwareName("test").setClientSoftwareVersion("1.0.0");
+            ByteBuf byteBuf =
+                    MessageCodec.encodeRequest(
+                            ByteBufAllocator.DEFAULT,
+                            ApiKeys.API_VERSIONS.id,
+                            ApiKeys.API_VERSIONS.highestSupportedVersion,
+                            1001,
+                            request);
+            serverHandler.channelRead(ctx, byteBuf);
+        }
+
+        Deque<FlussRequest> inflightResponses =
+                serverHandler.inflightResponses(ApiKeys.API_VERSIONS.id);
+        assertThat(requestChannel.requestsCount()).isEqualTo(10);
+        assertThat(inflightResponses.size()).isEqualTo(10);
+
+        // 1. try to response first request, it will return immediately.
+        FlussRequest request1 = (FlussRequest) requestChannel.getAndRemoveRequest(0);
+        request1.setRequestCompletedTimeMs(System.currentTimeMillis());
+        request1.setRequestDequeTimeMs(System.currentTimeMillis());
+        request1.complete(makeApiVersionResponse());
+        retry(Duration.ofSeconds(20), () -> assertThat(inflightResponses.size()).isEqualTo(9));
+
+        // 2. try to response 6th, 7th, 8th requests, but it will not return immediately.
+        Set<Integer> finishedRequests = new HashSet<>();
+        for (int i = 5; i < 8; i++) {
+            // always get index 5 as request will be removed from requestChannel after get.
+            FlussRequest request = (FlussRequest) requestChannel.getAndRemoveRequest(5);
+            request.setRequestCompletedTimeMs(System.currentTimeMillis());
+            request.setRequestDequeTimeMs(System.currentTimeMillis());
+            request.complete(makeApiVersionResponse());
+            assertThat(inflightResponses.size()).isEqualTo(9);
+            finishedRequests.add(i);
+        }
+        int currentIndex = 0;
+        for (FlussRequest rpcRequest : inflightResponses) {
+            if (finishedRequests.contains(currentIndex)) {
+                assertThat(rpcRequest.getResponseFuture().isDone()).isTrue();
+            } else {
+                assertThat(rpcRequest.getResponseFuture().isDone()).isFalse();
+            }
+            currentIndex++;
+        }
+
+        // 3. try to finish the requests 0 - 3.
+        for (int i = 0; i < 4; i++) {
+            FlussRequest request = (FlussRequest) requestChannel.getAndRemoveRequest(0);
+            request.setRequestCompletedTimeMs(System.currentTimeMillis());
+            request.setRequestDequeTimeMs(System.currentTimeMillis());
+            request.complete(makeApiVersionResponse());
+            final int size = 8 - i;
+            retry(
+                    Duration.ofSeconds(20),
+                    () -> assertThat(inflightResponses.size()).isEqualTo(size));
+        }
+
+        // 4. try to finish 5th request, 6th, 7th, 8th requests will also return as it has been done
+        // before.
+        FlussRequest request = (FlussRequest) requestChannel.getAndRemoveRequest(0);
+        request.setRequestCompletedTimeMs(System.currentTimeMillis());
+        request.setRequestDequeTimeMs(System.currentTimeMillis());
+        request.complete(makeApiVersionResponse());
+        retry(Duration.ofSeconds(20), () -> assertThat(inflightResponses.size()).isEqualTo(1));
+    }
+
+    @Test
+    @Disabled("TODO: add back in https://github.com/apache/fluss/issues/771")
+    void testDifferentResponseTypeReturnInSeparateOrder() throws Exception {
+        // 1. first write 5 requests with api as ApiKeys.API_VERSIONS to serverHandler.
+        for (int i = 0; i < 5; i++) {
+            ApiVersionsRequest request = new ApiVersionsRequest();
+            request.setClientSoftwareName("test").setClientSoftwareVersion("1.0.0");
+            ByteBuf byteBuf =
+                    MessageCodec.encodeRequest(
+                            ByteBufAllocator.DEFAULT,
+                            ApiKeys.API_VERSIONS.id,
+                            ApiKeys.API_VERSIONS.highestSupportedVersion,
+                            1001,
+                            request);
+            serverHandler.channelRead(ctx, byteBuf);
+        }
+
+        // 2. second write 5 with api as ApiKeys.LOOKUP to serverHandler.
+        LookupRequest lookupRequest = new LookupRequest().setTableId(1);
+        PbLookupReqForBucket pbLookupReqForBucket =
+                new PbLookupReqForBucket().setPartitionId(1).setBucketId(1);
+        pbLookupReqForBucket.addKey("key".getBytes());
+        lookupRequest.addAllBucketsReqs(Collections.singleton(pbLookupReqForBucket));
+        for (int i = 0; i < 5; i++) {
+            ByteBuf byteBuf =
+                    MessageCodec.encodeRequest(
+                            ByteBufAllocator.DEFAULT,
+                            ApiKeys.LOOKUP.id,
+                            ApiKeys.LOOKUP.highestSupportedVersion,
+                            1001,
+                            lookupRequest);
+            serverHandler.channelRead(ctx, byteBuf);
+        }
+
+        assertThat(requestChannel.requestsCount()).isEqualTo(10);
+        Deque<FlussRequest> inflightApiVersionResponses =
+                serverHandler.inflightResponses(ApiKeys.API_VERSIONS.id);
+        assertThat(inflightApiVersionResponses.size()).isEqualTo(5);
+
+        Deque<FlussRequest> inflightLookupResponses =
+                serverHandler.inflightResponses(ApiKeys.LOOKUP.id);
+        assertThat(inflightLookupResponses.size()).isEqualTo(5);
+
+        // 3. try to finish one Lookup request, return immediately not to wait the previous five
+        // ApiVersionsRequest response first.
+        FlussRequest request = (FlussRequest) requestChannel.getAndRemoveRequest(5);
+        request.setRequestCompletedTimeMs(System.currentTimeMillis());
+        request.setRequestDequeTimeMs(System.currentTimeMillis());
+        request.complete(makeLookupResponse());
+        retry(
+                Duration.ofSeconds(20),
+                () -> assertThat(inflightLookupResponses.size()).isEqualTo(4));
+        assertThat(inflightApiVersionResponses.size()).isEqualTo(5);
+    }
+
+    private static NettyServerHandler newServerHandler(RequestChannel requestChannel) {
+        MetricGroup metricGroup = NOPMetricsGroup.newInstance();
+        return new NettyServerHandler(
+                requestChannel,
+                new ApiManager(ServerType.TABLET_SERVER),
+                "FLUSS",
+                true,
+                RequestsMetrics.createCoordinatorServerRequestMetrics(metricGroup),
+                new PlainTextAuthenticationPlugin.PlainTextServerAuthenticator());
+    }
+
+    private static ByteBuf encodeProduceLogRequest() throws Exception {
+        MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
+        PbProduceLogReqForBucket bucketRequest =
+                new PbProduceLogReqForBucket()
+                        .setBucketId(0)
+                        .setRecordsBytesView(
+                                new MemorySegmentBytesView(
+                                        records.getMemorySegment(),
+                                        records.getPosition(),
+                                        records.sizeInBytes()));
+        ProduceLogRequest request =
+                new ProduceLogRequest()
+                        .setTableId(1001L)
+                        .setAcks(1)
+                        .setTimeoutMs(10_000)
+                        .addAllBucketsReqs(Collections.singletonList(bucketRequest));
+        return MessageCodec.encodeRequest(
+                ByteBufAllocator.DEFAULT,
+                ApiKeys.PRODUCE_LOG.id,
+                ApiKeys.PRODUCE_LOG.highestSupportedVersion,
+                1,
+                request);
+    }
+
+    private static ChannelHandlerContext mockChannelHandlerContext() {
+        ChannelId channelId = mock(ChannelId.class);
+        when(channelId.asShortText()).thenReturn("short_text");
+        when(channelId.asLongText()).thenReturn("long_text");
+        Channel channel = mock(Channel.class);
+        when(channel.id()).thenReturn(channelId);
+        ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
+        when(ctx.channel()).thenReturn(channel);
+        when(ctx.alloc()).thenReturn(ByteBufAllocator.DEFAULT);
+        when(ctx.executor()).thenReturn(new DefaultEventExecutor());
+        return ctx;
+    }
+
+    private static ChannelHandlerContext mockImmediateChannelHandlerContext() {
+        ChannelHandlerContext ctx = mockChannelHandlerContext();
+        when(ctx.channel().remoteAddress()).thenReturn(new InetSocketAddress("127.0.0.1", 9092));
+        when(ctx.executor()).thenReturn(ImmediateEventExecutor.INSTANCE);
+        return ctx;
+    }
+
+    private ApiVersionsResponse makeApiVersionResponse() {
+        ApiVersionsResponse response = new ApiVersionsResponse();
+        PbApiVersion apiVersion = new PbApiVersion();
+        apiVersion
+                .setApiKey(ApiKeys.API_VERSIONS.id)
+                .setMinVersion(ApiKeys.API_VERSIONS.lowestSupportedVersion)
+                .setMaxVersion(ApiKeys.API_VERSIONS.highestSupportedVersion);
+        response.addAllApiVersions(Collections.singletonList(apiVersion));
+        return response;
+    }
+
+    private static <T> T getWithTimeout(CompletableFuture<T> future, String operation) {
+        try {
+            return future.get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Interrupted while waiting for " + operation, e);
+        } catch (Exception e) {
+            throw new AssertionError("Failed while waiting for " + operation, e);
+        }
+    }
+
+    private static final class RecordingRequestChannel extends RequestChannel {
+        private int putRequestInvocations;
+
+        private RecordingRequestChannel() {
+            super(100);
+        }
+
+        @Override
+        public void putRequest(RpcRequest request) {
+            putRequestInvocations++;
+            super.putRequest(request);
+        }
+
+        private int getPutRequestInvocations() {
+            return putRequestInvocations;
+        }
+    }
+
+    private static final class CoordinatedRequestChannel extends RequestChannel {
+        private final CompletableFuture<MemoryLogRecords> capturedRecords;
+        private final AtomicReference<Throwable> coordinationFailure;
+
+        private CoordinatedRequestChannel(
+                CompletableFuture<MemoryLogRecords> capturedRecords,
+                AtomicReference<Throwable> coordinationFailure) {
+            super(100);
+            this.capturedRecords = capturedRecords;
+            this.coordinationFailure = coordinationFailure;
+        }
+
+        @Override
+        public void putRequest(RpcRequest request) {
+            super.putRequest(request);
+            if (request != ShutdownRequest.INSTANCE) {
+                try {
+                    getWithTimeout(capturedRecords, "request processor to capture records");
+                } catch (Throwable t) {
+                    coordinationFailure.set(t);
+                    throw t;
+                }
+            }
+        }
+    }
+
+    private static final class TestEmbeddedChannel extends EmbeddedChannel {
+
+        private static final InetSocketAddress REMOTE_ADDRESS =
+                new InetSocketAddress("127.0.0.1", 8080);
+
+        private TestEmbeddedChannel(NettyServerHandler serverHandler) {
+            super(serverHandler);
+        }
+
+        @Override
+        protected SocketAddress remoteAddress0() {
+            return REMOTE_ADDRESS;
+        }
+
+        @Override
+        protected SocketAddress localAddress0() {
+            return new InetSocketAddress("127.0.0.1", 18080);
+        }
+    }
+
+    private LookupResponse makeLookupResponse() {
+        LookupResponse response = new LookupResponse();
+        PbLookupRespForBucket pbLookupRespForBucket =
+                new PbLookupRespForBucket()
+                        .setPartitionId(1)
+                        .setBucketId(1)
+                        .addAllValues(Collections.singleton(new PbValue()));
+        response.addAllBucketsResps(Collections.singletonList(pbLookupRespForBucket));
+        return response;
+    }
+}

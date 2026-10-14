@@ -1,0 +1,867 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.client.table.scanner.log;
+
+import org.apache.fluss.client.metrics.ScannerMetricGroup;
+import org.apache.fluss.client.metrics.TestingScannerMetricGroup;
+import org.apache.fluss.client.table.scanner.RemoteFileDownloader;
+import org.apache.fluss.client.table.scanner.log.RemoteLogDownloader.RemoteLogDownloadRequest;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.fs.FSDataInputStream;
+import org.apache.fluss.fs.FSDataInputStreamWrapper;
+import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.fs.FsPathAndFileName;
+import org.apache.fluss.fs.local.LocalFileSystem;
+import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.utils.FileUtils;
+import org.apache.fluss.utils.IOUtils;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
+import static org.apache.fluss.testutils.DataTestUtils.genRemoteLogSegmentFile;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
+import static org.apache.fluss.utils.FlussPaths.remoteLogDir;
+import static org.apache.fluss.utils.FlussPaths.remoteLogTabletDir;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Tests for {@link RemoteLogDownloader}. */
+class RemoteLogDownloaderTest {
+
+    private @TempDir File remoteDataDir;
+    private @TempDir File localDir;
+    private FsPath remoteLogDir;
+    private Configuration conf;
+    private ScannerMetricGroup scannerMetricGroup;
+
+    @BeforeEach
+    void beforeEach() {
+        conf = new Configuration();
+        conf.set(ConfigOptions.REMOTE_DATA_DIR, remoteDataDir.getAbsolutePath());
+        conf.set(ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR, localDir.getAbsolutePath());
+        conf.set(ConfigOptions.CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM, 4);
+        remoteLogDir = remoteLogDir(conf);
+        scannerMetricGroup = TestingScannerMetricGroup.newInstance();
+    }
+
+    @Test
+    void testPrefetchNum() throws Exception {
+        RemoteFileDownloader remoteFileDownloader = new RemoteFileDownloader(1);
+        RemoteLogDownloader remoteLogDownloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(),
+                        conf,
+                        remoteFileDownloader,
+                        scannerMetricGroup,
+                        10L);
+        try {
+            // trigger auto download.
+            remoteLogDownloader.start();
+
+            Path localLogDir = remoteLogDownloader.getLocalLogDir();
+            TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+            List<RemoteLogSegment> remoteLogSegments =
+                    buildRemoteLogSegmentList(tb, DATA1_PHYSICAL_TABLE_PATH, 5, conf, 10);
+            FsPath remoteLogTabletDir =
+                    remoteLogTabletDir(remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, tb);
+            List<RemoteLogDownloadFuture> futures =
+                    requestRemoteLogs(remoteLogDownloader, remoteLogTabletDir, remoteLogSegments);
+
+            // the first 4 segments should success.
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        for (int i = 0; i < 4; i++) {
+                            assertThat(futures.get(i).isDone()).isTrue();
+                        }
+                    });
+
+            assertThat(FileUtils.listDirectory(localLogDir).length).isEqualTo(4);
+            assertThat(scannerMetricGroup.remoteFetchRequestCount().getCount()).isEqualTo(4);
+            assertThat(scannerMetricGroup.remoteFetchBytes().getCount())
+                    .isEqualTo(
+                            remoteLogSegmentFilesLength(remoteLogSegments, remoteLogTabletDir, 4));
+            assertThat(remoteLogDownloader.getPrefetchSemaphore().availablePermits()).isEqualTo(0);
+
+            futures.get(0).getRecycleCallback().run();
+            // the 5th segment should success.
+            retry(Duration.ofMinutes(1), () -> assertThat(futures.get(4).isDone()).isTrue());
+            assertThat(FileUtils.listDirectory(localLogDir).length).isEqualTo(4);
+            assertThat(scannerMetricGroup.remoteFetchRequestCount().getCount()).isEqualTo(5);
+            assertThat(scannerMetricGroup.remoteFetchBytes().getCount())
+                    .isEqualTo(
+                            remoteLogSegmentFilesLength(remoteLogSegments, remoteLogTabletDir, 5));
+            assertThat(remoteLogDownloader.getPrefetchSemaphore().availablePermits()).isEqualTo(0);
+
+            futures.get(1).getRecycleCallback().run();
+            futures.get(2).getRecycleCallback().run();
+            assertThat(remoteLogDownloader.getPrefetchSemaphore().availablePermits()).isEqualTo(2);
+            // the removal of log files are async, so we need to wait for the removal.
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(FileUtils.listDirectory(localLogDir).length).isEqualTo(2));
+
+            // test cleanup
+            remoteLogDownloader.close();
+            assertThat(localLogDir.toFile().exists()).isFalse();
+        } finally {
+            IOUtils.closeQuietly(remoteLogDownloader);
+            IOUtils.closeQuietly(remoteFileDownloader);
+        }
+    }
+
+    @Test
+    void testDuplicateRemoteLogDownloadDoesNotBreakOpenReader() throws Exception {
+        CountDownLatch duplicateDownloadCopyStarted = new CountDownLatch(1);
+        CountDownLatch continueDuplicateDownload = new CountDownLatch(1);
+
+        BlockingRemoteFileDownloader fileDownloader =
+                new BlockingRemoteFileDownloader(
+                        duplicateDownloadCopyStarted, continueDuplicateDownload);
+        RemoteLogDownloader downloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(), conf, fileDownloader, scannerMetricGroup, 10L);
+        try {
+            TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+            RemoteLogSegment segment =
+                    buildRemoteLogSegmentList(tableBucket, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 10)
+                            .get(0);
+            FsPath tabletDir =
+                    remoteLogTabletDir(remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, tableBucket);
+
+            RemoteLogDownloadFuture firstDownload = downloader.requestRemoteLog(tabletDir, segment);
+            downloader.fetchOnce();
+            retry(Duration.ofSeconds(30), () -> assertThat(firstDownload.isDone()).isTrue());
+
+            RemoteLogDownloadFuture duplicateDownload =
+                    downloader.requestRemoteLog(tabletDir, segment);
+            FileLogRecords openReader = firstDownload.getFileLogRecords(0);
+            try {
+                downloader.fetchOnce();
+                assertThat(duplicateDownloadCopyStarted.await(30, TimeUnit.SECONDS)).isTrue();
+                assertThat(openReader.batches().iterator().hasNext()).isTrue();
+                continueDuplicateDownload.countDown();
+                retry(
+                        Duration.ofSeconds(30),
+                        () -> assertThat(duplicateDownload.isDone()).isTrue());
+                duplicateDownload.getFileLogRecords(0).closeHandlers();
+            } finally {
+                continueDuplicateDownload.countDown();
+                openReader.closeHandlers();
+            }
+
+            assertThat(FileUtils.listDirectory(downloader.getLocalLogDir())).hasSize(1);
+        } finally {
+            IOUtils.closeQuietly(downloader);
+            IOUtils.closeQuietly(fileDownloader);
+        }
+    }
+
+    @Test
+    void testTemporaryFileCleanupOnError() throws Exception {
+        Path remoteFile = remoteDataDir.toPath().resolve("remote.log");
+        Files.write(remoteFile, new byte[] {1});
+        FileSystem failingFileSystem =
+                new LocalFileSystem() {
+                    @Override
+                    public FSDataInputStream open(FsPath path) throws IOException {
+                        return new FSDataInputStreamWrapper(super.open(path)) {
+                            @Override
+                            public int read(byte[] buffer) {
+                                throw new OutOfMemoryError("test");
+                            }
+                        };
+                    }
+                };
+        FsPath remotePath =
+                new FsPath(remoteFile.toUri()) {
+                    @Override
+                    public FileSystem getFileSystem() {
+                        return failingFileSystem;
+                    }
+                };
+
+        try (RemoteFileDownloader downloader = new RemoteFileDownloader(1)) {
+            assertThatThrownBy(
+                            () ->
+                                    downloader
+                                            .downloadFileAsync(
+                                                    new FsPathAndFileName(remotePath, "local.log"),
+                                                    localDir.toPath())
+                                            .get())
+                    .hasCauseInstanceOf(OutOfMemoryError.class);
+        }
+        assertThat(FileUtils.listDirectory(localDir.toPath())).isEmpty();
+    }
+
+    @Test
+    void testDiscardQueuedDownload() throws Exception {
+        RemoteFileDownloader fileDownloader = new RemoteFileDownloader(1);
+        RemoteLogDownloader downloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(), conf, fileDownloader, scannerMetricGroup, 10L);
+        try {
+            TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+            RemoteLogSegment segment =
+                    buildRemoteLogSegmentList(tableBucket, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 10)
+                            .get(0);
+            FsPath tabletDir =
+                    remoteLogTabletDir(remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, tableBucket);
+
+            RemoteLogDownloadFuture future = downloader.requestRemoteLog(tabletDir, segment);
+            future.discard();
+            future.discard();
+
+            assertThat(future.isDone()).isTrue();
+            assertThat(downloader.getSizeOfSegmentsToFetch()).isZero();
+            assertThat(downloader.getPrefetchSemaphore().availablePermits()).isEqualTo(4);
+        } finally {
+            IOUtils.closeQuietly(downloader);
+            IOUtils.closeQuietly(fileDownloader);
+        }
+    }
+
+    @Test
+    void testDiscardInFlightDownload() throws Exception {
+        CountDownLatch downloadStarted = new CountDownLatch(1);
+        CountDownLatch continueDownload = new CountDownLatch(1);
+
+        class BlockingFileDownloader extends RemoteFileDownloader {
+            BlockingFileDownloader() {
+                super(1);
+            }
+
+            @Override
+            protected long downloadFile(Path targetFilePath, FsPath remoteFilePath)
+                    throws IOException {
+                downloadStarted.countDown();
+                try {
+                    continueDownload.await();
+                } catch (InterruptedException e) {
+                    throw new IOException("Interrupted while blocking", e);
+                }
+                return super.downloadFile(targetFilePath, remoteFilePath);
+            }
+        }
+
+        BlockingFileDownloader fileDownloader = new BlockingFileDownloader();
+        RemoteLogDownloader downloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(), conf, fileDownloader, scannerMetricGroup, 10L);
+        try {
+            TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+            RemoteLogSegment segment =
+                    buildRemoteLogSegmentList(tableBucket, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 10)
+                            .get(0);
+            FsPath tabletDir =
+                    remoteLogTabletDir(remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, tableBucket);
+            File localFile = localFile(downloader, tabletDir, segment);
+
+            RemoteLogDownloadFuture future = downloader.requestRemoteLog(tabletDir, segment);
+            downloader.fetchOnce();
+            assertThat(downloadStarted.await(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(downloader.getPrefetchSemaphore().availablePermits()).isEqualTo(3);
+
+            future.discard();
+            continueDownload.countDown();
+
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(downloader.getPrefetchSemaphore().availablePermits())
+                                    .isEqualTo(4));
+            assertThat(future.isDone()).isTrue();
+            assertThat(localFile).doesNotExist();
+        } finally {
+            continueDownload.countDown();
+            IOUtils.closeQuietly(downloader);
+            IOUtils.closeQuietly(fileDownloader);
+        }
+    }
+
+    @Test
+    void testDiscardCompletedDownload() throws Exception {
+        RemoteFileDownloader fileDownloader = new RemoteFileDownloader(1);
+        RemoteLogDownloader downloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(), conf, fileDownloader, scannerMetricGroup, 10L);
+        try {
+            TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+            RemoteLogSegment segment =
+                    buildRemoteLogSegmentList(tableBucket, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 10)
+                            .get(0);
+            FsPath tabletDir =
+                    remoteLogTabletDir(remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, tableBucket);
+            File localFile = localFile(downloader, tabletDir, segment);
+
+            RemoteLogDownloadFuture future = downloader.requestRemoteLog(tabletDir, segment);
+            downloader.fetchOnce();
+            retry(Duration.ofMinutes(1), () -> assertThat(future.isDone()).isTrue());
+            assertThat(downloader.getPrefetchSemaphore().availablePermits()).isEqualTo(3);
+            assertThat(localFile).exists();
+
+            future.discard();
+            future.discard();
+
+            assertThat(downloader.getPrefetchSemaphore().availablePermits()).isEqualTo(4);
+            downloader.start();
+            retry(Duration.ofMinutes(1), () -> assertThat(localFile).doesNotExist());
+        } finally {
+            IOUtils.closeQuietly(downloader);
+            IOUtils.closeQuietly(fileDownloader);
+        }
+    }
+
+    @Test
+    void testDownloadLogInParallelAndInPriority() throws Exception {
+        class TestRemoteFileDownloader extends RemoteFileDownloader {
+            final Set<String> threadNames = Collections.synchronizedSet(new HashSet<>());
+
+            private TestRemoteFileDownloader(int threadNum) {
+                super(threadNum);
+            }
+
+            @Override
+            protected long downloadFile(Path targetFilePath, FsPath remoteFilePath)
+                    throws IOException {
+                threadNames.add(Thread.currentThread().getName());
+                return super.downloadFile(targetFilePath, remoteFilePath);
+            }
+        }
+
+        // prepare the environment, 4 download threads, pre-fetch 4 segments, 10 segments to fetch.
+        TestRemoteFileDownloader fileDownloader = new TestRemoteFileDownloader(4);
+        RemoteLogDownloader remoteLogDownloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(),
+                        conf, // max 4 pre-fetch num
+                        fileDownloader,
+                        scannerMetricGroup,
+                        10L);
+        TableBucket bucket1 = new TableBucket(DATA1_TABLE_ID, 1);
+        TableBucket bucket2 = new TableBucket(DATA1_TABLE_ID, 2);
+        TableBucket bucket3 = new TableBucket(DATA1_TABLE_ID, 3);
+        TableBucket bucket4 = new TableBucket(DATA1_TABLE_ID, 4);
+        try {
+            // prepare segments, 4 buckets with different maxTimestamp, total 10 segments
+            int totalSegments = 10;
+            List<RemoteLogSegment> remoteLogSegments =
+                    buildRemoteLogSegmentList(bucket1, DATA1_PHYSICAL_TABLE_PATH, 6, conf, 10);
+            remoteLogSegments.addAll(
+                    buildRemoteLogSegmentList(bucket3, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 5));
+            remoteLogSegments.addAll(
+                    buildRemoteLogSegmentList(bucket2, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 1));
+            remoteLogSegments.addAll(
+                    buildRemoteLogSegmentList(bucket3, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 15));
+            remoteLogSegments.addAll(
+                    buildRemoteLogSegmentList(bucket4, DATA1_PHYSICAL_TABLE_PATH, 1, conf, 8));
+
+            Map<UUID, RemoteLogDownloadFuture> futures = new HashMap<>();
+            for (RemoteLogSegment segment : remoteLogSegments) {
+                FsPath remoteLogTabletDir =
+                        remoteLogTabletDir(
+                                remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, segment.tableBucket());
+                RemoteLogDownloadFuture future =
+                        remoteLogDownloader.requestRemoteLog(remoteLogTabletDir, segment);
+                futures.put(segment.remoteLogSegmentId(), future);
+            }
+
+            // start the downloader after requests are added to have deterministic request order.
+            remoteLogDownloader.start();
+
+            // check the segments are fetched in priority order.
+            remoteLogSegments.sort(Comparator.comparingLong(RemoteLogSegment::maxTimestamp));
+            List<RemoteLogDownloadFuture> top4Futures = new ArrayList<>();
+            for (int i = 0; i < 4; i++) {
+                RemoteLogSegment segment = remoteLogSegments.get(i);
+                top4Futures.add(futures.get(segment.remoteLogSegmentId()));
+            }
+
+            // 4 to fetch.
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        for (RemoteLogDownloadFuture future : top4Futures) {
+                            assertThat(future.isDone()).isTrue();
+                        }
+                    });
+            // make sure 4 threads are used.
+            assertThat(fileDownloader.threadNames.size()).isEqualTo(4);
+            // only 4 segments are pre-fetched.
+            assertThat(remoteLogDownloader.getSizeOfSegmentsToFetch()).isEqualTo(totalSegments - 4);
+
+            for (int i = 3; i < totalSegments; i++) {
+                RemoteLogSegment segment = remoteLogSegments.get(i);
+                RemoteLogDownloadFuture future = futures.get(segment.remoteLogSegmentId());
+                waitUntil(future::isDone, Duration.ofMinutes(1), "segment download timeout");
+                // recycle the one segment to trigger download next segment
+                future.getRecycleCallback().run();
+            }
+
+            // all segments are fetched.
+            assertThat(remoteLogDownloader.getSizeOfSegmentsToFetch()).isEqualTo(0);
+        } finally {
+            IOUtils.closeQuietly(fileDownloader);
+            IOUtils.closeQuietly(remoteLogDownloader);
+        }
+    }
+
+    @Test
+    void testOrderOfRemoteLogDownloadRequest() {
+        TableBucket bucket1 = new TableBucket(DATA1_TABLE_ID, 1);
+        TableBucket bucket2 = new TableBucket(DATA1_TABLE_ID, 2);
+        TableBucket bucket3 = new TableBucket(DATA1_TABLE_ID, 3);
+
+        List<RemoteLogDownloadRequest> requests =
+                Arrays.asList(
+                        // different offset, same timestamp and bucket
+                        createDownloadRequest(bucket1, 10, 10),
+                        createDownloadRequest(bucket1, 20, 10),
+                        createDownloadRequest(bucket1, 30, 10),
+                        // -1 timestamp
+                        createDownloadRequest(bucket2, 10, -1),
+                        createDownloadRequest(bucket2, 20, -1),
+                        createDownloadRequest(bucket2, 30, -1),
+                        // 0 offset
+                        createDownloadRequest(bucket3, 0, 5),
+                        createDownloadRequest(bucket3, 0, 15),
+                        createDownloadRequest(bucket3, 0, 25));
+
+        // Sort the requests based on the custom comparator
+        Collections.sort(requests);
+        List<String> results =
+                requests.stream()
+                        .map(
+                                r ->
+                                        String.format(
+                                                "(bucket=%s, offset=%s, ts=%s)",
+                                                r.segment.tableBucket().getBucket(),
+                                                r.segment.remoteLogStartOffset(),
+                                                r.segment.maxTimestamp()))
+                        .collect(Collectors.toList());
+        List<String> expected =
+                Arrays.asList(
+                        "(bucket=2, offset=10, ts=-1)",
+                        "(bucket=2, offset=20, ts=-1)",
+                        "(bucket=2, offset=30, ts=-1)",
+                        "(bucket=3, offset=0, ts=5)",
+                        "(bucket=1, offset=10, ts=10)",
+                        "(bucket=1, offset=20, ts=10)",
+                        "(bucket=1, offset=30, ts=10)",
+                        "(bucket=3, offset=0, ts=15)",
+                        "(bucket=3, offset=0, ts=25)");
+        assertThat(results).isEqualTo(expected);
+    }
+
+    /**
+     * Tests that close() properly cleans up the local directory even when there are simultaneously:
+     * (1) already-downloaded files on disk, (2) in-flight downloads still running on the shared
+     * pool, and (3) pending requests in the queue. After close() the local directory must not exist
+     * — including after in-flight downloads finish and potentially recreate it via
+     * Files.createDirectories.
+     */
+    @Test
+    void testCloseWithInFlightAndPendingDownloads() throws Exception {
+        // Latch to block in-flight downloads until explicitly released after close().
+        CountDownLatch blockLatch = new CountDownLatch(1);
+        // Latch to know when 2 in-flight downloads have entered the blocked state.
+        CountDownLatch inFlightStarted = new CountDownLatch(2);
+        // Latch to know when 2 in-flight downloads are finished.
+        CountDownLatch inFlightFinished = new CountDownLatch(2);
+
+        class BlockingFileDownloader extends RemoteFileDownloader {
+            private final AtomicInteger enteredCount = new AtomicInteger(0);
+
+            BlockingFileDownloader(int threadNum) {
+                super(threadNum);
+            }
+
+            @Override
+            protected long downloadFile(Path targetFilePath, FsPath remoteFilePath)
+                    throws IOException {
+                int count = enteredCount.incrementAndGet();
+                boolean shouldBlock = count > 1;
+                if (shouldBlock) {
+                    // Block the 2nd and 3rd downloads to simulate in-flight state.
+                    inFlightStarted.countDown();
+                    try {
+                        blockLatch.await();
+                    } catch (InterruptedException e) {
+                        throw new IOException("Interrupted while blocking", e);
+                    }
+                }
+                try {
+                    return super.downloadFile(targetFilePath, remoteFilePath);
+                } finally {
+                    if (shouldBlock) {
+                        inFlightFinished.countDown();
+                    }
+                }
+            }
+        }
+
+        // prefetch=3: downloads 0,1,2 start; downloads 3,4 remain in the queue.
+        conf.set(ConfigOptions.CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM, 3);
+        BlockingFileDownloader fileDownloader = new BlockingFileDownloader(4);
+        RemoteLogDownloader downloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(), conf, fileDownloader, scannerMetricGroup, 10L);
+
+        try {
+            TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+            List<RemoteLogSegment> segments =
+                    buildRemoteLogSegmentList(tb, DATA1_PHYSICAL_TABLE_PATH, 5, conf, 10);
+            FsPath tabletDir = remoteLogTabletDir(remoteLogDir, DATA1_PHYSICAL_TABLE_PATH, tb);
+            List<RemoteLogDownloadFuture> futures =
+                    requestRemoteLogs(downloader, tabletDir, segments);
+
+            downloader.start();
+
+            // Wait for the first download to complete (already-downloaded file on disk) and 2
+            // in-flight downloads to enter the blocked state.
+            // At this point: 1 file downloaded, 2 blocked in-flight, 2 pending.
+            assertThat(inFlightStarted.await(30, TimeUnit.SECONDS)).isTrue();
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(futures.subList(0, 3)).anyMatch(future -> future.isDone()));
+            Path localLogDir = downloader.getLocalLogDir();
+            assertThat(localLogDir.toFile().exists()).isTrue();
+
+            // Close the downloader.
+            downloader.close();
+
+            // Pending futures (segments 3, 4) should be cancelled immediately.
+            assertThat(futures.get(3).isDone()).isTrue();
+            assertThat(futures.get(4).isDone()).isTrue();
+
+            // Wait for 2 in-flight downloads finished.
+            blockLatch.countDown();
+            assertThat(inFlightFinished.await(30, TimeUnit.SECONDS)).isTrue();
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(futures.subList(0, 3)).allMatch(future -> future.isDone()));
+
+            // Verify that ultimately the local directory does not exist.
+            retry(Duration.ofMinutes(1), () -> assertThat(localLogDir.toFile().exists()).isFalse());
+        } finally {
+            blockLatch.countDown(); // ensure latch is released even on test failure
+            IOUtils.closeQuietly(downloader);
+            IOUtils.closeQuietly(fileDownloader);
+        }
+    }
+
+    @Test
+    void testDiscardDoesNotReportDownloadFailure() {
+        CompletableFuture<File> logFileFuture = new CompletableFuture<>();
+        AtomicInteger completionCount = new AtomicInteger();
+        RemoteLogDownloadFuture remoteLogDownloadFuture =
+                new RemoteLogDownloadFuture(
+                        logFileFuture, () -> {}, () -> logFileFuture.cancel(false));
+        remoteLogDownloadFuture.whenComplete(ignored -> completionCount.incrementAndGet());
+
+        remoteLogDownloadFuture.discard();
+
+        assertThat(logFileFuture).isCancelled();
+        assertThat(completionCount).hasValue(0);
+    }
+
+    @Test
+    void testFetchException() {
+        conf.set(ConfigOptions.CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM, 1);
+        RemoteFileDownloader remoteFileDownloader =
+                new RemoteFileDownloader(1) {
+                    @Override
+                    protected long downloadFile(Path targetFilePath, FsPath remoteFilePath)
+                            throws IOException {
+                        throw new IOException("Test fetch exception");
+                    }
+                };
+        RemoteLogDownloader remoteLogDownloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(),
+                        conf,
+                        remoteFileDownloader,
+                        scannerMetricGroup,
+                        10L);
+        try {
+            remoteLogDownloader.start();
+
+            TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+            RemoteLogSegment nonExistLogSegment =
+                    RemoteLogSegment.Builder.builder()
+                            .tableBucket(tableBucket)
+                            .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH)
+                            .remoteLogSegmentId(UUID.randomUUID())
+                            .remoteLogStartOffset(1)
+                            .remoteLogEndOffset(2)
+                            .maxTimestamp(2)
+                            .segmentSizeInBytes(Integer.MAX_VALUE)
+                            .build();
+
+            RemoteLogDownloadFuture remoteLogDownloadFuture =
+                    remoteLogDownloader.requestRemoteLog(remoteLogDir, nonExistLogSegment);
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(remoteLogDownloadFuture.isDone()).isTrue());
+            assertThatThrownBy(() -> remoteLogDownloadFuture.getFileLogRecords(1))
+                    .cause()
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining(
+                            String.format(
+                                    "Failed to download remote log segment file %s, retry count %d",
+                                    RemoteLogDownloader.getFsPathAndFileName(
+                                                    remoteLogDir, nonExistLogSegment)
+                                            .getFileName(),
+                                    conf.getInt(
+                                            ConfigOptions
+                                                    .CLIENT_SCANNER_REMOTE_LOG_FETCH_MAX_RETRIES)))
+                    .rootCause()
+                    .hasMessageContaining("Test fetch exception");
+            assertThat(scannerMetricGroup.remoteFetchRequestCount().getCount()).isEqualTo(6);
+
+            RemoteLogSegment secondLogSegment =
+                    RemoteLogSegment.Builder.builder()
+                            .tableBucket(tableBucket)
+                            .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH)
+                            .remoteLogSegmentId(UUID.randomUUID())
+                            .remoteLogStartOffset(3)
+                            .remoteLogEndOffset(4)
+                            .maxTimestamp(4)
+                            .segmentSizeInBytes(Integer.MAX_VALUE)
+                            .build();
+            RemoteLogDownloadFuture secondDownloadFuture =
+                    remoteLogDownloader.requestRemoteLog(remoteLogDir, secondLogSegment);
+            retry(Duration.ofMinutes(1), () -> assertThat(secondDownloadFuture.isDone()).isTrue());
+            assertThat(scannerMetricGroup.remoteFetchRequestCount().getCount()).isEqualTo(12);
+        } finally {
+            IOUtils.closeQuietly(remoteLogDownloader);
+            IOUtils.closeQuietly(remoteFileDownloader);
+        }
+    }
+
+    @Test
+    void testConfigurableMaxRetryCount() {
+        conf.set(ConfigOptions.CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM, 1);
+        conf.set(ConfigOptions.CLIENT_SCANNER_REMOTE_LOG_FETCH_MAX_RETRIES, 0);
+        RemoteFileDownloader remoteFileDownloader =
+                new RemoteFileDownloader(1) {
+                    @Override
+                    protected long downloadFile(Path targetFilePath, FsPath remoteFilePath)
+                            throws IOException {
+                        throw new IOException("Test fetch exception");
+                    }
+                };
+        RemoteLogDownloader remoteLogDownloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH.toString(),
+                        conf,
+                        remoteFileDownloader,
+                        scannerMetricGroup,
+                        10L);
+        try {
+            remoteLogDownloader.start();
+            TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+            RemoteLogSegment segment =
+                    RemoteLogSegment.Builder.builder()
+                            .tableBucket(tableBucket)
+                            .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH)
+                            .remoteLogSegmentId(UUID.randomUUID())
+                            .remoteLogStartOffset(1)
+                            .remoteLogEndOffset(2)
+                            .maxTimestamp(2)
+                            .segmentSizeInBytes(Integer.MAX_VALUE)
+                            .build();
+
+            RemoteLogDownloadFuture future =
+                    remoteLogDownloader.requestRemoteLog(remoteLogDir, segment);
+            retry(Duration.ofMinutes(1), () -> assertThat(future.isDone()).isTrue());
+            assertThat(scannerMetricGroup.remoteFetchRequestCount().getCount()).isEqualTo(1);
+            assertThatThrownBy(() -> future.getFileLogRecords(1))
+                    .cause()
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("retry count 0");
+        } finally {
+            IOUtils.closeQuietly(remoteLogDownloader);
+            IOUtils.closeQuietly(remoteFileDownloader);
+        }
+    }
+
+    private static class BlockingRemoteFileDownloader extends RemoteFileDownloader {
+        private final CountDownLatch duplicateDownloadCopyStarted;
+        private final CountDownLatch continueDuplicateDownload;
+        private final AtomicInteger downloadCount = new AtomicInteger();
+
+        private BlockingRemoteFileDownloader(
+                CountDownLatch duplicateDownloadCopyStarted,
+                CountDownLatch continueDuplicateDownload) {
+            super(1);
+            this.duplicateDownloadCopyStarted = duplicateDownloadCopyStarted;
+            this.continueDuplicateDownload = continueDuplicateDownload;
+        }
+
+        @Override
+        protected long downloadFile(Path targetFilePath, FsPath remoteFilePath) throws IOException {
+            if (downloadCount.incrementAndGet() == 2) {
+                FileSystem blockingFileSystem =
+                        new LocalFileSystem() {
+                            @Override
+                            public FSDataInputStream open(FsPath path) throws IOException {
+                                return new FSDataInputStreamWrapper(super.open(path)) {
+                                    @Override
+                                    public int read(byte[] buffer) throws IOException {
+                                        duplicateDownloadCopyStarted.countDown();
+                                        try {
+                                            if (!continueDuplicateDownload.await(
+                                                    30, TimeUnit.SECONDS)) {
+                                                throw new IOException(
+                                                        "Timed out waiting to continue duplicate download");
+                                            }
+                                        } catch (InterruptedException e) {
+                                            Thread.currentThread().interrupt();
+                                            throw new IOException(
+                                                    "Interrupted while blocking duplicate download",
+                                                    e);
+                                        }
+                                        return super.read(buffer);
+                                    }
+                                };
+                            }
+                        };
+                remoteFilePath =
+                        new FsPath(remoteFilePath.toUri()) {
+                            @Override
+                            public FileSystem getFileSystem() {
+                                return blockingFileSystem;
+                            }
+                        };
+            }
+            return super.downloadFile(targetFilePath, remoteFilePath);
+        }
+    }
+
+    private RemoteLogDownloadRequest createDownloadRequest(
+            TableBucket tableBucket, long startOffset, long maxTimestamp) {
+        RemoteLogSegment remoteLogSegment =
+                RemoteLogSegment.Builder.builder()
+                        .tableBucket(tableBucket)
+                        .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH)
+                        .remoteLogSegmentId(UUID.randomUUID())
+                        .remoteLogStartOffset(startOffset)
+                        .remoteLogEndOffset(startOffset + 10)
+                        .maxTimestamp(maxTimestamp)
+                        .segmentSizeInBytes(Integer.MAX_VALUE)
+                        .build();
+        return new RemoteLogDownloadRequest(remoteLogSegment, remoteLogDir);
+    }
+
+    private List<RemoteLogDownloadFuture> requestRemoteLogs(
+            RemoteLogDownloader remoteLogDownloader,
+            FsPath remoteLogTabletDir,
+            List<RemoteLogSegment> remoteLogSegments) {
+        List<RemoteLogDownloadFuture> futures = new ArrayList<>();
+        for (RemoteLogSegment segment : remoteLogSegments) {
+            RemoteLogDownloadFuture future =
+                    remoteLogDownloader.requestRemoteLog(remoteLogTabletDir, segment);
+            futures.add(future);
+        }
+        return futures;
+    }
+
+    private static List<RemoteLogSegment> buildRemoteLogSegmentList(
+            TableBucket tableBucket,
+            PhysicalTablePath physicalTablePath,
+            int num,
+            Configuration conf,
+            long maxTimestamp)
+            throws Exception {
+        List<RemoteLogSegment> remoteLogSegmentList = new ArrayList<>();
+        for (int i = 0; i < num; i++) {
+            long baseOffset = i * 10L;
+            UUID segmentId = UUID.randomUUID();
+            RemoteLogSegment remoteLogSegment =
+                    RemoteLogSegment.Builder.builder()
+                            .tableBucket(tableBucket)
+                            .physicalTablePath(physicalTablePath)
+                            .remoteLogSegmentId(segmentId)
+                            .remoteLogStartOffset(baseOffset)
+                            .remoteLogEndOffset(baseOffset + 9)
+                            .maxTimestamp(maxTimestamp)
+                            .segmentSizeInBytes(Integer.MAX_VALUE)
+                            .build();
+            genRemoteLogSegmentFile(
+                    tableBucket, physicalTablePath, conf, remoteLogSegment, baseOffset);
+            remoteLogSegmentList.add(remoteLogSegment);
+        }
+        return remoteLogSegmentList;
+    }
+
+    private static Long remoteLogSegmentFilesLength(
+            List<RemoteLogSegment> remoteLogSegments, FsPath remoteLogTabletDir, int segmentNum) {
+        return remoteLogSegments.stream()
+                .limit(segmentNum)
+                .mapToLong(
+                        segment ->
+                                new File(
+                                                RemoteLogDownloader.getFsPathAndFileName(
+                                                                remoteLogTabletDir, segment)
+                                                        .getPath()
+                                                        .getPath())
+                                        .length())
+                .sum();
+    }
+
+    private static File localFile(
+            RemoteLogDownloader downloader, FsPath remoteLogTabletDir, RemoteLogSegment segment) {
+        return new File(
+                downloader.getLocalLogDir().toFile(),
+                RemoteLogDownloader.getFsPathAndFileName(remoteLogTabletDir, segment)
+                        .getFileName());
+    }
+}

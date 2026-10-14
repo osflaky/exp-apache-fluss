@@ -1,0 +1,67 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluss-conf-file
+  labels:
+  {{- include "fluss.labels" . | nindent 4 }}
+data:
+  server.yaml: |
+    {{- range $key, $val := .Values.configurationOverrides }}
+    {{ $key }}: {{ tpl (printf "%v" $val) $ }}
+    {{- end }}
+
+    ### Security
+
+    {{- $internalProtocol := include "fluss.security.listener.protocol" (dict "context" .Values "listener" "internal") | trim -}}
+    {{- $clientProtocol := include "fluss.security.listener.protocol" (dict "context" .Values "listener" "client") | trim -}}
+    {{- $enabledMechanisms := include "fluss.security.sasl.enabledMechanisms" . | trim -}}
+    {{- $internalMechanism := include "fluss.security.listener.mechanism" (dict "context" .Values "listener" "internal") -}}
+    {{- if (include "fluss.security.sasl.enabled" .) }}
+    security.protocol.map: INTERNAL:{{ $internalProtocol }},CLIENT:{{ $clientProtocol }}
+    security.sasl.enabled.mechanisms: {{ $enabledMechanisms }}
+    {{- if ne $internalMechanism "" }}
+    client.security.protocol: SASL
+    client.security.sasl.mechanism: {{ upper $internalMechanism }}
+    {{- end }}
+
+    {{- end }}
+
+    {{- if include "fluss.metrics.enabled" . }}
+    ### Metrics
+
+    metrics.reporters: {{ .Values.metrics.reporters }}
+    {{- range $name := (include "fluss.metrics.reporterNames" . | fromYamlArray) }}
+    {{ printf "metrics.reporter.%s.port" $name }}: {{ (index $.Values.metrics $name).port }}
+    {{- end }}
+
+    {{- end }}
+
+    ### Zookeeper
+
+    {{- if (include "fluss.security.zookeeper.sasl.enabled" .) }}
+    zookeeper.client.config-path: /etc/fluss/conf/zookeeper-client.properties
+    {{- end }}
+
+    {{- if include "fluss.secrets.enabled" . }}
+    ### Secrets
+
+    {{- include "fluss.secrets.configLines" . | nindent 4 }}
+    {{- end }}

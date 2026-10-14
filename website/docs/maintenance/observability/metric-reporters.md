@@ -1,0 +1,169 @@
+---
+title: Metric Reporters
+sidebar_position: 2
+---
+
+# Metric Reporters
+
+Fluss allows reporting [metrics](monitor-metrics.md) to external system. 
+Metrics can be exposed to an external system by configuring one or several reporters in `conf/server.yaml`. These 
+reporters will be instantiated on each CoordinatorServer and TabletServers when they started.
+
+Example reporter configuration that specifies multiple reporters:
+
+```yaml
+metrics.reporters: jmx,prometheus
+```
+
+## Push vs. Pull
+
+Metrics are exported either via pushes or pulls.
+
+Push-based reporters usually implement the `Scheduled` interface and periodically send a summary of current metrics to an external system.
+
+Pull-based reporters are queried from an external system instead.
+
+## Filtering metrics
+
+Each reporter supports two filters:
+
+- `metrics.reporter.<name>.filter.includes`: metrics to export (default: `*:*:*`).
+- `metrics.reporter.<name>.filter.excludes`: metrics to omit (default: empty). Excludes take precedence.
+
+Rules use `<scope>[:<name>[:<type>]]`, with `;` between rules and `,` between names/types.
+Use logical scopes with `.` separators (without `fluss_` or label values) and original metric names.
+Patterns support `*` wildcards and regular expressions. Types are `counter`, `gauge`, `meter`, or
+`histogram`; omitted names/types match all.
+
+For example, exclude bucket metrics (including subgroups) and histograms from PushGateway:
+
+```yaml
+metrics.reporter.prometheus-push.filter.includes: *:*:*
+metrics.reporter.prometheus-push.filter.excludes: *.bucket;*.bucket.*;*:*:histogram
+```
+
+Restart the Fluss process to apply changes.
+
+## Reporters
+
+The following sections list the supported reporters currently.
+
+### JMX
+
+Type: pull
+
+Parameters:
+
+- `port` - (optional) the port on which JMX listens for connections.
+  In order to be able to run several instances of the reporter on one host (e.g. when one TabletServer is co-located with the CoordinatorServer) it is advisable to use a port range like `9250-9260`.
+  When a range is specified the actual port is shown in the relevant server log.
+  If this setting is set, Fluss will start an extra JMX connector for the given port/range.
+  Metrics are always available on the default local JMX interface.
+
+Example configuration:
+
+```yaml
+metrics.reporters: jmx
+metrics.reporter.jmx.port: 9250-9260
+```
+
+Metrics exposed through JMX are identified by a domain and a list of key-properties, which together form the object name.
+
+The domain always begins with `org.apache.fluss` followed by a generalized metric identifier.
+An example for such a domain would be `org.apache.fluss.tabletserver.replicaCount`.
+
+The key-property list contains the values for all variables, that are associated
+with a given metric.
+An example for such a list would be `cluster_id=fluss1,host=localhost,server_id=1`.
+
+The domain thus identifies a metric class, while the key-property list identifies one (or multiple) instances of that metric.
+
+### Prometheus
+
+Type: pull
+
+Parameters:
+
+- `metrics.reporter.prometheus.port` - (optional) the port the Prometheus exporter listens on, defaults to [9249](https://github.com/prometheus/prometheus/wiki/Default-port-allocations). In order to be able to run several instances of the reporter on one host (e.g. when one TabletServer is co-located with the CoordinatorServer) it is advisable to use a port range like `9250-9260`.
+
+Example configuration:
+
+```yaml
+metrics.reporters: prometheus
+metrics.reporter.prometheus.port: 9250
+```
+
+Fluss metric types are mapped to Prometheus metric types as follows:
+
+| Fluss     | Prometheus | Note                                     |
+| --------- |------------|------------------------------------------|
+| Counter   | Gauge      |Prometheus counters cannot be decremented.|
+| Gauge     | Gauge      |Only numbers and booleans are supported.  |
+| Histogram | Summary    |Quantiles .5, .75, .95, .98, .99 and .999 |
+| Meter     | Gauge      |The gauge exports the meter's rate.       
+
+### PrometheusPushGateway
+
+Type: push
+
+Parameters:
+
+- `metrics.reporter.prometheus-push.host-url` - The PushGateway server host URL including scheme, host name, and port.
+- `metrics.reporter.prometheus-push.job-name` - The job name under which metrics will be pushed.
+- `metrics.reporter.prometheus-push.push-interval` - (Optional) The interval of pushing metrics to Prometheus PushGateway, defaults to 10 SECONDS.
+- `metrics.reporter.prometheus-push.random-job-name-suffix` - (Optional) Specifies whether a random suffix should be appended to the job name, defaults to true. This is useful when multiple instances of the reporter are running on the same host. 
+- `metrics.reporter.prometheus-push.delete-on-shutdown` - (Optional) Specifies whether to delete metrics from the PushGateway on shutdown, defaults to true. Fluss will try its best to delete the metrics but this is not guaranteed.
+- `metrics.reporter.prometheus-push.grouping-key` - Specifies the grouping key which is the group and global labels of all metrics. The label name and value are separated by `=`, and labels are separated by `;`, e.g., `k1=v1;k2=v2`.
+- `metrics.reporter.prometheus-push.username` - (Optional) The username for Basic Auth of the Prometheus PushGateway. Leave it unset to disable authentication.
+- `metrics.reporter.prometheus-push.password` - (Optional) The password for Basic Auth of the Prometheus PushGateway. Only takes effect when `username` is configured.
+
+Example configuration:
+
+```yaml
+metrics.reporters: prometheus-push
+metrics.reporter.prometheus-push.host-url: http://localhost:9091
+metrics.reporter.prometheus-push.job-name: fluss-tablet-server
+metrics.reporter.prometheus-push.push-interval: 10 SECONDS
+metrics.reporter.prometheus-push.random-job-name-suffix: true
+metrics.reporter.prometheus-push.delete-on-shutdown: true
+metrics.reporter.prometheus-push.grouping-key: instance=instance01;cluster=clusterA
+metrics.reporter.prometheus-push.username: myuser
+metrics.reporter.prometheus-push.password: mypassword
+```
+
+### InfluxDB
+
+Type: push
+
+InfluxDB reporter supports both InfluxDB v2 and InfluxDB v3. The default version is v3.
+
+Parameters:
+
+- `metrics.reporter.influxdb.version` - (Optional) The InfluxDB version to connect to, defaults to `v3`. Supported values are `v2` and `v3`.
+- `metrics.reporter.influxdb.host-url` - The InfluxDB server host URL including scheme, host name, and port.
+- `metrics.reporter.influxdb.bucket` - The InfluxDB bucket/database name.
+- `metrics.reporter.influxdb.org` - The InfluxDB organization name. Required for InfluxDB v2, not needed for InfluxDB v3.
+- `metrics.reporter.influxdb.token` - The InfluxDB authentication token.
+- `metrics.reporter.influxdb.push-interval` - (Optional) The interval of reporting metrics to InfluxDB, defaults to 10 SECONDS.
+
+Example configuration for InfluxDB v3 (default):
+
+```yaml
+metrics.reporters: influxdb
+metrics.reporter.influxdb.host-url: http://localhost:8181
+metrics.reporter.influxdb.bucket: fluss_metrics
+metrics.reporter.influxdb.token: your-influxdb-token
+metrics.reporter.influxdb.push-interval: 10 SECONDS
+```
+
+Example configuration for InfluxDB v2:
+
+```yaml
+metrics.reporters: influxdb
+metrics.reporter.influxdb.version: v2
+metrics.reporter.influxdb.host-url: http://localhost:8086
+metrics.reporter.influxdb.bucket: fluss_metrics
+metrics.reporter.influxdb.org: fluss_org
+metrics.reporter.influxdb.token: your-influxdb-token
+metrics.reporter.influxdb.push-interval: 10 SECONDS
+```

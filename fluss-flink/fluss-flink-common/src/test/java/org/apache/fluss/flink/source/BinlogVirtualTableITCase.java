@@ -1,0 +1,754 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.source;
+
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.writer.UpsertWriter;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.testutils.common.MultiVersionTest;
+import org.apache.fluss.utils.clock.ManualClock;
+
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.configuration.CheckpointingOptions;
+import org.apache.flink.configuration.MemorySize;
+import org.apache.flink.configuration.StateBackendOptions;
+import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.TableResult;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.table.api.config.ExecutionConfigOptions;
+import org.apache.flink.test.util.MiniClusterWithClientResource;
+import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
+
+import javax.annotation.Nullable;
+
+import java.io.File;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectBatchRows;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
+import static org.apache.fluss.flink.utils.FlinkTestBase.writeRows;
+import static org.apache.fluss.server.testutils.FlussClusterExtension.BUILTIN_DATABASE;
+import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Integration test for $binlog virtual table functionality. */
+abstract class BinlogVirtualTableITCase {
+
+    protected static final ManualClock CLOCK = new ManualClock();
+    @TempDir public static File checkpointDir;
+    @TempDir public static File savepointDir;
+
+    @RegisterExtension
+    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
+            FlussClusterExtension.builder()
+                    .setClusterConf(new Configuration())
+                    .setNumOfTabletServers(1)
+                    .setClock(CLOCK)
+                    .build();
+
+    static final String CATALOG_NAME = "testcatalog";
+    static final String DEFAULT_DB = "test_binlog_db";
+    protected StreamExecutionEnvironment execEnv;
+    protected StreamTableEnvironment tEnv;
+    protected Connection conn;
+    protected Admin admin;
+    protected Configuration clientConf;
+    protected MiniClusterWithClientResource cluster;
+
+    @BeforeEach
+    protected void beforeEach() throws Exception {
+        clientConf = FLUSS_CLUSTER_EXTENSION.getClientConfig();
+        conn = ConnectionFactory.createConnection(clientConf);
+        admin = conn.getAdmin();
+
+        cluster =
+                new MiniClusterWithClientResource(
+                        new MiniClusterResourceConfiguration.Builder()
+                                .setConfiguration(getFileBasedCheckpointsConfig(savepointDir))
+                                .setNumberTaskManagers(2)
+                                .setNumberSlotsPerTaskManager(2)
+                                .build());
+        cluster.before();
+
+        // Initialize Flink environment
+        tEnv = initTableEnvironment(null);
+        // reset clock before each test
+        CLOCK.advanceTime(-CLOCK.milliseconds(), TimeUnit.MILLISECONDS);
+    }
+
+    @AfterEach
+    protected void afterEach() throws Exception {
+        if (cluster != null) {
+            cluster.after();
+            cluster = null;
+        }
+        if (admin != null) {
+            admin.close();
+            admin = null;
+        }
+        if (conn != null) {
+            conn.close();
+            conn = null;
+        }
+    }
+
+    // init table environment from savepointPath
+    private StreamTableEnvironment initTableEnvironment(@Nullable String savepointPath) {
+        return initTableEnvironment(savepointPath, EnvironmentSettings.inStreamingMode());
+    }
+
+    private StreamTableEnvironment initBatchTableEnvironment() {
+        return initTableEnvironment(null, EnvironmentSettings.inBatchMode());
+    }
+
+    private StreamTableEnvironment initTableEnvironment(
+            @Nullable String savepointPath, EnvironmentSettings environmentSettings) {
+        org.apache.flink.configuration.Configuration conf =
+                new org.apache.flink.configuration.Configuration();
+        if (savepointPath != null) {
+            conf.setString("execution.savepoint.path", savepointPath);
+        }
+        StreamExecutionEnvironment execEnv =
+                StreamExecutionEnvironment.getExecutionEnvironment(conf);
+        execEnv.setParallelism(1);
+        execEnv.enableCheckpointing(1000);
+        StreamTableEnvironment tEnv = StreamTableEnvironment.create(execEnv, environmentSettings);
+        String bootstrapServers = String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS));
+        // crate catalog using sql
+        tEnv.executeSql(
+                String.format(
+                        "create catalog %s with ('type' = 'fluss', '%s' = '%s')",
+                        CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
+        tEnv.executeSql("use catalog " + CATALOG_NAME);
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+        tEnv.executeSql("create database if not exists " + DEFAULT_DB);
+        tEnv.useDatabase(DEFAULT_DB);
+
+        return tEnv;
+    }
+
+    @AfterEach
+    void after() {
+        tEnv.useDatabase(BUILTIN_DATABASE);
+        tEnv.executeSql(String.format("drop database %s cascade", DEFAULT_DB));
+    }
+
+    /** Deletes rows from a primary key table using the proper delete API. */
+    protected static void deleteRows(
+            Connection connection, TablePath tablePath, List<InternalRow> rows) throws Exception {
+        try (Table table = connection.getTable(tablePath)) {
+            UpsertWriter writer = table.newUpsert().createWriter();
+            for (InternalRow row : rows) {
+                writer.delete(row);
+            }
+            writer.flush();
+        }
+    }
+
+    @Test
+    @MultiVersionTest
+    public void testDescribeBinlogTable() throws Exception {
+        // Create a table with various data types to test complex schema
+        tEnv.executeSql(
+                "CREATE TABLE describe_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ")");
+
+        // Test DESCRIBE on binlog virtual table
+        CloseableIterator<Row> describeResult =
+                tEnv.executeSql("DESCRIBE describe_test$binlog").collect();
+
+        List<String> schemaRows = new ArrayList<>();
+        while (describeResult.hasNext()) {
+            schemaRows.add(describeResult.next().toString());
+        }
+
+        // Should have 5 columns: _change_type, _log_offset, _commit_timestamp, before, after
+        assertThat(schemaRows).hasSize(5);
+
+        // Verify metadata columns are listed first
+        assertThat(schemaRows.get(0))
+                .isEqualTo("+I[_change_type, STRING, false, null, null, null]");
+        assertThat(schemaRows.get(1)).isEqualTo("+I[_log_offset, BIGINT, false, null, null, null]");
+        assertThat(schemaRows.get(2))
+                .isEqualTo("+I[_commit_timestamp, TIMESTAMP_LTZ(3), false, null, null, null]");
+
+        // Verify before and after are ROW types with original columns
+        assertThat(schemaRows.get(3))
+                .isEqualTo(
+                        "+I[before, ROW<`id` INT NOT NULL, `name` STRING, `amount` BIGINT>, true, null, null, null]");
+        assertThat(schemaRows.get(4))
+                .isEqualTo(
+                        "+I[after, ROW<`id` INT NOT NULL, `name` STRING, `amount` BIGINT>, true, null, null, null]");
+    }
+
+    @Test
+    public void testBinlogUnsupportedForLogTable() throws Exception {
+        // Create a log table (no primary key)
+        tEnv.executeSql(
+                "CREATE TABLE log_table ("
+                        + "  event_id INT,"
+                        + "  event_type STRING"
+                        + ") WITH ('bucket.num' = '1')");
+
+        // $binlog should fail for log tables
+        assertThatThrownBy(() -> tEnv.executeSql("DESCRIBE log_table$binlog").collect())
+                .hasMessageContaining("only supported for primary key tables");
+    }
+
+    @Test
+    public void testBatchReadBinlogTable() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE batch_binlog_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "batch_binlog_test");
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice"), row(2, "Bob")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice-updated")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        deleteRows(conn, tablePath, Arrays.asList(row(2, "Bob")));
+
+        tEnv = initBatchTableEnvironment();
+
+        // The batch source resolves the configured starting offsets and captures the latest log
+        // offsets as stopping offsets, so historical binlog replay completes as a bounded query.
+        List<String> allChanges =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, "
+                                                + "before.id, before.name, after.id, after.name "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(allChanges)
+                .containsExactly(
+                        "+I[insert, 0, null, null, 1, Alice]",
+                        "+I[insert, 1, null, null, 2, Bob]",
+                        "+I[update, 2, 1, Alice, 1, Alice-updated]",
+                        "+I[delete, 4, 2, Bob, null, null]");
+
+        List<String> limited =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "ORDER BY _log_offset LIMIT 2")
+                                .collect());
+        assertThat(limited).containsExactly("+I[insert, 0]", "+I[insert, 1]");
+
+        List<String> primaryKeyFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, before.id, before.name, "
+                                                + "after.id, after.name "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "WHERE after.id = 1 "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(primaryKeyFiltered)
+                .containsExactly(
+                        "+I[insert, null, null, 1, Alice]",
+                        "+I[update, 1, Alice, 1, Alice-updated]");
+
+        // Filters on _commit_timestamp are covered by
+        // testBatchReadBinlogTableWithCommitTimestampFilter, which is disabled on Flink 1.18
+        // (FLINK-35318).
+        List<String> metadataFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, before.id "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "WHERE _change_type = 'delete' "
+                                                + "AND _log_offset = 4")
+                                .collect());
+        assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
+
+        List<String> timestampStartup =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "/*+ OPTIONS("
+                                                + "'scan.startup.mode' = 'timestamp', "
+                                                + "'scan.startup.timestamp' = '1500') */ "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(timestampStartup).containsExactly("+I[update, 2]", "+I[delete, 4]");
+    }
+
+    /**
+     * Bounded reads with a predicate on the {@code _commit_timestamp} metadata column.
+     *
+     * <p>This is kept apart from {@code testBatchReadBinlogTable} because Flink 1.18 rebuilds the
+     * remaining TIMESTAMP_LTZ filter using the session time zone instead of UTC after {@code
+     * applyFilters()} (FLINK-35318, fixed in Flink 1.19.2 and 1.20.0), which shifts the literal and
+     * drops all rows in non-UTC environments. The Flink 1.18 subclass therefore disables this test
+     * only, keeping the rest of the batch coverage.
+     */
+    @Test
+    public void testBatchReadBinlogTableWithCommitTimestampFilter() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE batch_binlog_ts_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "batch_binlog_ts_test");
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice"), row(2, "Bob")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice-updated")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        deleteRows(conn, tablePath, Arrays.asList(row(2, "Bob")));
+
+        tEnv = initBatchTableEnvironment();
+
+        List<String> metadataFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, before.id "
+                                                + "FROM batch_binlog_ts_test$binlog "
+                                                + "WHERE _change_type = 'delete' "
+                                                + "AND _log_offset = 4 "
+                                                + "AND _commit_timestamp = TO_TIMESTAMP_LTZ(3000, 3)")
+                                .collect());
+        assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
+    }
+
+    @Test
+    public void testBinlogWithAllChangeTypes() throws Exception {
+        // Create a primary key table with 1 bucket for consistent log_offset numbers
+        tEnv.executeSql(
+                "CREATE TABLE binlog_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "binlog_test");
+
+        // Start binlog scan
+        String query =
+                "SELECT _change_type, _log_offset, "
+                        + "before.id, before.name, before.amount, "
+                        + "after.id, after.name, after.amount "
+                        + "FROM binlog_test$binlog";
+        CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
+
+        // Test INSERT
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(
+                conn,
+                tablePath,
+                Arrays.asList(row(1, "Item-1", 100L), row(2, "Item-2", 200L)),
+                false);
+
+        // Collect inserts - each INSERT produces one binlog row
+        List<String> insertResults = collectRowsWithTimeout(rowIter, 2, false);
+        assertThat(insertResults).hasSize(2);
+
+        // INSERT: before=null, after=row data
+        // Format: +I[_change_type, _log_offset, before.id, before.name, before.amount,
+        //            after.id, after.name, after.amount]
+        assertThat(insertResults.get(0))
+                .isEqualTo("+I[insert, 0, null, null, null, 1, Item-1, 100]");
+        assertThat(insertResults.get(1))
+                .isEqualTo("+I[insert, 1, null, null, null, 2, Item-2, 200]");
+
+        // Test UPDATE - should merge -U and +U into single binlog row
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Item-1-Updated", 150L)), false);
+
+        // UPDATE produces ONE binlog row (not two like changelog)
+        List<String> updateResults = collectRowsWithTimeout(rowIter, 1, false);
+        assertThat(updateResults).hasSize(1);
+
+        // UPDATE: before=old row, after=new row, offset=from -U record
+        assertThat(updateResults.get(0))
+                .isEqualTo("+I[update, 2, 1, Item-1, 100, 1, Item-1-Updated, 150]");
+
+        // Test DELETE
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        deleteRows(conn, tablePath, Arrays.asList(row(2, "Item-2", 200L)));
+
+        // DELETE produces one binlog row
+        List<String> deleteResults = collectRowsWithTimeout(rowIter, 1, true);
+        assertThat(deleteResults).hasSize(1);
+
+        // DELETE: before=row data, after=null
+        assertThat(deleteResults.get(0))
+                .isEqualTo("+I[delete, 4, 2, Item-2, 200, null, null, null]");
+    }
+
+    @Test
+    public void testBinlogSelectStar() throws Exception {
+        // Test SELECT * which returns the full binlog structure
+        tEnv.executeSql(
+                "CREATE TABLE star_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "star_test");
+
+        String query = "SELECT * FROM star_test$binlog";
+        CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
+
+        // Insert a row
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice")), false);
+
+        List<String> results = collectRowsWithTimeout(rowIter, 1, true);
+        assertThat(results).hasSize(1);
+
+        // SELECT * returns: _change_type, _log_offset, _commit_timestamp, before, after
+        // before is null for INSERT, after contains the row
+        assertThat(results.get(0))
+                .isEqualTo("+I[insert, 0, 1970-01-01T00:00:01Z, null, +I[1, Alice]]");
+    }
+
+    @Test
+    public void testBinlogTopLevelProjection() throws Exception {
+        // Select only the top-level columns _change_type and after (skip _log_offset,
+        // _commit_timestamp and before). The data scan stays full, so the nested after ROW still
+        // carries all original columns.
+        tEnv.executeSql(
+                "CREATE TABLE binlog_projection_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "binlog_projection_test");
+
+        String query = "SELECT _change_type, after FROM binlog_projection_test$binlog";
+
+        // The top-level projection should be pushed into the source scan (assert the exact
+        // pushed projection rather than just the presence of "project=[").
+        assertThat(tEnv.explainSql(query)).contains("project=[_change_type, after]");
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
+
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice", 100L)), false);
+
+        List<String> results = collectRowsWithTimeout(rowIter, 1, true);
+        assertThat(results).hasSize(1);
+        // after ROW retains all data columns even though only two top-level columns are projected.
+        assertThat(results.get(0)).isEqualTo("+I[insert, +I[1, Alice, 100]]");
+        rowIter.close();
+    }
+
+    @Test
+    public void testBinlogReorderedTopLevelProjection() throws Exception {
+        // Reordered top-level projection: after before _change_type, i.e. not in the declared
+        // order of the binlog row. This exercises FlinkSource output projection end to end through
+        // the real planner, which no ascending-order projection test covers.
+        tEnv.executeSql(
+                "CREATE TABLE binlog_reordered_projection_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "binlog_reordered_projection_test");
+
+        String query = "SELECT after, _change_type FROM binlog_reordered_projection_test$binlog";
+        // The planner pushes the reordered projection into the scan as-is (no Calc reorder), so
+        // the source receives the out-of-order indices end to end.
+        assertThat(tEnv.explainSql(query)).contains("project=[after, _change_type]");
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
+
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice", 100L)), false);
+        List<String> insertResult = collectRowsWithTimeout(rowIter, 1, false);
+        assertThat(insertResult).containsExactly("+I[+I[1, Alice, 100], insert]");
+
+        // An update exercises the -U/+U merge together with the reordered projection.
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice", 250L)), false);
+        List<String> updateResult = collectRowsWithTimeout(rowIter, 1, true);
+        assertThat(updateResult).containsExactly("+I[+I[1, Alice, 250], update]");
+    }
+
+    @Test
+    public void testBinlogWithPartitionedTable() throws Exception {
+        // Create a partitioned primary key table
+        tEnv.executeSql(
+                "CREATE TABLE partitioned_binlog_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  region STRING NOT NULL,"
+                        + "  PRIMARY KEY (id, region) NOT ENFORCED"
+                        + ") PARTITIONED BY (region) WITH ('bucket.num' = '1')");
+
+        // Insert data into different partitions using Flink SQL
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        tEnv.executeSql(
+                        "INSERT INTO partitioned_binlog_test VALUES "
+                                + "(1, 'Item-1', 'us'), "
+                                + "(2, 'Item-2', 'eu')")
+                .await();
+
+        // Query binlog with nested field access
+        String query =
+                "SELECT _change_type, after.id, after.name, after.region "
+                        + "FROM partitioned_binlog_test$binlog";
+        CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
+
+        List<String> results = collectRowsWithTimeout(rowIter, 2, false);
+        // Sort results for deterministic assertion (partitions may return in any order)
+        Collections.sort(results);
+        assertThat(results)
+                .isEqualTo(Arrays.asList("+I[insert, 1, Item-1, us]", "+I[insert, 2, Item-2, eu]"));
+
+        // Update a record in a specific partition
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        tEnv.executeSql("INSERT INTO partitioned_binlog_test VALUES (1, 'Item-1-Updated', 'us')")
+                .await();
+
+        List<String> updateResults = collectRowsWithTimeout(rowIter, 1, true);
+        assertThat(updateResults).hasSize(1);
+        assertThat(updateResults.get(0)).isEqualTo("+I[update, 1, Item-1-Updated, us]");
+    }
+
+    @Test
+    public void testBinlogScanStartupMode() throws Exception {
+        // Create a primary key table with 1 bucket
+        tEnv.executeSql(
+                "CREATE TABLE startup_binlog_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "startup_binlog_test");
+
+        // Write first batch
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "v1"), row(2, "v2"), row(3, "v3")), false);
+
+        // Write second batch
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, tablePath, Arrays.asList(row(4, "v4"), row(5, "v5")), false);
+
+        // Test scan.startup.mode='earliest' - should read all records from beginning
+        String optionsEarliest = " /*+ OPTIONS('scan.startup.mode' = 'earliest') */";
+        String queryEarliest =
+                "SELECT _change_type, after.id, after.name FROM startup_binlog_test$binlog"
+                        + optionsEarliest;
+        CloseableIterator<Row> rowIterEarliest = tEnv.executeSql(queryEarliest).collect();
+        List<String> earliestResults = collectRowsWithTimeout(rowIterEarliest, 5, true);
+        assertThat(earliestResults)
+                .isEqualTo(
+                        Arrays.asList(
+                                "+I[insert, 1, v1]",
+                                "+I[insert, 2, v2]",
+                                "+I[insert, 3, v3]",
+                                "+I[insert, 4, v4]",
+                                "+I[insert, 5, v5]"));
+
+        // Test scan.startup.mode='timestamp' - should read from specific timestamp
+        String optionsTimestamp =
+                " /*+ OPTIONS('scan.startup.mode' = 'timestamp', 'scan.startup.timestamp' = '150') */";
+        String queryTimestamp =
+                "SELECT _change_type, after.id, after.name FROM startup_binlog_test$binlog"
+                        + optionsTimestamp;
+        CloseableIterator<Row> rowIterTimestamp = tEnv.executeSql(queryTimestamp).collect();
+        List<String> timestampResults = collectRowsWithTimeout(rowIterTimestamp, 2, true);
+        assertThat(timestampResults)
+                .isEqualTo(Arrays.asList("+I[insert, 4, v4]", "+I[insert, 5, v5]"));
+    }
+
+    @Test
+    public void testBinlogWithLatestScanStartupMode() throws Exception {
+        // Create source and result tables
+        tEnv.executeSql(
+                "CREATE TABLE source_table ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        tEnv.executeSql(
+                "CREATE TABLE result_table ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ")");
+
+        TablePath sourcePath = TablePath.of(DEFAULT_DB, "source_table");
+
+        // Write first batch of data.
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, sourcePath, Arrays.asList(row(1, "v1"), row(2, "v2"), row(3, "v3")), false);
+
+        // Pre-populate the result table with some existing records.
+        String optionsLatest = "/*+ OPTIONS('scan.startup.mode' = 'latest') */";
+        TableResult insertResult =
+                tEnv.executeSql(
+                        "INSERT INTO result_table SELECT after.id, after.name FROM source_table$binlog "
+                                + optionsLatest);
+
+        // Wait for at least one checkpoint to complete before creating savepoint
+        waitForCheckpoint(insertResult.getJobClient().get().getJobID());
+
+        CloseableIterator<Row> rowIterLatest =
+                tEnv.executeSql("SELECT * FROM result_table").collect();
+
+        // now, stop the job with save point
+        String savepointPath =
+                insertResult
+                        .getJobClient()
+                        .get()
+                        .stopWithSavepoint(
+                                false,
+                                savepointDir.getAbsolutePath(),
+                                SavepointFormatType.CANONICAL)
+                        .get(60, TimeUnit.SECONDS);
+
+        // Init env with savepoint Path
+        tEnv = initTableEnvironment(savepointPath);
+        insertResult =
+                tEnv.executeSql(
+                        "INSERT INTO result_table SELECT after.id, after.name FROM source_table$binlog "
+                                + optionsLatest);
+
+        // Write the third batch of data, ensure to get the lastest value
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, sourcePath, Arrays.asList(row(4, "v4"), row(5, "v5")), false);
+
+        // Should contain records from the third batch only
+        List<String> latestResults = collectRowsWithTimeout(rowIterLatest, 2, true);
+        assertThat(latestResults).hasSize(2);
+        assertThat(latestResults).containsExactly("+I[4, v4]", "+I[5, v5]");
+
+        // Cleanup job
+        insertResult.getJobClient().get().cancel().get();
+    }
+
+    private static org.apache.flink.configuration.Configuration getFileBasedCheckpointsConfig(
+            File savepointDir) {
+        return getFileBasedCheckpointsConfig(savepointDir.toURI().toString());
+    }
+
+    private static org.apache.flink.configuration.Configuration getFileBasedCheckpointsConfig(
+            final String savepointDir) {
+        final org.apache.flink.configuration.Configuration config =
+                new org.apache.flink.configuration.Configuration();
+        config.set(StateBackendOptions.STATE_BACKEND, "hashmap");
+        config.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir.toURI().toString());
+        config.set(CheckpointingOptions.FS_SMALL_FILE_THRESHOLD, MemorySize.ZERO);
+        config.set(CheckpointingOptions.SAVEPOINT_DIRECTORY, savepointDir);
+        return config;
+    }
+
+    protected static void waitForCheckpoint(JobID jobId) {
+        String jobIdStr = jobId.toHexString();
+        waitUntil(
+                () -> {
+                    File jobCheckpointDir = new File(checkpointDir, jobIdStr);
+                    if (!jobCheckpointDir.exists()) {
+                        return false;
+                    }
+                    File[] checkpoints =
+                            jobCheckpointDir.listFiles(
+                                    f -> f.isDirectory() && f.getName().startsWith("chk-"));
+                    return checkpoints != null && checkpoints.length > 0;
+                },
+                Duration.ofSeconds(60),
+                "Timeout waiting for checkpoint for job " + jobIdStr);
+    }
+
+    @Test
+    public void testBinlogBoundedRead() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE bounded_binlog_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded_binlog_test");
+
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Item-1"), row(2, "Item-2")), false);
+        // the update produces an update_before/update_after pair in the log
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Item-1-Updated")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        long boundedTimestamp = CLOCK.milliseconds();
+        // records written at or after the bounded timestamp are not read
+        writeRows(conn, tablePath, Arrays.asList(row(2, "Item-2-Updated")), false);
+
+        // The stopping offsets are aligned to record batch boundaries, and the update_before/
+        // update_after pair of a single update is always written in one record batch, so the
+        // pair is never split apart by the stopping offset: the last update is either fully
+        // included (merged into one binlog row) or fully excluded.
+        String query =
+                "SELECT _change_type, before.id, before.name, after.id, after.name "
+                        + "FROM bounded_binlog_test$binlog "
+                        + String.format(
+                                "/*+ OPTIONS('scan.bounded.mode' = 'timestamp', "
+                                        + "'scan.bounded.timestamp' = '%d') */",
+                                boundedTimestamp);
+        try (CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect()) {
+            assertThat(collectBatchRows(rowIter))
+                    .containsExactly(
+                            "+I[insert, null, null, 1, Item-1]",
+                            "+I[insert, null, null, 2, Item-2]",
+                            "+I[update, 1, Item-1, 1, Item-1-Updated]");
+        }
+    }
+}

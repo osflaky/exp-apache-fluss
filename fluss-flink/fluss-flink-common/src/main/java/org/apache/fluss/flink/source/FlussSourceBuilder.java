@@ -1,0 +1,499 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.source;
+
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.initializer.LatestOffsetsInitializer;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
+import org.apache.fluss.client.initializer.OffsetsInitializer;
+import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
+import org.apache.fluss.client.initializer.TimestampOffsetsInitializer;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.FlinkConnectorOptions;
+import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
+import org.apache.fluss.flink.utils.LakeSourceUtils;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.predicate.Predicate;
+import org.apache.fluss.types.RowType;
+
+import org.apache.flink.api.connector.source.Boundedness;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+
+import static org.apache.flink.util.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+
+/**
+ * Builder class for creating {@link FlussSource} instances.
+ *
+ * <p>The builder allows for step-by-step configuration of a Fluss source connector. It handles the
+ * setup of connection parameters, table metadata retrieval, and source configuration.
+ *
+ * <p>Sample usage:
+ *
+ * <pre>{@code
+ * FlussSource<Order> source = FlussSource.<Order>builder()
+ *     .setBootstrapServers("localhost:9092")
+ *     .setDatabase("mydb")
+ *     .setTable("orders")
+ *     .setProjectedFields("orderId", "amount")
+ *     .setScanPartitionDiscoveryIntervalMs(1000L)
+ *     .setStartingOffsets(OffsetsInitializer.earliest())
+ *     .setDeserializationSchema(new OrderDeserializationSchema())
+ *     .build();
+ * }</pre>
+ *
+ * <p>When the target table has datalake enabled and the source starts in full mode (the default,
+ * {@link OffsetsInitializer#full()}), the built source performs a union read: it reads the
+ * historical data tiered to the lake (e.g. Iceberg, Paimon) together with the real-time data still
+ * in Fluss. Other startup modes (earliest/latest/timestamp) read data from Fluss only.
+ *
+ * @param <OUT> The type of records produced by the source being built
+ */
+public class FlussSourceBuilder<OUT> {
+    private static final Logger LOG = LoggerFactory.getLogger(FlussSourceBuilder.class);
+
+    private Configuration flussConf;
+
+    private int[] projectedFields;
+    private String[] projectedFieldNames;
+    private Predicate logRecordBatchFilter;
+    private Long scanPartitionDiscoveryIntervalMs;
+    private Integer splitPerAssignmentBatchSize;
+    private OffsetsInitializer offsetsInitializer;
+    @Nullable private OffsetsInitializer stoppingOffsetsInitializer;
+
+    // Selects the Fluss batch-read path independently from the configured offset range. The
+    // deprecated no-argument setBounded() is retained as a compatibility alias for setBatch().
+    private boolean isBatch;
+    private FlussDeserializationSchema<OUT> deserializationSchema;
+
+    private String bootstrapServers;
+
+    private String database;
+    private String tableName;
+
+    /**
+     * Sets the bootstrap servers for the Fluss source connection.
+     *
+     * <p>This is a required parameter.
+     *
+     * @param bootstrapServers bootstrap server addresses
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setBootstrapServers(String bootstrapServers) {
+        this.bootstrapServers = bootstrapServers;
+        return this;
+    }
+
+    /**
+     * Sets the database name for the Fluss source.
+     *
+     * <p>This is a required parameter.
+     *
+     * @param database name of the database
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setDatabase(String database) {
+        this.database = database;
+        return this;
+    }
+
+    /**
+     * Sets the table name for the Fluss source.
+     *
+     * <p>This is a required parameter.
+     *
+     * @param table name of the table
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setTable(String table) {
+        this.tableName = table;
+        return this;
+    }
+
+    /**
+     * Sets the scan partition discovery interval in milliseconds.
+     *
+     * <p>If not specified, the default value from {@link
+     * FlinkConnectorOptions#SCAN_PARTITION_DISCOVERY_INTERVAL} is used.
+     *
+     * @param scanPartitionDiscoveryIntervalMs interval in milliseconds
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setScanPartitionDiscoveryIntervalMs(
+            long scanPartitionDiscoveryIntervalMs) {
+        this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
+        return this;
+    }
+
+    /**
+     * Sets the maximum number of splits assigned to a reader in one assignment request.
+     *
+     * <p>If not specified, the default value from {@link
+     * FlinkConnectorOptions#SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE} is used.
+     *
+     * @param splitPerAssignmentBatchSize maximum splits per assignment request
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setSplitPerAssignmentBatchSize(int splitPerAssignmentBatchSize) {
+        this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
+        return this;
+    }
+
+    /**
+     * Sets the starting offsets strategy for the Fluss source.
+     *
+     * <p>If not specified, {@link OffsetsInitializer#full()} is used by default.
+     *
+     * @param offsetsInitializer the strategy for determining starting offsets
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setStartingOffsets(OffsetsInitializer offsetsInitializer) {
+        this.offsetsInitializer = offsetsInitializer;
+        return this;
+    }
+
+    /**
+     * Configures the source to use the Fluss batch-read path. If no stopping offsets are configured
+     * through {@link #setStoppingOffsets(OffsetsInitializer)}, the source reads up to the latest
+     * offsets captured at startup. Without explicit stopping offsets, combining batch mode with the
+     * default {@link OffsetsInitializer#full()} on a datalake-enabled table performs a bounded
+     * union read of the lake snapshot and the Fluss log.
+     *
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setBatch() {
+        this.isBatch = true;
+        return this;
+    }
+
+    /**
+     * Configures the source to use the Fluss batch-read path.
+     *
+     * <p>This deprecated method is retained for compatibility and is equivalent to {@link
+     * #setBatch()}.
+     *
+     * @return this builder
+     * @deprecated This method configures a batch read, not stopping offsets. Use {@link
+     *     #setBatch()} for batch reads.
+     */
+    @Deprecated
+    public FlussSourceBuilder<OUT> setBounded() {
+        return setBatch();
+    }
+
+    /**
+     * Sets the stopping offsets strategy for the Fluss source. In streaming mode, configuring
+     * stopping offsets makes the source bounded. In batch mode, it overrides the default latest
+     * stopping offsets for log-table reads.
+     *
+     * <p>Supported stopping offsets initializers are {@link OffsetsInitializer#latest()} and {@link
+     * OffsetsInitializer#timestamp(long)}.
+     *
+     * @param stoppingOffsetsInitializer the strategy for determining the stopping offsets
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setStoppingOffsets(
+            OffsetsInitializer stoppingOffsetsInitializer) {
+        OffsetsInitializer checkedStoppingOffsetsInitializer =
+                checkNotNull(
+                        stoppingOffsetsInitializer, "stoppingOffsetsInitializer must not be null");
+        checkArgument(
+                checkedStoppingOffsetsInitializer instanceof LatestOffsetsInitializer
+                        || checkedStoppingOffsetsInitializer instanceof TimestampOffsetsInitializer,
+                "Only OffsetsInitializer.latest() and OffsetsInitializer.timestamp(...) are "
+                        + "supported as stopping offsets, but was %s.",
+                checkedStoppingOffsetsInitializer.getClass().getName());
+        this.stoppingOffsetsInitializer = checkedStoppingOffsetsInitializer;
+        return this;
+    }
+
+    /**
+     * Sets the deserialization schema for converting Fluss records to output records.
+     *
+     * <p>This is a required parameter.
+     *
+     * @param deserializationSchema the deserialization schema to use
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setDeserializationSchema(
+            FlussDeserializationSchema<OUT> deserializationSchema) {
+        this.deserializationSchema = deserializationSchema;
+        return this;
+    }
+
+    /**
+     * Sets the projected fields for this source using field names.
+     *
+     * <p>Projection allows selecting a subset of fields from the table. Without projection, all
+     * fields from the table are included.
+     *
+     * @param projectedFieldNames names of the fields to project
+     * @return this builder
+     * @throws NullPointerException if projectedFieldNames is null
+     */
+    public FlussSourceBuilder<OUT> setProjectedFields(String... projectedFieldNames) {
+        checkNotNull(projectedFieldNames, "Field names must not be null");
+        this.projectedFieldNames = projectedFieldNames;
+        return this;
+    }
+
+    /**
+     * Sets the filter predicate for server-side record batch filtering based on column statistics.
+     *
+     * <p>The predicate is evaluated against per-batch column statistics (min/max values) to skip
+     * entire record batches that cannot contain matching rows.
+     *
+     * @param filter the predicate to filter record batches
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setFilter(Predicate filter) {
+        checkNotNull(filter, "filter must not be null");
+        this.logRecordBatchFilter = filter;
+        return this;
+    }
+
+    /**
+     * Sets custom Fluss configuration properties for the source connector.
+     *
+     * <p>If not specified, an empty configuration will be created and populated with required
+     * properties. Any configuration set through this method will be merged with table-specific
+     * properties retrieved from the Fluss system.
+     *
+     * @param flussConf the configuration to use
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setFlussConfig(Configuration flussConf) {
+        this.flussConf = flussConf;
+        return this;
+    }
+
+    /**
+     * Builds and returns a new {@link FlussSource} instance with the configured properties.
+     *
+     * <p>This method validates all required parameters, connects to the Fluss system to retrieve
+     * table metadata, and constructs a configured source.
+     *
+     * @return a new {@link FlussSource} instance
+     * @throws NullPointerException if any required parameter is missing
+     * @throws IllegalArgumentException if any parameter is invalid
+     * @throws RuntimeException if connection to Fluss fails or the table cannot be found
+     */
+    public FlussSource<OUT> build() {
+        checkNotNull(bootstrapServers, "BootstrapServers is required but not provided.");
+        checkNotNull(database, "Database is required but not provided.");
+        if (database.isEmpty()) {
+            throw new IllegalArgumentException("Database must not be empty.");
+        }
+        checkNotNull(tableName, "TableName is required but not provided.");
+        if (tableName.isEmpty()) {
+            throw new IllegalArgumentException("TableName must not be empty.");
+        }
+        checkNotNull(deserializationSchema, "Deserialization schema is required but not provided.");
+
+        // if null use the default value:
+        if (offsetsInitializer == null) {
+            offsetsInitializer = OffsetsInitializer.full();
+        }
+
+        boolean hasExplicitStoppingOffsets = stoppingOffsetsInitializer != null;
+        OffsetsInitializer effectiveStoppingOffsetsInitializer =
+                hasExplicitStoppingOffsets
+                        ? stoppingOffsetsInitializer
+                        : isBatch
+                                ? OffsetsInitializer.latest()
+                                : new NoStoppingOffsetsInitializer();
+        Boundedness effectiveBoundedness =
+                isBatch || hasExplicitStoppingOffsets
+                        ? Boundedness.BOUNDED
+                        : Boundedness.CONTINUOUS_UNBOUNDED;
+
+        // if null use the default value:
+        if (scanPartitionDiscoveryIntervalMs == null) {
+            scanPartitionDiscoveryIntervalMs =
+                    FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL
+                            .defaultValue()
+                            .toMillis();
+        }
+        if (splitPerAssignmentBatchSize == null) {
+            splitPerAssignmentBatchSize =
+                    FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue();
+        }
+
+        if (this.flussConf == null) {
+            this.flussConf = new Configuration();
+        }
+
+        TablePath tablePath = new TablePath(this.database, this.tableName);
+        this.flussConf.setString(ConfigOptions.BOOTSTRAP_SERVERS.key(), bootstrapServers);
+        TableInfo tableInfo;
+        try (Connection connection = ConnectionFactory.createConnection(flussConf);
+                Admin admin = connection.getAdmin()) {
+            try {
+                tableInfo = admin.getTableInfo(tablePath).get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while getting table info", e);
+            } catch (ExecutionException e) {
+                throw new RuntimeException("Failed to get table info", e);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to initialize FlussSource admin connection: " + e.getMessage(), e);
+        }
+
+        if (this.projectedFieldNames != null && this.projectedFieldNames.length > 0) {
+            RowType rowType = tableInfo.getRowType();
+            List<String> allFieldNames = rowType.getFieldNames();
+
+            // Create a map of field name to index
+            Map<String, Integer> fieldNameToIndex = new HashMap<>();
+            for (int i = 0; i < allFieldNames.size(); i++) {
+                fieldNameToIndex.put(allFieldNames.get(i), i);
+            }
+
+            int[] indices = new int[projectedFieldNames.length];
+            for (int i = 0; i < projectedFieldNames.length; i++) {
+                String fieldName = projectedFieldNames[i];
+                Integer index = fieldNameToIndex.get(fieldName);
+
+                if (index == null) {
+                    throw new IllegalArgumentException(
+                            "Field name '"
+                                    + fieldName
+                                    + "' not found in table schema. "
+                                    + "Available fields: "
+                                    + String.join(", ", allFieldNames));
+                }
+
+                indices[i] = index;
+            }
+
+            this.projectedFields = indices;
+        }
+
+        flussConf.addAll(tableInfo.getCustomProperties());
+        flussConf.addAll(tableInfo.getProperties());
+
+        boolean isPartitioned = !tableInfo.getPartitionKeys().isEmpty();
+        boolean hasPrimaryKey = !tableInfo.getPrimaryKeys().isEmpty();
+
+        RowType sourceOutputType =
+                projectedFields != null
+                        ? tableInfo.getRowType().project(projectedFields)
+                        : tableInfo.getRowType();
+
+        // union read (lake historical + Fluss) only applies to full startup mode, like the SQL
+        // connector; other startup modes read Fluss only.
+        boolean lakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
+        boolean fullStartup = offsetsInitializer instanceof SnapshotOffsetsInitializer;
+
+        // Explicit stopping offsets support:
+        //  - Log tables and the changelog of primary key tables (earliest/latest/timestamp
+        //    startup mode) are supported.
+        //  - Batch reads of primary key tables do not support explicit stopping offsets.
+        //  - The full startup mode of primary key tables is not supported, because the snapshot
+        //    reading phase has no bounded end.
+        //  - The datalake union read (full startup mode on a datalake-enabled table) is not
+        //    supported, because lake splits have no bounded end.
+        if (hasExplicitStoppingOffsets) {
+            if (isBatch && hasPrimaryKey) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Batch read on primary-key table '%s' does not support explicit "
+                                        + "stopping offsets. Remove setStoppingOffsets(...); "
+                                        + "primary-key batch reads require full startup mode and "
+                                        + "stop at the latest offsets captured at startup.",
+                                tablePath));
+            }
+            if (hasPrimaryKey && fullStartup) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Explicit stopping offsets on primary key table '%s' are not "
+                                        + "supported in full startup mode, because the snapshot "
+                                        + "reading phase has no bounded end. Use "
+                                        + "earliest/latest/timestamp starting offsets to read "
+                                        + "the changelog with a bounded end.",
+                                tablePath));
+            }
+            if (lakeEnabled && fullStartup) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Explicit stopping offsets on datalake-enabled table '%s' are not "
+                                        + "supported in full startup mode (datalake union read). "
+                                        + "Use earliest/latest/timestamp starting offsets to read "
+                                        + "only the Fluss log with a bounded end.",
+                                tablePath));
+            }
+        }
+
+        LakeSource<LakeSplit> lakeSource = null;
+        if (lakeEnabled && fullStartup) {
+            lakeSource =
+                    LakeSourceUtils.createLakeSource(tablePath, tableInfo.getProperties().toMap());
+            if (lakeSource != null) {
+                if (projectedFields != null) {
+                    int[][] nestedProjectedFields = new int[projectedFields.length][];
+                    for (int i = 0; i < projectedFields.length; i++) {
+                        nestedProjectedFields[i] = new int[] {projectedFields[i]};
+                    }
+                    lakeSource.withProject(nestedProjectedFields);
+                }
+                // push the record-batch filter to the lake side as well,
+                // so the historical lake scan is filtered consistently with Fluss.
+                if (logRecordBatchFilter != null) {
+                    lakeSource.withFilters(Collections.singletonList(logRecordBatchFilter));
+                }
+            }
+        }
+
+        LOG.info("Creating Fluss Source with Configuration: {}", flussConf);
+
+        return new FlussSource<>(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                effectiveStoppingOffsetsInitializer,
+                effectiveBoundedness,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                deserializationSchema,
+                !isBatch,
+                lakeSource);
+    }
+}

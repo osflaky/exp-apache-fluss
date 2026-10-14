@@ -1,0 +1,1982 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.coordinator;
+
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.ServerType;
+import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.cluster.rebalance.GoalType;
+import org.apache.fluss.cluster.rebalance.ServerTag;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.cluster.AlterConfig;
+import org.apache.fluss.config.cluster.AlterConfigOpType;
+import org.apache.fluss.exception.ApiException;
+import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidCoordinatorException;
+import org.apache.fluss.exception.InvalidDatabaseException;
+import org.apache.fluss.exception.InvalidPartitionException;
+import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.LakeTableAlreadyExistException;
+import org.apache.fluss.exception.NonPrimaryKeyTableException;
+import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.exception.SecurityDisabledException;
+import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.exception.TableNotPartitionedException;
+import org.apache.fluss.exception.UnknownServerException;
+import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.committer.TieringStats;
+import org.apache.fluss.lake.lakestorage.LakeCatalog;
+import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.DatabaseChange;
+import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.DeleteBehavior;
+import org.apache.fluss.metadata.LakeTableUtil;
+import org.apache.fluss.metadata.MergeEngineType;
+import org.apache.fluss.metadata.PartitionSpec;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableChange;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePartition;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddServerTagByRackRequest;
+import org.apache.fluss.rpc.messages.AddServerTagByRackResponse;
+import org.apache.fluss.rpc.messages.AddServerTagRequest;
+import org.apache.fluss.rpc.messages.AddServerTagResponse;
+import org.apache.fluss.rpc.messages.AdjustIsrRequest;
+import org.apache.fluss.rpc.messages.AdjustIsrResponse;
+import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
+import org.apache.fluss.rpc.messages.AlterClusterConfigsResponse;
+import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
+import org.apache.fluss.rpc.messages.AlterDatabaseResponse;
+import org.apache.fluss.rpc.messages.AlterTableRequest;
+import org.apache.fluss.rpc.messages.AlterTableResponse;
+import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
+import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
+import org.apache.fluss.rpc.messages.CommitRemoteLogManifestResponse;
+import org.apache.fluss.rpc.messages.ControlledShutdownRequest;
+import org.apache.fluss.rpc.messages.ControlledShutdownResponse;
+import org.apache.fluss.rpc.messages.CreateAclsRequest;
+import org.apache.fluss.rpc.messages.CreateAclsResponse;
+import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
+import org.apache.fluss.rpc.messages.CreateDatabaseResponse;
+import org.apache.fluss.rpc.messages.CreatePartitionRequest;
+import org.apache.fluss.rpc.messages.CreatePartitionResponse;
+import org.apache.fluss.rpc.messages.CreateTableRequest;
+import org.apache.fluss.rpc.messages.CreateTableResponse;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.DropAclsRequest;
+import org.apache.fluss.rpc.messages.DropAclsResponse;
+import org.apache.fluss.rpc.messages.DropDatabaseRequest;
+import org.apache.fluss.rpc.messages.DropDatabaseResponse;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.DropPartitionRequest;
+import org.apache.fluss.rpc.messages.DropPartitionResponse;
+import org.apache.fluss.rpc.messages.DropTableRequest;
+import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
+import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
+import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsRequest;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressRequest;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsRequest;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
+import org.apache.fluss.rpc.messages.MetadataRequest;
+import org.apache.fluss.rpc.messages.MetadataResponse;
+import org.apache.fluss.rpc.messages.PbAlterConfig;
+import org.apache.fluss.rpc.messages.PbHeartbeatReqForTable;
+import org.apache.fluss.rpc.messages.PbHeartbeatRespForTable;
+import org.apache.fluss.rpc.messages.PbKvSnapshotLeaseForTable;
+import org.apache.fluss.rpc.messages.PbLakeTieringStats;
+import org.apache.fluss.rpc.messages.PbPrepareLakeTableRespForTable;
+import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
+import org.apache.fluss.rpc.messages.PbTableBucket;
+import org.apache.fluss.rpc.messages.PbTableOffsets;
+import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.RebalanceRequest;
+import org.apache.fluss.rpc.messages.RebalanceResponse;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagByRackRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagByRackResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.netty.server.Session;
+import org.apache.fluss.rpc.protocol.ApiError;
+import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.security.acl.AclBinding;
+import org.apache.fluss.security.acl.AclBindingFilter;
+import org.apache.fluss.security.acl.FlussPrincipal;
+import org.apache.fluss.security.acl.OperationType;
+import org.apache.fluss.security.acl.Resource;
+import org.apache.fluss.server.DynamicConfigManager;
+import org.apache.fluss.server.RpcServiceBase;
+import org.apache.fluss.server.authorizer.AclCreateResult;
+import org.apache.fluss.server.authorizer.AclDeleteResult;
+import org.apache.fluss.server.authorizer.Authorizer;
+import org.apache.fluss.server.coordinator.event.AccessContextEvent;
+import org.apache.fluss.server.coordinator.event.AddServerTagByRackEvent;
+import org.apache.fluss.server.coordinator.event.AddServerTagEvent;
+import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
+import org.apache.fluss.server.coordinator.event.CancelRebalanceEvent;
+import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
+import org.apache.fluss.server.coordinator.event.CommitLakeTableSnapshotEvent;
+import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
+import org.apache.fluss.server.coordinator.event.ControlledShutdownEvent;
+import org.apache.fluss.server.coordinator.event.EventManager;
+import org.apache.fluss.server.coordinator.event.ListRebalanceProgressEvent;
+import org.apache.fluss.server.coordinator.event.RebalanceEvent;
+import org.apache.fluss.server.coordinator.event.RemoveServerTagByRackEvent;
+import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseHandler;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
+import org.apache.fluss.server.coordinator.producer.ProducerOffsetsManager;
+import org.apache.fluss.server.coordinator.rebalance.goal.Goal;
+import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
+import org.apache.fluss.server.entity.CommitKvSnapshotData;
+import org.apache.fluss.server.entity.DatabasePropertyChanges;
+import org.apache.fluss.server.entity.LakeTieringTableInfo;
+import org.apache.fluss.server.entity.TablePropertyChanges;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
+import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
+import org.apache.fluss.server.metadata.CoordinatorMetadataProvider;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.ZooKeeperClient.TableBucketAndManifest;
+import org.apache.fluss.server.zk.data.BucketAssignment;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.lake.LakeTable;
+import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
+import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.concurrent.FutureUtils;
+import org.apache.fluss.utils.json.TableBucketOffsets;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
+import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindingFilters;
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindings;
+import static org.apache.fluss.server.coordinator.rebalance.goal.GoalUtils.getGoalByType;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.addTableOffsetsToResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.fromTablePath;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAcquireKvSnapshotLeaseData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitLakeTableSnapshotData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitRemoteLogManifestData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getPartitionSpec;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getReleaseKvSnapshotLeaseData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.groupOffsetsByTableId;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAcquireKvSnapshotLeaseResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeCreateAclsResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeDropAclsResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeListRemoteLogManifestsResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toAlterTableConfigChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toAlterTableDistributionChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toAlterTableSchemaChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toDatabaseChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableBucketOffsets;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTablePath;
+import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
+import static org.apache.fluss.utils.PartitionUtils.validateAutoPartitionTime;
+import static org.apache.fluss.utils.PartitionUtils.validatePartitionSpec;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+
+/** An RPC Gateway service for coordinator server. */
+public final class CoordinatorService extends RpcServiceBase implements CoordinatorGateway {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CoordinatorService.class);
+    private static final String SECURITY_CONFIG_KEY_PREFIX = "security.";
+
+    private final int defaultBucketNumber;
+    private final int defaultReplicationFactor;
+    private final boolean logTableAllowCreation;
+    private final boolean kvTableAllowCreation;
+    private final Supplier<EventManager> eventManagerSupplier;
+    private final Supplier<Integer> coordinatorEpochSupplier;
+    private final Supplier<Integer> coordinatorZkVersionSupplier;
+    private final CoordinatorMetadataCache metadataCache;
+
+    private final Supplier<CompletedSnapshotStoreManager> snapshotStoreManagerSupplier;
+    private final LakeTableTieringManager lakeTableTieringManager;
+    private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
+    private final ExecutorService ioExecutor;
+    private final LakeTableHelper lakeTableHelper;
+    private final ProducerOffsetsManager producerOffsetsManager;
+    private final KvSnapshotLeaseManager kvSnapshotLeaseManager;
+    private final CoordinatorLeaderElection coordinatorLeaderElection;
+    private final RemoteDirDynamicLoader remoteDirDynamicLoader;
+    private final ReplicaCapacityController replicaCapacityController;
+
+    public CoordinatorService(
+            Configuration conf,
+            FileSystem remoteFileSystem,
+            ZooKeeperClient zkClient,
+            Supplier<CoordinatorEventProcessor> coordinatorEventProcessorSupplier,
+            CoordinatorMetadataCache metadataCache,
+            MetadataManager metadataManager,
+            @Nullable Authorizer authorizer,
+            LakeCatalogDynamicLoader lakeCatalogDynamicLoader,
+            LakeTableTieringManager lakeTableTieringManager,
+            RemoteDirDynamicLoader remoteDirDynamicLoader,
+            DynamicConfigManager dynamicConfigManager,
+            ExecutorService ioExecutor,
+            KvSnapshotLeaseManager kvSnapshotLeaseManager,
+            CoordinatorLeaderElection coordinatorLeaderElection,
+            ReplicaCapacityController replicaCapacityController) {
+        super(
+                remoteFileSystem,
+                ServerType.COORDINATOR,
+                zkClient,
+                metadataManager,
+                authorizer,
+                dynamicConfigManager,
+                ioExecutor);
+        this.defaultBucketNumber = conf.getInt(ConfigOptions.DEFAULT_BUCKET_NUMBER);
+        this.defaultReplicationFactor = conf.getInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR);
+        this.logTableAllowCreation = conf.getBoolean(ConfigOptions.LOG_TABLE_ALLOW_CREATION);
+        this.kvTableAllowCreation = conf.getBoolean(ConfigOptions.KV_TABLE_ALLOW_CREATION);
+        this.eventManagerSupplier =
+                () -> coordinatorEventProcessorSupplier.get().getCoordinatorEventManager();
+        this.coordinatorEpochSupplier =
+                () -> coordinatorEventProcessorSupplier.get().getCoordinatorEpoch();
+        this.coordinatorZkVersionSupplier =
+                () -> coordinatorEventProcessorSupplier.get().getCoordinatorZkVersion();
+        this.snapshotStoreManagerSupplier =
+                () -> coordinatorEventProcessorSupplier.get().completedSnapshotStoreManager();
+        this.lakeTableTieringManager = lakeTableTieringManager;
+        this.metadataCache = metadataCache;
+        this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
+        this.ioExecutor = ioExecutor;
+        this.lakeTableHelper =
+                new LakeTableHelper(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR));
+        this.remoteDirDynamicLoader = remoteDirDynamicLoader;
+
+        // Initialize and start the producer snapshot manager
+        this.producerOffsetsManager = new ProducerOffsetsManager(conf, zkClient);
+        this.producerOffsetsManager.start();
+
+        this.kvSnapshotLeaseManager = kvSnapshotLeaseManager;
+        this.coordinatorLeaderElection = coordinatorLeaderElection;
+        this.replicaCapacityController = replicaCapacityController;
+    }
+
+    @Override
+    public String name() {
+        return "coordinator";
+    }
+
+    @Override
+    public boolean isLeader() {
+        return coordinatorLeaderElection.isLeader();
+    }
+
+    @Override
+    public void shutdown() {
+        IOUtils.closeQuietly(producerOffsetsManager, "producer snapshot manager");
+        IOUtils.closeQuietly(lakeCatalogDynamicLoader, "lake catalog");
+    }
+
+    @Override
+    public void authorizeTable(OperationType operationType, long tableId) {
+        if (authorizer != null) {
+            authorizeTableWithSession(currentSession(), operationType, tableId);
+        }
+    }
+
+    /**
+     * Authorize table access with an explicitly provided session.
+     *
+     * <p>This method is used for async operations where the session must be captured before
+     * entering the async block, since currentSession() relies on thread-local storage.
+     */
+    private void authorizeTableWithSession(
+            Session session, OperationType operationType, long tableId) {
+        TablePath tablePath = getTablePathById(tableId);
+        authorizer.authorize(session, operationType, Resource.table(tablePath));
+    }
+
+    private TablePath getTablePathById(long tableId) {
+        TablePath tablePath;
+        try {
+            // TODO: this will block on the coordinator event thread, consider refactor
+            //  CoordinatorMetadataCache to hold the mapping of table_id to table_path, and then
+            //  we don't need this async request.
+            AccessContextEvent<TablePath> getTablePathEvent =
+                    new AccessContextEvent<>(ctx -> ctx.getTablePathById(tableId));
+            eventManagerSupplier.get().put(getTablePathEvent);
+            tablePath = getTablePathEvent.getResultFuture().get();
+        } catch (Exception e) {
+            throw new UnknownServerException("Failed to get table path by ID " + tableId, e);
+        }
+
+        if (tablePath == null) {
+            throw new UnknownTableOrBucketException(
+                    String.format(
+                            "This server %s does not know this table ID %s. This may happen when the table "
+                                    + "metadata cache in the server is not updated yet.",
+                            name(), tableId));
+        }
+        return tablePath;
+    }
+
+    @Override
+    protected TableInfo getTableInfo(long tableId) {
+        TablePath tablePath = getTablePathById(tableId);
+        return metadataManager.getTable(tablePath);
+    }
+
+    private TableInfo validateKvTable(long tableId) {
+        TablePath tablePath = getTablePathById(tableId);
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        if (!tableInfo.hasPrimaryKey()) {
+            throw new NonPrimaryKeyTableException(
+                    "Table '" + tablePath + "' is not a primary key table");
+        }
+        return tableInfo;
+    }
+
+    @Override
+    public CompletableFuture<CreateDatabaseResponse> createDatabase(CreateDatabaseRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.CREATE, Resource.cluster());
+        }
+
+        CreateDatabaseResponse response = new CreateDatabaseResponse();
+        try {
+            TablePath.validateDatabaseName(request.getDatabaseName());
+        } catch (InvalidDatabaseException e) {
+            return FutureUtils.completedExceptionally(e);
+        }
+
+        DatabaseDescriptor databaseDescriptor;
+        if (request.getDatabaseJson() != null) {
+            databaseDescriptor = DatabaseDescriptor.fromJsonBytes(request.getDatabaseJson());
+        } else {
+            databaseDescriptor = DatabaseDescriptor.builder().build();
+        }
+        metadataManager.createDatabase(
+                request.getDatabaseName(), databaseDescriptor, request.isIgnoreIfExists());
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<AlterDatabaseResponse> alterDatabase(AlterDatabaseRequest request) {
+        String databaseName = request.getDatabaseName();
+        if (authorizer != null) {
+            authorizer.authorize(
+                    currentSession(), OperationType.ALTER, Resource.database(databaseName));
+        }
+
+        List<DatabaseChange> databaseChanges = toDatabaseChanges(request);
+        DatabasePropertyChanges databasePropertyChanges =
+                toDatabasePropertyChanges(databaseChanges);
+
+        metadataManager.alterDatabaseProperties(
+                databaseName, databasePropertyChanges, request.isIgnoreIfNotExists());
+
+        return CompletableFuture.completedFuture(new AlterDatabaseResponse());
+    }
+
+    private DatabasePropertyChanges toDatabasePropertyChanges(
+            List<DatabaseChange> databaseChanges) {
+        DatabasePropertyChanges.Builder builder = DatabasePropertyChanges.builder();
+        if (databaseChanges.isEmpty()) {
+            return builder.build();
+        }
+
+        for (DatabaseChange databaseChange : databaseChanges) {
+            if (databaseChange instanceof DatabaseChange.SetOption) {
+                DatabaseChange.SetOption setOption = (DatabaseChange.SetOption) databaseChange;
+                builder.setCustomProperty(setOption.getKey(), setOption.getValue());
+            } else if (databaseChange instanceof DatabaseChange.ResetOption) {
+                DatabaseChange.ResetOption resetOption =
+                        (DatabaseChange.ResetOption) databaseChange;
+                builder.resetCustomProperty(resetOption.getKey());
+            } else if (databaseChange instanceof DatabaseChange.UpdateComment) {
+                DatabaseChange.UpdateComment updateComment =
+                        (DatabaseChange.UpdateComment) databaseChange;
+                builder.setComment(updateComment.getComment());
+            }
+        }
+        return builder.build();
+    }
+
+    @Override
+    public CompletableFuture<DropDatabaseResponse> dropDatabase(DropDatabaseRequest request) {
+        authorizeDatabase(OperationType.DROP, request.getDatabaseName());
+        DropDatabaseResponse response = new DropDatabaseResponse();
+        metadataManager.dropDatabase(
+                request.getDatabaseName(), request.isIgnoreIfNotExists(), request.isCascade());
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<CreateTableResponse> createTable(CreateTableRequest request) {
+        TablePath tablePath = toTablePath(request.getTablePath());
+        tablePath.validate();
+        authorizeDatabase(OperationType.CREATE, tablePath.getDatabaseName());
+
+        TableDescriptor tableDescriptor;
+        try {
+            tableDescriptor = TableDescriptor.fromJsonBytes(request.getTableJson());
+        } catch (Exception e) {
+            if (e instanceof UncheckedIOException) {
+                throw new InvalidTableException(
+                        "Failed to parse table descriptor: " + e.getMessage(), e);
+            } else {
+                // wrap the validate message to InvalidTableException
+                throw new InvalidTableException(e.getMessage(), e);
+            }
+        }
+
+        LakeCatalogDynamicLoader.LakeCatalogContainer lakeCatalogContainer =
+                lakeCatalogDynamicLoader.getLakeCatalogContainer();
+
+        // Check table creation permissions based on table type
+        validateTableCreationPermission(tableDescriptor, tablePath);
+
+        // apply system defaults if the config is not set
+        tableDescriptor = applySystemDefaults(tableDescriptor, lakeCatalogContainer);
+
+        // validate table descriptor before creating table in lake or fluss metadata,
+        // to avoid orphaned lake tables when validation fails
+        metadataManager.validateTableDescriptor(tableDescriptor);
+
+        // the distribution and bucket count must be set now
+        //noinspection OptionalGetWithoutIsPresent
+        int bucketCount = tableDescriptor.getTableDistribution().get().getBucketCount().get();
+        long newKvLeaderReplicaCount = getNewKvLeaderReplicaCount(tableDescriptor);
+
+        // first, generate the assignment
+        TableAssignment tableAssignment = null;
+        // only when it's no partitioned table do we generate the assignment for it
+        if (!tableDescriptor.isPartitioned()) {
+            // the replication factor must be set now
+            int replicaFactor = tableDescriptor.getReplicationFactor();
+            TabletServerInfo[] servers = metadataCache.getLiveServers();
+            tableAssignment = generateAssignment(bucketCount, replicaFactor, servers);
+        }
+
+        if (request.isIgnoreIfExists() && metadataManager.tableExists(tablePath)) {
+            return CompletableFuture.completedFuture(new CreateTableResponse());
+        }
+
+        replicaCapacityController.checkCanCreateKvLeaderReplicas(newKvLeaderReplicaCount);
+
+        // before create table in fluss, we may create in lake
+        if (isDataLakeEnabled(tableDescriptor)) {
+            TablePath lakeTablePath =
+                    LakeTableUtil.resolveLakeTablePath(
+                            tablePath, Configuration.fromMap(tableDescriptor.getProperties()));
+            try {
+                checkNotNull(lakeCatalogContainer.getLakeCatalog())
+                        .createTable(
+                                lakeTablePath,
+                                tableDescriptor,
+                                new DefaultLakeCatalogContext(
+                                        true,
+                                        null,
+                                        currentSession().getPrincipal(),
+                                        null,
+                                        tableDescriptor));
+            } catch (TableAlreadyExistException e) {
+                throw new LakeTableAlreadyExistException(e.getMessage(), e);
+            }
+        }
+
+        // select remote data dir for table.
+        // remote data dir will be used to store table data for non-partitioned table and metadata
+        // (such as lake snapshot offset file) for partitioned table
+        String remoteDataDir = remoteDirDynamicLoader.getRemoteDirSelector().nextDataDir();
+
+        // then create table;
+        long tableId =
+                metadataManager.createTable(
+                        tablePath,
+                        remoteDataDir,
+                        tableDescriptor,
+                        tableAssignment,
+                        request.isIgnoreIfExists());
+        if (tableId >= 0 && isHistoricalPartitionEnabled(tableDescriptor)) {
+            try {
+                createHistoricalPartition(tablePath, tableId, tableDescriptor);
+            } catch (Exception e) {
+                throw historicalPartitionCreateTableException(tablePath, e);
+            }
+        }
+
+        return CompletableFuture.completedFuture(new CreateTableResponse());
+    }
+
+    private long getNewKvLeaderReplicaCount(TableDescriptor tableDescriptor) {
+        if (!tableDescriptor.hasPrimaryKey()) {
+            return 0;
+        }
+        if (tableDescriptor.isPartitioned() && !isHistoricalPartitionEnabled(tableDescriptor)) {
+            return 0;
+        }
+        // the distribution and bucket count must be set now
+        //noinspection OptionalGetWithoutIsPresent
+        return tableDescriptor.getTableDistribution().get().getBucketCount().get();
+    }
+
+    @Override
+    public CompletableFuture<AlterTableResponse> alterTable(AlterTableRequest request) {
+        TablePath tablePath = toTablePath(request.getTablePath());
+        tablePath.validate();
+        authorizeTable(OperationType.ALTER, tablePath);
+
+        List<TableChange> alterTableConfigChanges =
+                toAlterTableConfigChanges(request.getConfigChangesList());
+        TablePropertyChanges tablePropertyChanges = toTablePropertyChanges(alterTableConfigChanges);
+        List<TableChange> alterSchemaChanges = toAlterTableSchemaChanges(request);
+        List<TableChange.DistributionChange> alterDistributionChanges =
+                toAlterTableDistributionChanges(request);
+
+        boolean hasConfigChanges = !alterTableConfigChanges.isEmpty();
+        boolean hasSchemaChanges = !alterSchemaChanges.isEmpty();
+        boolean hasDistributionChanges = !alterDistributionChanges.isEmpty();
+        if ((hasConfigChanges && (hasSchemaChanges || hasDistributionChanges))
+                || (hasSchemaChanges && hasDistributionChanges)) {
+            throw new InvalidAlterTableException(
+                    "Table alteration can only be applied to one of the following: "
+                            + "table properties, table schema, or table distribution.");
+        }
+
+        if (hasSchemaChanges) {
+            metadataManager.alterTableSchema(
+                    tablePath,
+                    alterSchemaChanges,
+                    request.isIgnoreIfNotExists(),
+                    currentSession().getPrincipal());
+        }
+
+        if (hasConfigChanges) {
+            metadataManager.alterTableProperties(
+                    tablePath,
+                    alterTableConfigChanges,
+                    tablePropertyChanges,
+                    request.isIgnoreIfNotExists(),
+                    currentSession().getPrincipal(),
+                    this::beforeTablePropertiesUpdate,
+                    this::afterTablePropertiesUpdate,
+                    coordinatorZkVersionSupplier.get());
+        }
+
+        if (hasDistributionChanges) {
+            TableChange.ModifyBucketCount modifyBucketCount =
+                    (TableChange.ModifyBucketCount) alterDistributionChanges.get(0);
+            metadataManager.alterBucketCount(
+                    tablePath,
+                    modifyBucketCount.getNewBucketCount(),
+                    request.isIgnoreIfNotExists(),
+                    currentSession().getPrincipal(),
+                    coordinatorZkVersionSupplier.get());
+        }
+
+        return CompletableFuture.completedFuture(new AlterTableResponse());
+    }
+
+    private void beforeTablePropertiesUpdate(TableInfo currentTable, TableDescriptor updatedTable) {
+        if (!currentTable.getTableConfig().isHistoricalPartitionEnabled()
+                && isHistoricalPartitionEnabled(updatedTable)) {
+            TablePath tablePath = currentTable.getTablePath();
+            try {
+                replicaCapacityController.checkCanCreateKvLeaderReplicas(
+                        getBucketCount(updatedTable));
+                createHistoricalPartition(tablePath, currentTable.getTableId(), updatedTable);
+            } catch (Exception e) {
+                throw historicalPartitionEnableException(tablePath, e);
+            }
+        }
+    }
+
+    private void afterTablePropertiesUpdate(TableInfo currentTable, TableDescriptor updatedTable) {
+        boolean oldEnabled = currentTable.getTableConfig().isHistoricalPartitionEnabled();
+        boolean newEnabled = isHistoricalPartitionEnabled(updatedTable);
+        if (!oldEnabled || newEnabled) {
+            return;
+        }
+
+        TablePath tablePath = currentTable.getTablePath();
+        try {
+            metadataManager.dropPartition(tablePath, historicalPartitionSpec(updatedTable), true);
+        } catch (Exception e) {
+            throw historicalPartitionDisableException(tablePath, e);
+        }
+    }
+
+    private void createHistoricalPartition(
+            TablePath tablePath, long tableId, TableDescriptor tableDescriptor) {
+        int replicaFactor = tableDescriptor.getReplicationFactor();
+        TabletServerInfo[] servers = metadataCache.getLiveServers();
+        int bucketCount = getBucketCount(tableDescriptor);
+        Map<Integer, BucketAssignment> bucketAssignments =
+                generateAssignment(bucketCount, replicaFactor, servers).getBucketAssignments();
+        PartitionAssignment partitionAssignment =
+                new PartitionAssignment(tableId, bucketAssignments);
+        String remoteDataDir = remoteDirDynamicLoader.getRemoteDirSelector().nextDataDir();
+
+        metadataManager.createPartition(
+                tablePath,
+                tableId,
+                remoteDataDir,
+                partitionAssignment,
+                historicalPartitionSpec(tableDescriptor),
+                true,
+                bucketCount);
+    }
+
+    private static ResolvedPartitionSpec historicalPartitionSpec(TableDescriptor tableDescriptor) {
+        return new ResolvedPartitionSpec(
+                tableDescriptor.getPartitionKeys(),
+                Collections.singletonList(HISTORICAL_PARTITION_VALUE));
+    }
+
+    private static boolean isHistoricalPartitionEnabled(TableDescriptor tableDescriptor) {
+        return Configuration.fromMap(tableDescriptor.getProperties())
+                .get(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED);
+    }
+
+    private static int getBucketCount(TableDescriptor tableDescriptor) {
+        // The descriptor has already passed validation, so distribution and bucket count exist.
+        //noinspection OptionalGetWithoutIsPresent
+        return tableDescriptor.getTableDistribution().get().getBucketCount().get();
+    }
+
+    private static FlussRuntimeException historicalPartitionCreateTableException(
+            TablePath tablePath, Exception cause) {
+        String option = ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key();
+        String message =
+                String.format(
+                        "CREATE TABLE for %s failed after the table metadata was persisted: the "
+                                + "required historical system partition '%s' could not be created. "
+                                + "The table exists with '%s'='true', but historical lookup is "
+                                + "unavailable.%nAction: do not retry CREATE TABLE "
+                                + "because the table already exists. Fix the underlying error, then "
+                                + "either set '%s' to 'false' and back to 'true', or drop and "
+                                + "recreate the table.",
+                        tablePath, HISTORICAL_PARTITION_VALUE, option, option);
+        return new FlussRuntimeException(message, cause);
+    }
+
+    private static FlussRuntimeException historicalPartitionEnableException(
+            TablePath tablePath, Exception cause) {
+        String option = ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key();
+        String message =
+                String.format(
+                        "ALTER TABLE for %s failed to enable historical lookup because the "
+                                + "required system partition '%s' could not be prepared. The table "
+                                + "option was not changed and '%s' remains 'false'.%n"
+                                + "Action: fix the underlying error, then retry setting '%s' to "
+                                + "'true'.",
+                        tablePath, HISTORICAL_PARTITION_VALUE, option, option);
+        return new FlussRuntimeException(message, cause);
+    }
+
+    private static FlussRuntimeException historicalPartitionDisableException(
+            TablePath tablePath, Exception cause) {
+        String option = ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key();
+        String message =
+                String.format(
+                        "ALTER TABLE for %s disabled historical lookup and persisted '%s'='false', "
+                                + "but failed to delete the system partition '%s'. The orphan "
+                                + "partition still consumes KV capacity.%nAction: fix "
+                                + "the underlying error, then set '%s' to "
+                                + "'true' and back to 'false' to retry the deletion, or restart the "
+                                + "Coordinator to run startup reconciliation. Setting only "
+                                + "'%s'='false' again will not retry the deletion because the "
+                                + "option is already disabled.",
+                        tablePath, option, HISTORICAL_PARTITION_VALUE, option, option);
+        return new FlussRuntimeException(message, cause);
+    }
+
+    public static TablePropertyChanges toTablePropertyChanges(List<TableChange> tableChanges) {
+        TablePropertyChanges.Builder builder = TablePropertyChanges.builder();
+        if (tableChanges.isEmpty()) {
+            return builder.build();
+        }
+
+        for (TableChange tableChange : tableChanges) {
+            if (tableChange instanceof TableChange.SetOption) {
+                TableChange.SetOption setOption = (TableChange.SetOption) tableChange;
+                String optionKey = setOption.getKey();
+                if (isTableStorageConfig(optionKey)) {
+                    builder.setTableProperty(optionKey, setOption.getValue());
+                } else {
+                    // otherwise, it's considered as custom property
+                    builder.setCustomProperty(optionKey, setOption.getValue());
+                }
+            } else if (tableChange instanceof TableChange.ResetOption) {
+                TableChange.ResetOption resetOption = (TableChange.ResetOption) tableChange;
+                String optionKey = resetOption.getKey();
+                if (isTableStorageConfig(optionKey)) {
+                    builder.resetTableProperty(optionKey);
+                } else {
+                    // otherwise, it's considered as custom property
+                    builder.resetCustomProperty(optionKey);
+                }
+            } else {
+                throw new InvalidAlterTableException(
+                        "Unsupported alter table change: " + tableChange);
+            }
+        }
+        return builder.build();
+    }
+
+    private TableDescriptor applySystemDefaults(
+            TableDescriptor tableDescriptor,
+            LakeCatalogDynamicLoader.LakeCatalogContainer lakeCatalogContainer) {
+        DataLakeFormat dataLakeFormat = lakeCatalogContainer.getDataLakeFormat();
+        boolean clusterDataLakeTableEnabled = lakeCatalogContainer.isClusterDataLakeTableEnabled();
+        TableDescriptor newDescriptor = tableDescriptor;
+
+        // not set bucket num
+        if (!newDescriptor.getTableDistribution().isPresent()
+                || !newDescriptor.getTableDistribution().get().getBucketCount().isPresent()) {
+            newDescriptor = newDescriptor.withBucketCount(defaultBucketNumber);
+        }
+
+        // not set replication factor
+        Map<String, String> properties = newDescriptor.getProperties();
+        if (!properties.containsKey(ConfigOptions.TABLE_REPLICATION_FACTOR.key())) {
+            newDescriptor = newDescriptor.withReplicationFactor(defaultReplicationFactor);
+        }
+
+        // override set num-precreate for auto-partition table with multi-level partition keys
+        if (newDescriptor.getPartitionKeys().size() > 1
+                && "true".equals(properties.get(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key()))
+                && !properties.containsKey(
+                        ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key())) {
+            Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
+            // disable precreate partitions for multi-level partitions.
+            newProperties.put(ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key(), "0");
+            newDescriptor = newDescriptor.withProperties(newProperties);
+        }
+
+        // override the datalake format if the table hasn't set it and the cluster configured
+        if (dataLakeFormat != null
+                && !properties.containsKey(ConfigOptions.TABLE_DATALAKE_FORMAT.key())) {
+            newDescriptor = newDescriptor.withDataLakeFormat(dataLakeFormat);
+        }
+
+        // lake table can only be enabled when the cluster configures datalake format
+        boolean dataLakeEnabled = isDataLakeEnabled(tableDescriptor);
+        if (dataLakeEnabled && !clusterDataLakeTableEnabled) {
+            throw new InvalidTableException(
+                    String.format(
+                            "'%s' is enabled for the table, but the Fluss cluster doesn't enable datalake tables.",
+                            ConfigOptions.TABLE_DATALAKE_ENABLED.key()));
+        }
+
+        // For tables with first_row, versioned or aggregation merge engines, automatically set to
+        // IGNORE if delete behavior is not set
+        Configuration tableConf = Configuration.fromMap(tableDescriptor.getProperties());
+        MergeEngineType mergeEngine =
+                tableConf.getOptional(ConfigOptions.TABLE_MERGE_ENGINE).orElse(null);
+        if (mergeEngine == MergeEngineType.FIRST_ROW
+                || mergeEngine == MergeEngineType.VERSIONED
+                || mergeEngine == MergeEngineType.AGGREGATION) {
+            if (tableDescriptor.hasPrimaryKey()
+                    && !tableConf.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR).isPresent()) {
+                Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
+                newProperties.put(
+                        ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), DeleteBehavior.IGNORE.name());
+                newDescriptor = newDescriptor.withProperties(newProperties);
+            }
+        }
+
+        if (newDescriptor.hasPrimaryKey()) {
+            Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
+            Configuration newTableConf = Configuration.fromMap(newProperties);
+            Integer formatVersion = newTableConf.get(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+            // The option has no default so that its absence continues to identify legacy tables.
+            if (formatVersion == null) {
+                newProperties.put(
+                        ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                        String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            }
+
+            int layoutVersion =
+                    newTableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent()
+                            ? KvValueLayout.TAGGED.version()
+                            : KvValueLayout.PLAIN.version();
+            newProperties.put(
+                    ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                    String.valueOf(layoutVersion));
+
+            newDescriptor = newDescriptor.withProperties(newProperties);
+        }
+
+        return newDescriptor;
+    }
+
+    private boolean isDataLakeEnabled(TableDescriptor tableDescriptor) {
+        String dataLakeEnabledValue =
+                tableDescriptor.getProperties().get(ConfigOptions.TABLE_DATALAKE_ENABLED.key());
+        return Boolean.parseBoolean(dataLakeEnabledValue);
+    }
+
+    @Override
+    public CompletableFuture<DropTableResponse> dropTable(DropTableRequest request) {
+        TablePath tablePath = toTablePath(request.getTablePath());
+        authorizeTable(OperationType.DROP, tablePath);
+
+        DropTableResponse response = new DropTableResponse();
+        metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<CreatePartitionResponse> createPartition(
+            CreatePartitionRequest request) {
+        TablePath tablePath = toTablePath(request.getTablePath());
+        authorizeTable(OperationType.WRITE, tablePath);
+
+        CreatePartitionResponse response = new CreatePartitionResponse();
+        // The table metadata (including bucket.num) is read fresh here, and the partition's
+        // registration persists its assignment and bucket count atomically in one ZK transaction
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        if (!tableInfo.isPartitioned()) {
+            throw new TableNotPartitionedException(
+                    "Only partitioned table support create partition.");
+        }
+
+        // first, validate the partition spec, and get resolved partition spec.
+        PartitionSpec partitionSpec = getPartitionSpec(request.getPartitionSpec());
+        validatePartitionSpec(tablePath, tableInfo.getPartitionKeys(), partitionSpec, true);
+
+        // second, check whether the partition is out-of-date.
+        validateAutoPartitionTime(
+                partitionSpec,
+                tableInfo.getPartitionKeys(),
+                tableInfo.getTableConfig().getAutoPartitionStrategy());
+
+        ResolvedPartitionSpec partitionToCreate =
+                ResolvedPartitionSpec.fromPartitionSpec(
+                        tableInfo.getPartitionKeys(), partitionSpec);
+        if (request.isIgnoreIfNotExists()
+                && metadataManager
+                        .getOptionalPartitionRegistration(
+                                tablePath, partitionToCreate.getPartitionName())
+                        .isPresent()) {
+            return CompletableFuture.completedFuture(response);
+        }
+
+        long newKvLeaderReplicaCount = tableInfo.hasPrimaryKey() ? tableInfo.getNumBuckets() : 0;
+        replicaCapacityController.checkCanCreateKvLeaderReplicas(newKvLeaderReplicaCount);
+
+        // third, generate the PartitionAssignment.
+        int replicaFactor = tableInfo.getTableConfig().getReplicationFactor();
+        TabletServerInfo[] servers = metadataCache.getLiveServers();
+        Map<Integer, BucketAssignment> bucketAssignments =
+                generateAssignment(tableInfo.getNumBuckets(), replicaFactor, servers)
+                        .getBucketAssignments();
+        PartitionAssignment partitionAssignment =
+                new PartitionAssignment(tableInfo.getTableId(), bucketAssignments);
+
+        // select remote data dir for partition
+        String remoteDataDir = remoteDirDynamicLoader.getRemoteDirSelector().nextDataDir();
+
+        metadataManager.createPartition(
+                tablePath,
+                tableInfo.getTableId(),
+                remoteDataDir,
+                partitionAssignment,
+                partitionToCreate,
+                request.isIgnoreIfNotExists(),
+                tableInfo.getNumBuckets());
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<DropPartitionResponse> dropPartition(DropPartitionRequest request) {
+        TablePath tablePath = toTablePath(request.getTablePath());
+        authorizeTable(OperationType.WRITE, tablePath);
+
+        DropPartitionResponse response = new DropPartitionResponse();
+        TableRegistration table = metadataManager.getTableRegistration(tablePath);
+        if (!table.isPartitioned()) {
+            throw new TableNotPartitionedException(
+                    "Only partitioned table support drop partition.");
+        }
+
+        // first, validate the partition spec.
+        PartitionSpec partitionSpec = getPartitionSpec(request.getPartitionSpec());
+        validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec, false);
+        ResolvedPartitionSpec partitionToDrop =
+                ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
+        if (table.getTableConfig().isHistoricalPartitionEnabled()
+                && HISTORICAL_PARTITION_VALUE.equals(partitionToDrop.getPartitionName())) {
+            throw new InvalidPartitionException(
+                    "Historical system partition is managed by the coordinator and cannot be "
+                            + "dropped manually.");
+        }
+
+        metadataManager.dropPartition(tablePath, partitionToDrop, request.isIgnoreIfNotExists());
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<MetadataResponse> metadata(MetadataRequest request) {
+        String listenerName = currentListenerName();
+        Session session = currentSession();
+
+        AccessContextEvent<MetadataResponse> metadataResponseAccessContextEvent =
+                new AccessContextEvent<>(
+                        ctx ->
+                                processMetadataRequest(
+                                        request,
+                                        listenerName,
+                                        session,
+                                        authorizer,
+                                        metadataCache,
+                                        new CoordinatorMetadataProvider(
+                                                zkClient, metadataManager, ctx)));
+        eventManagerSupplier.get().put(metadataResponseAccessContextEvent);
+        return metadataResponseAccessContextEvent.getResultFuture();
+    }
+
+    @Override
+    public CompletableFuture<ListRemoteLogManifestsResponse> listRemoteLogManifests(
+            ListRemoteLogManifestsRequest request) {
+        long tableId = request.getTableId();
+        if (authorizer != null) {
+            authorizeTableWithSession(currentSession(), OperationType.DESCRIBE, tableId);
+        }
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
+                    validatePartitionOwnership(partitionId, tableId);
+                    try {
+                        List<TableBucketAndManifest> entries =
+                                zkClient.listRemoteLogManifestHandles(tableId, partitionId);
+                        return makeListRemoteLogManifestsResponse(entries);
+                    } catch (ApiException e) {
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to list remote log manifests for tableId=" + tableId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<ListKvSnapshotsResponse> listKvSnapshots(
+            ListKvSnapshotsRequest request) {
+        long tableId = request.getTableId();
+        Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
+        if (authorizer != null) {
+            authorizeTableWithSession(currentSession(), OperationType.DESCRIBE, tableId);
+        }
+
+        // Resolve numBuckets via event thread (CoordinatorContext is @NotThreadSafe)
+        CompletableFuture<Integer> numBucketsFuture = resolveNumBuckets(tableId, partitionId);
+
+        return numBucketsFuture.thenCompose(
+                numBuckets ->
+                        CompletableFuture.supplyAsync(
+                                () -> {
+                                    validatePartitionOwnership(partitionId, tableId);
+
+                                    CompletedSnapshotStoreManager storeManager =
+                                            snapshotStoreManagerSupplier.get();
+                                    Map<Integer, Set<Long>> activeByBucket =
+                                            storeManager.getActiveSnapshotIdsByBucket(
+                                                    tableId, partitionId, numBuckets);
+                                    Map<Integer, Set<Long>> stillInUse =
+                                            kvSnapshotLeaseManager.getStillInUseSnapshotIds(
+                                                    tableId, partitionId);
+
+                                    ListKvSnapshotsResponse response =
+                                            new ListKvSnapshotsResponse().setTableId(tableId);
+                                    if (partitionId != null) {
+                                        response.setPartitionId(partitionId);
+                                    }
+
+                                    Set<Integer> allBucketIds =
+                                            new HashSet<>(activeByBucket.keySet());
+                                    allBucketIds.addAll(stillInUse.keySet());
+                                    for (int bucketId : allBucketIds) {
+                                        Set<Long> merged =
+                                                new LinkedHashSet<>(
+                                                        activeByBucket.getOrDefault(
+                                                                bucketId, Collections.emptySet()));
+                                        merged.addAll(
+                                                stillInUse.getOrDefault(
+                                                        bucketId, Collections.emptySet()));
+                                        for (Long snapId : merged) {
+                                            response.addActiveSnapshot()
+                                                    .setBucketId(bucketId)
+                                                    .setSnapshotId(snapId);
+                                        }
+                                    }
+                                    return response;
+                                },
+                                ioExecutor));
+    }
+
+    private CompletableFuture<Integer> resolveNumBuckets(long tableId, @Nullable Long partitionId) {
+        AccessContextEvent<Integer> event =
+                new AccessContextEvent<>(
+                        ctx -> {
+                            if (partitionId != null) {
+                                // for partitions, the table-level bucket count may differ from the
+                                // partition's actual bucket count after ALTER bucket.num; use the
+                                // partition assignment size instead
+                                Map<Integer, List<Integer>> partitionAssignment =
+                                        ctx.getPartitionAssignment(
+                                                new TablePartition(tableId, partitionId));
+                                return partitionAssignment.isEmpty()
+                                        ? null
+                                        : partitionAssignment.size();
+                            }
+                            TablePath tablePath = ctx.getTablePathById(tableId);
+                            if (tablePath != null) {
+                                TableInfo tableInfo = ctx.getTableInfoById(tableId);
+                                if (tableInfo != null) {
+                                    return tableInfo.getNumBuckets();
+                                }
+                            }
+                            return null;
+                        });
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture()
+                .thenCompose(
+                        numBuckets -> {
+                            if (numBuckets != null) {
+                                return CompletableFuture.completedFuture(numBuckets);
+                            }
+                            return CompletableFuture.supplyAsync(
+                                    () -> resolveNumBucketsFromZk(tableId, partitionId),
+                                    ioExecutor);
+                        });
+    }
+
+    private int resolveNumBucketsFromZk(long tableId, @Nullable Long partitionId) {
+        try {
+            if (partitionId != null) {
+                Optional<PartitionAssignment> pAssignment =
+                        zkClient.getPartitionAssignment(partitionId);
+                if (!pAssignment.isPresent()) {
+                    throw new PartitionNotExistException(
+                            "Partition " + partitionId + " does not exist");
+                }
+                return pAssignment.get().getBuckets().size();
+            } else {
+                Optional<TableAssignment> assignment = zkClient.getTableAssignment(tableId);
+                if (!assignment.isPresent()) {
+                    throw new TableNotExistException("Table " + tableId + " does not exist");
+                }
+                return assignment.get().getBuckets().size();
+            }
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new ApiException("Failed to resolve table " + tableId + ": " + e.getMessage(), e);
+        }
+    }
+
+    private void validatePartitionOwnership(@Nullable Long partitionId, long tableId) {
+        if (partitionId == null) {
+            return;
+        }
+        try {
+            Optional<PartitionAssignment> pa = zkClient.getPartitionAssignment(partitionId);
+            if (!pa.isPresent()) {
+                throw new PartitionNotExistException(
+                        "Partition " + partitionId + " does not exist");
+            }
+            if (pa.get().getTableId() != tableId) {
+                throw new PartitionNotExistException(
+                        "Partition " + partitionId + " does not belong to table " + tableId);
+            }
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new UnknownServerException(
+                    "Failed to validate partition ownership for partition "
+                            + partitionId
+                            + " and table "
+                            + tableId,
+                    e);
+        }
+    }
+
+    @Override
+    public CompletableFuture<AdjustIsrResponse> adjustIsr(AdjustIsrRequest request) {
+        CompletableFuture<AdjustIsrResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(new AdjustIsrReceivedEvent(getAdjustIsrData(request), response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CommitKvSnapshotResponse> commitKvSnapshot(
+            CommitKvSnapshotRequest request) {
+        CompletableFuture<CommitKvSnapshotResponse> response = new CompletableFuture<>();
+        // parse completed snapshot from request
+        byte[] completedSnapshotBytes = request.getCompletedSnapshot();
+        CompletedSnapshot completedSnapshot =
+                CompletedSnapshotJsonSerde.fromJson(completedSnapshotBytes);
+        CommitKvSnapshotData commitKvSnapshotData =
+                new CommitKvSnapshotData(
+                        completedSnapshot,
+                        request.getCoordinatorEpoch(),
+                        request.getBucketLeaderEpoch());
+        eventManagerSupplier.get().put(new CommitKvSnapshotEvent(commitKvSnapshotData, response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CommitRemoteLogManifestResponse> commitRemoteLogManifest(
+            CommitRemoteLogManifestRequest request) {
+        CompletableFuture<CommitRemoteLogManifestResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new CommitRemoteLogManifestEvent(
+                                getCommitRemoteLogManifestData(request), response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CreateAclsResponse> createAcls(CreateAclsRequest request) {
+        if (authorizer == null) {
+            throw new SecurityDisabledException("No Authorizer is configured.");
+        }
+        List<AclBinding> aclBindings = toAclBindings(request.getAclsList());
+        List<AclCreateResult> aclCreateResults = authorizer.addAcls(currentSession(), aclBindings);
+        return CompletableFuture.completedFuture(makeCreateAclsResponse(aclCreateResults));
+    }
+
+    @Override
+    public CompletableFuture<DropAclsResponse> dropAcls(DropAclsRequest request) {
+        if (authorizer == null) {
+            throw new SecurityDisabledException("No Authorizer is configured.");
+        }
+        List<AclBindingFilter> filters = toAclBindingFilters(request.getAclFiltersList());
+        List<AclDeleteResult> aclDeleteResults = authorizer.dropAcls(currentSession(), filters);
+        return CompletableFuture.completedFuture(makeDropAclsResponse(aclDeleteResults));
+    }
+
+    @Override
+    public CompletableFuture<PrepareLakeTableSnapshotResponse> prepareLakeTableSnapshot(
+            PrepareLakeTableSnapshotRequest request) {
+        CompletableFuture<PrepareLakeTableSnapshotResponse> future = new CompletableFuture<>();
+        boolean ignorePreviousBucketOffsets =
+                request.hasIgnorePreviousTableOffsets() && request.isIgnorePreviousTableOffsets();
+        ioExecutor.submit(
+                () -> {
+                    PrepareLakeTableSnapshotResponse response =
+                            new PrepareLakeTableSnapshotResponse();
+                    try {
+                        for (PbTableOffsets bucketOffsets : request.getBucketOffsetsList()) {
+                            PbPrepareLakeTableRespForTable pbPrepareLakeTableRespForTable =
+                                    response.addPrepareLakeTableResp();
+                            try {
+                                long tableId = bucketOffsets.getTableId();
+                                TableBucketOffsets tableBucketOffsets =
+                                        toTableBucketOffsets(bucketOffsets);
+                                if (!ignorePreviousBucketOffsets) {
+                                    // get previous lake tables
+                                    Optional<LakeTable> optPreviousLakeTable =
+                                            zkClient.getLakeTable(tableId);
+                                    if (optPreviousLakeTable.isPresent()) {
+                                        // need to merge with previous lake table
+                                        tableBucketOffsets =
+                                                lakeTableHelper.mergeTableBucketOffsets(
+                                                        optPreviousLakeTable.get(),
+                                                        tableBucketOffsets);
+                                    }
+                                }
+                                TablePath tablePath = toTablePath(bucketOffsets.getTablePath());
+                                FsPath fsPath =
+                                        lakeTableHelper.storeLakeTableOffsetsFile(
+                                                tablePath, tableBucketOffsets);
+                                pbPrepareLakeTableRespForTable.setTableId(tableId);
+                                pbPrepareLakeTableRespForTable.setLakeTableOffsetsPath(
+                                        fsPath.toString());
+                            } catch (Exception e) {
+                                long tableId = bucketOffsets.getTableId();
+                                LOG.warn(
+                                        "Failed to prepare lake table snapshot for table {}.",
+                                        tableId,
+                                        e);
+                                Errors error = ApiError.fromThrowable(e).error();
+                                pbPrepareLakeTableRespForTable.setTableId(tableId);
+                                pbPrepareLakeTableRespForTable.setError(
+                                        error.code(), error.message());
+                            }
+                        }
+                        future.complete(response);
+                    } catch (Exception e) {
+                        future.completeExceptionally(e);
+                    }
+                });
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<CommitLakeTableSnapshotResponse> commitLakeTableSnapshot(
+            CommitLakeTableSnapshotRequest request) {
+        CompletableFuture<CommitLakeTableSnapshotResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new CommitLakeTableSnapshotEvent(
+                                getCommitLakeTableSnapshotData(request), response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<LakeTieringHeartbeatResponse> lakeTieringHeartbeat(
+            LakeTieringHeartbeatRequest request) {
+        LakeTieringHeartbeatResponse heartbeatResponse = new LakeTieringHeartbeatResponse();
+        int currentCoordinatorEpoch = coordinatorEpochSupplier.get();
+        heartbeatResponse.setCoordinatorEpoch(currentCoordinatorEpoch);
+
+        // process failed tables
+        for (PbHeartbeatReqForTable failedTable : request.getFailedTablesList()) {
+            PbHeartbeatRespForTable pbHeartbeatRespForTable =
+                    heartbeatResponse.addFailedTableResp().setTableId(failedTable.getTableId());
+            try {
+                validateHeartbeatRequest(failedTable, currentCoordinatorEpoch);
+                lakeTableTieringManager.reportTieringFail(
+                        failedTable.getTableId(), failedTable.getTieringEpoch());
+            } catch (Throwable e) {
+                pbHeartbeatRespForTable.setError(ApiError.fromThrowable(e).toErrorResponse());
+            }
+        }
+
+        // process tiering tables
+        for (PbHeartbeatReqForTable tieringTable : request.getTieringTablesList()) {
+            PbHeartbeatRespForTable pbHeartbeatRespForTable =
+                    heartbeatResponse.addTieringTableResp().setTableId(tieringTable.getTableId());
+            try {
+                validateHeartbeatRequest(tieringTable, currentCoordinatorEpoch);
+                lakeTableTieringManager.renewTieringHeartbeat(
+                        tieringTable.getTableId(), tieringTable.getTieringEpoch());
+            } catch (Throwable t) {
+                pbHeartbeatRespForTable.setError(ApiError.fromThrowable(t).toErrorResponse());
+            }
+        }
+
+        // process force finished tables
+        Set<Long> forceFinishedTableId = new HashSet<>();
+        for (long forceFinishTableId : request.getForceFinishedTables()) {
+            forceFinishedTableId.add(forceFinishTableId);
+        }
+
+        // process finished tables
+        for (PbHeartbeatReqForTable finishTable : request.getFinishedTablesList()) {
+            PbHeartbeatRespForTable pbHeartbeatRespForTable =
+                    heartbeatResponse.addFinishedTableResp().setTableId(finishTable.getTableId());
+            try {
+                validateHeartbeatRequest(finishTable, currentCoordinatorEpoch);
+                TieringStats stats = TieringStats.UNKNOWN;
+                if (finishTable.hasLakeTieringStats()) {
+                    PbLakeTieringStats pbStats = finishTable.getLakeTieringStats();
+                    stats =
+                            new TieringStats(
+                                    pbStats.hasFileSize() ? pbStats.getFileSize() : null,
+                                    pbStats.hasRecordCount() ? pbStats.getRecordCount() : null);
+                }
+                lakeTableTieringManager.finishTableTiering(
+                        finishTable.getTableId(),
+                        finishTable.getTieringEpoch(),
+                        forceFinishedTableId.contains(finishTable.getTableId()),
+                        stats);
+            } catch (Throwable e) {
+                pbHeartbeatRespForTable.setError(ApiError.fromThrowable(e).toErrorResponse());
+            }
+        }
+
+        if (request.hasRequestTable() && request.isRequestTable()) {
+            LakeTieringTableInfo lakeTieringTableInfo = lakeTableTieringManager.requestTable();
+            if (lakeTieringTableInfo != null) {
+                heartbeatResponse
+                        .setTieringTable()
+                        .setTableId(lakeTieringTableInfo.tableId())
+                        .setTablePath(fromTablePath(lakeTieringTableInfo.tablePath()))
+                        .setTieringEpoch(lakeTieringTableInfo.tieringEpoch());
+            }
+        }
+        return CompletableFuture.completedFuture(heartbeatResponse);
+    }
+
+    @Override
+    public CompletableFuture<ControlledShutdownResponse> controlledShutdown(
+            ControlledShutdownRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<ControlledShutdownResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new ControlledShutdownEvent(
+                                request.getTabletServerId(),
+                                request.getTabletServerEpoch(),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<AcquireKvSnapshotLeaseResponse> acquireKvSnapshotLease(
+            AcquireKvSnapshotLeaseRequest request) {
+        for (PbKvSnapshotLeaseForTable kvSnapshotLeaseForTable :
+                request.getSnapshotsToLeasesList()) {
+            long tableId = kvSnapshotLeaseForTable.getTableId();
+            if (authorizer != null) {
+                // Authorization: require WRITE permission on all tables in the request
+                authorizeTable(OperationType.READ, tableId);
+            }
+
+            validateKvTable(tableId);
+        }
+
+        String leaseId = request.getLeaseId();
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        return makeAcquireKvSnapshotLeaseResponse(
+                                kvSnapshotLeaseManager.acquireLease(
+                                        leaseId,
+                                        request.getLeaseDurationMs(),
+                                        getAcquireKvSnapshotLeaseData(request)));
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to acquire kv snapshot lease for" + leaseId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<ReleaseKvSnapshotLeaseResponse> releaseKvSnapshotLease(
+            ReleaseKvSnapshotLeaseRequest request) {
+        for (PbTableBucket tableBucket : request.getBucketsToReleasesList()) {
+            long tableId = tableBucket.getTableId();
+            if (authorizer != null) {
+                // Authorization: require WRITE permission on all tables in the request.
+                authorizeTable(OperationType.READ, tableId);
+            }
+
+            validateKvTable(tableId);
+        }
+
+        String leaseId = request.getLeaseId();
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        ReleaseKvSnapshotLeaseResponse response =
+                                new ReleaseKvSnapshotLeaseResponse();
+                        kvSnapshotLeaseManager.release(
+                                leaseId, getReleaseKvSnapshotLeaseData(request));
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to release kv snapshot lease for" + leaseId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<DropKvSnapshotLeaseResponse> dropKvSnapshotLease(
+            DropKvSnapshotLeaseRequest request) {
+        String leaseId = request.getLeaseId();
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        // Authorization: require READ permission on all tables acquired by this
+                        // lease.
+                        if (authorizer != null) {
+                            Optional<KvSnapshotLeaseHandler> leaseHandlerOpt =
+                                    kvSnapshotLeaseManager.getLease(leaseId);
+
+                            if (leaseHandlerOpt.isPresent()) {
+                                KvSnapshotLeaseHandler leaseHandler = leaseHandlerOpt.get();
+                                Set<Long> tableIds = leaseHandler.getTableIdToTableLease().keySet();
+                                // Check WRITE permission for each table.
+                                for (Long tableId : tableIds) {
+                                    authorizeTableWithSession(session, OperationType.READ, tableId);
+                                }
+                            }
+                        }
+
+                        DropKvSnapshotLeaseResponse response = new DropKvSnapshotLeaseResponse();
+                        kvSnapshotLeaseManager.dropLease(leaseId);
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to drop kv snapshot lease for" + leaseId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<AlterClusterConfigsResponse> alterClusterConfigs(
+            AlterClusterConfigsRequest request) {
+        CompletableFuture<AlterClusterConfigsResponse> future = new CompletableFuture<>();
+        List<PbAlterConfig> infos = request.getAlterConfigsList();
+        if (infos.isEmpty()) {
+            return CompletableFuture.completedFuture(new AlterClusterConfigsResponse());
+        }
+
+        List<AlterConfig> serverConfigChanges =
+                infos.stream()
+                        .map(
+                                info ->
+                                        new AlterConfig(
+                                                info.getConfigKey(),
+                                                info.hasConfigValue()
+                                                        ? info.getConfigValue()
+                                                        : null,
+                                                AlterConfigOpType.from((byte) info.getOpType())))
+                        .collect(Collectors.toList());
+
+        Session session = currentSession();
+        if (authorizer != null) {
+            // altering security related configs (e.g. super user credentials) requires the full
+            // cluster permission instead of ALTER only
+            boolean alterSecurityConfigs =
+                    serverConfigChanges.stream()
+                            .anyMatch(
+                                    config -> config.key().startsWith(SECURITY_CONFIG_KEY_PREFIX));
+            authorizer.authorize(
+                    session,
+                    alterSecurityConfigs ? OperationType.ALL : OperationType.ALTER,
+                    Resource.cluster());
+        }
+        FlussPrincipal requester = session.isInternal() ? null : session.getPrincipal();
+
+        AccessContextEvent<Void> accessContextEvent =
+                new AccessContextEvent<>(
+                        (context) -> {
+                            try {
+                                dynamicConfigManager.alterConfigs(serverConfigChanges, requester);
+                                future.complete(new AlterClusterConfigsResponse());
+                            } catch (ApiException e) {
+                                future.completeExceptionally(e);
+                            } catch (Exception e) {
+                                future.completeExceptionally(
+                                        new UnknownServerException(
+                                                "Failed to alter cluster configs", e));
+                            }
+                            return null;
+                        });
+        eventManagerSupplier.get().put(accessContextEvent);
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<AddServerTagResponse> addServerTag(AddServerTagRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<AddServerTagResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new AddServerTagEvent(
+                                Arrays.stream(request.getServerIds())
+                                        .boxed()
+                                        .collect(Collectors.toList()),
+                                ServerTag.valueOf(request.getServerTag()),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<RemoveServerTagResponse> removeServerTag(
+            RemoveServerTagRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<RemoveServerTagResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new RemoveServerTagEvent(
+                                Arrays.stream(request.getServerIds())
+                                        .boxed()
+                                        .collect(Collectors.toList()),
+                                ServerTag.valueOf(request.getServerTag()),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<AddServerTagByRackResponse> addServerTagByRack(
+            AddServerTagByRackRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<AddServerTagByRackResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new AddServerTagByRackEvent(
+                                new ArrayList<>(request.getRacksList()),
+                                ServerTag.valueOf(request.getServerTag()),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<RemoveServerTagByRackResponse> removeServerTagByRack(
+            RemoveServerTagByRackRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<RemoveServerTagByRackResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new RemoveServerTagByRackEvent(
+                                new ArrayList<>(request.getRacksList()),
+                                ServerTag.valueOf(request.getServerTag()),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<RebalanceResponse> rebalance(RebalanceRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.WRITE, Resource.cluster());
+        }
+
+        List<Goal> goalsByPriority = new ArrayList<>();
+        Arrays.stream(request.getGoals())
+                .forEach(goal -> goalsByPriority.add(getGoalByType(GoalType.valueOf(goal))));
+
+        CompletableFuture<RebalanceResponse> response = new CompletableFuture<>();
+        eventManagerSupplier.get().put(new RebalanceEvent(goalsByPriority, response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<ListRebalanceProgressResponse> listRebalanceProgress(
+            ListRebalanceProgressRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        CompletableFuture<ListRebalanceProgressResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new ListRebalanceProgressEvent(
+                                request.hasRebalanceId() ? request.getRebalanceId() : null,
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CancelRebalanceResponse> cancelRebalance(
+            CancelRebalanceRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.WRITE, Resource.cluster());
+        }
+
+        CompletableFuture<CancelRebalanceResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new CancelRebalanceEvent(
+                                request.hasRebalanceId() ? request.getRebalanceId() : null,
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<GetClusterHealthResponse> getClusterHealth(
+            GetClusterHealthRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        AccessContextEvent<GetClusterHealthResponse> event =
+                new AccessContextEvent<>(CoordinatorService::computeClusterHealth);
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture();
+    }
+
+    @VisibleForTesting
+    static GetClusterHealthResponse computeClusterHealth(CoordinatorContext ctx) {
+        GetClusterHealthResponse response = new GetClusterHealthResponse();
+
+        int numReplicas = 0;
+        int inSyncReplicas = 0;
+        int numLeaderReplicas = 0;
+        int activeLeaderReplicas = 0;
+
+        for (TableBucket tb : ctx.getAllBuckets()) {
+            List<Integer> assignment = ctx.getAssignment(tb);
+            numReplicas += assignment.size();
+            numLeaderReplicas++;
+
+            Optional<LeaderAndIsr> laiOpt = ctx.getBucketLeaderAndIsr(tb);
+            if (laiOpt.isPresent()) {
+                inSyncReplicas += laiOpt.get().isr().size();
+            }
+            if (ctx.isLeaderActive(tb)) {
+                activeLeaderReplicas++;
+            }
+        }
+
+        // PbClusterHealthStatus: GREEN=0, YELLOW=1, RED=2, UNKNOWN=3
+        int status;
+        if (activeLeaderReplicas < numLeaderReplicas) {
+            status = 2; // RED
+        } else if (inSyncReplicas < numReplicas) {
+            status = 1; // YELLOW
+        } else {
+            status = 0; // GREEN
+        }
+
+        response.setNumReplicas(numReplicas);
+        response.setInSyncReplicas(inSyncReplicas);
+        response.setNumLeaderReplicas(numLeaderReplicas);
+        response.setActiveLeaderReplicas(activeLeaderReplicas);
+        response.setStatus(status);
+        return response;
+    }
+
+    @VisibleForTesting
+    public DataLakeFormat getDataLakeFormat() {
+        return lakeCatalogDynamicLoader.getLakeCatalogContainer().getDataLakeFormat();
+    }
+
+    @VisibleForTesting
+    public LakeTableTieringManager getLakeTableTieringManager() {
+        return lakeTableTieringManager;
+    }
+
+    private void validateHeartbeatRequest(
+            PbHeartbeatReqForTable heartbeatReqForTable, int currentEpoch) {
+        if (heartbeatReqForTable.getCoordinatorEpoch() != currentEpoch) {
+            throw new InvalidCoordinatorException(
+                    String.format(
+                            "The coordinator epoch %s in request is not match current coordinator epoch %d for table %d.",
+                            heartbeatReqForTable.getCoordinatorEpoch(),
+                            currentEpoch,
+                            heartbeatReqForTable.getTableId()));
+        }
+    }
+
+    /**
+     * Validates whether the table creation is allowed based on the table type and configuration.
+     *
+     * @param tableDescriptor the table descriptor to validate
+     * @param tablePath the table path for error reporting
+     * @throws InvalidTableException if table creation is not allowed
+     */
+    private void validateTableCreationPermission(
+            TableDescriptor tableDescriptor, TablePath tablePath) {
+        boolean hasPrimaryKey = tableDescriptor.hasPrimaryKey();
+
+        if (hasPrimaryKey) {
+            // This is a KV table (Primary Key Table)
+            if (!kvTableAllowCreation) {
+                throw new InvalidTableException(
+                        "Creation of Primary Key Tables is disallowed in the cluster.");
+            }
+        } else {
+            // This is a Log table
+            if (!logTableAllowCreation) {
+                throw new InvalidTableException(
+                        "Creation of Log Tables is disallowed in the cluster.");
+            }
+        }
+    }
+
+    static class DefaultLakeCatalogContext implements LakeCatalog.Context {
+
+        private final boolean isCreatingFlussTable;
+        @Nullable private final TablePath currentLakeTablePath;
+        private final FlussPrincipal flussPrincipal;
+        @Nullable private final TableDescriptor currentTable;
+        private final TableDescriptor expectedTable;
+
+        public DefaultLakeCatalogContext(
+                boolean isCreatingFlussTable,
+                @Nullable TablePath currentLakeTablePath,
+                FlussPrincipal flussPrincipal,
+                @Nullable TableDescriptor currentTable,
+                TableDescriptor expectedTable) {
+            this.isCreatingFlussTable = isCreatingFlussTable;
+            this.currentLakeTablePath = currentLakeTablePath;
+            this.flussPrincipal = flussPrincipal;
+            if (!isCreatingFlussTable) {
+                checkNotNull(
+                        currentTable, "currentTable must be provided when altering a Fluss table.");
+            }
+            this.currentTable = currentTable;
+            this.expectedTable = expectedTable;
+        }
+
+        @Override
+        public boolean isCreatingFlussTable() {
+            return isCreatingFlussTable;
+        }
+
+        @Override
+        public FlussPrincipal getFlussPrincipal() {
+            return flussPrincipal;
+        }
+
+        @Nullable
+        @Override
+        public TableDescriptor getCurrentTable() {
+            return currentTable;
+        }
+
+        @Nullable
+        @Override
+        public TablePath getCurrentLakeTablePath() {
+            return currentLakeTablePath;
+        }
+
+        @Override
+        public TableDescriptor getExpectedTable() {
+            return expectedTable;
+        }
+    }
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    @Override
+    public CompletableFuture<RegisterProducerOffsetsResponse> registerProducerOffsets(
+            RegisterProducerOffsetsRequest request) {
+        // Authorization: require WRITE permission on all tables in the request
+        if (authorizer != null) {
+            for (PbProducerTableOffsets tableOffsets : request.getTableOffsetsList()) {
+                long tableId = tableOffsets.getTableId();
+                authorizeTable(OperationType.WRITE, tableId);
+            }
+        }
+
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        String producerId = request.getProducerId();
+                        Map<TableBucket, Long> offsets =
+                                ServerRpcMessageUtils.toTableBucketOffsets(
+                                        request.getTableOffsetsList());
+
+                        // Use custom TTL if provided, otherwise use default (null means use
+                        // manager's default)
+                        Long ttlMs = request.hasTtlMs() ? request.getTtlMs() : null;
+
+                        // Register with atomic "check and register" semantics
+                        boolean created =
+                                producerOffsetsManager.registerSnapshot(producerId, offsets, ttlMs);
+
+                        RegisterProducerOffsetsResponse response =
+                                new RegisterProducerOffsetsResponse();
+                        // Aligns with RegisterResult enum in fluss-client:
+                        // 0 = CREATED, 1 = ALREADY_EXISTS
+                        response.setResult(created ? 0 : 1);
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to register producer offsets for producer "
+                                        + request.getProducerId(),
+                                e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<GetProducerOffsetsResponse> getProducerOffsets(
+            GetProducerOffsetsRequest request) {
+        String producerId = request.getProducerId();
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
+
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        Optional<ProducerOffsets> optSnapshot =
+                                producerOffsetsManager.getOffsetsMetadata(producerId);
+                        if (!optSnapshot.isPresent()) {
+                            return new GetProducerOffsetsResponse();
+                        }
+
+                        ProducerOffsets snapshot = optSnapshot.get();
+                        Map<TableBucket, Long> allOffsets =
+                                producerOffsetsManager.readOffsets(producerId);
+                        Map<Long, Map<TableBucket, Long>> offsetsByTable =
+                                groupOffsetsByTableId(allOffsets);
+
+                        // Authorization: filter tables by READ permission
+                        if (authorizer != null) {
+                            offsetsByTable
+                                    .keySet()
+                                    .removeIf(
+                                            tableId -> {
+                                                try {
+                                                    authorizeTableWithSession(
+                                                            session, OperationType.READ, tableId);
+                                                    return false; // keep this table
+                                                } catch (Exception e) {
+                                                    return true; // remove this table
+                                                }
+                                            });
+                        }
+
+                        GetProducerOffsetsResponse response = new GetProducerOffsetsResponse();
+                        response.setProducerId(producerId);
+                        response.setExpirationTime(snapshot.getExpirationTime());
+
+                        for (Map.Entry<Long, Map<TableBucket, Long>> entry :
+                                offsetsByTable.entrySet()) {
+                            addTableOffsetsToResponse(response, entry.getKey(), entry.getValue());
+                        }
+
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to get producer offsets for producer " + producerId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
+            DeleteProducerOffsetsRequest request) {
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        String producerId = request.getProducerId();
+
+                        // Authorization: require WRITE permission on all tables in the snapshot
+                        if (authorizer != null) {
+                            Map<TableBucket, Long> offsets =
+                                    producerOffsetsManager.readOffsets(producerId);
+                            // Extract unique table IDs from the snapshot
+                            Set<Long> tableIds =
+                                    offsets.keySet().stream()
+                                            .map(TableBucket::getTableId)
+                                            .collect(Collectors.toSet());
+                            // Check WRITE permission for each table
+                            for (Long tableId : tableIds) {
+                                authorizeTableWithSession(session, OperationType.WRITE, tableId);
+                            }
+                        }
+
+                        producerOffsetsManager.deleteSnapshot(producerId);
+                        return new DeleteProducerOffsetsResponse();
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to delete producer offsets for producer "
+                                        + request.getProducerId(),
+                                e);
+                    }
+                },
+                ioExecutor);
+    }
+}

@@ -1,0 +1,523 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.coordinator.event.watcher;
+
+import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.SchemaInfo;
+import org.apache.fluss.metadata.TableChange;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePartition;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
+import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.coordinator.TableLifecycleThrottler;
+import org.apache.fluss.server.coordinator.event.CoordinatorEvent;
+import org.apache.fluss.server.coordinator.event.CreatePartitionEvent;
+import org.apache.fluss.server.coordinator.event.CreateTableEvent;
+import org.apache.fluss.server.coordinator.event.DropPartitionEvent;
+import org.apache.fluss.server.coordinator.event.DropTableEvent;
+import org.apache.fluss.server.coordinator.event.SchemaChangeEvent;
+import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
+import org.apache.fluss.server.coordinator.event.TestingEventManager;
+import org.apache.fluss.server.entity.TablePropertyChanges;
+import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.ZooKeeperExtension;
+import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.ZkVersion;
+import org.apache.fluss.testutils.common.AllCallbackWrapper;
+import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.utils.clock.SystemClock;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Test for {@link TableChangeWatcher}. */
+class TableChangeWatcherTest {
+
+    private static final String DEFAULT_DB = "db";
+
+    private static final TableDescriptor TEST_TABLE =
+            TableDescriptor.builder()
+                    .schema(Schema.newBuilder().column("a", DataTypes.INT()).build())
+                    .distributedBy(3, "a")
+                    .build()
+                    .withReplicationFactor(3);
+
+    @RegisterExtension
+    public static final AllCallbackWrapper<ZooKeeperExtension> ZOO_KEEPER_EXTENSION_WRAPPER =
+            new AllCallbackWrapper<>(new ZooKeeperExtension());
+
+    private static ZooKeeperClient zookeeperClient;
+    private static String remoteDataDir;
+    private TestingEventManager eventManager;
+    private TableLifecycleThrottler lifecycleThrottler;
+    private TableChangeWatcher tableChangeWatcher;
+    private static MetadataManager metadataManager;
+
+    @BeforeAll
+    static void beforeAll() {
+        zookeeperClient =
+                ZOO_KEEPER_EXTENSION_WRAPPER
+                        .getCustomExtension()
+                        .getZooKeeperClient(NOPErrorHandler.INSTANCE);
+        remoteDataDir = zookeeperClient.getDefaultRemoteDataDir();
+        metadataManager =
+                new MetadataManager(
+                        zookeeperClient,
+                        new Configuration(),
+                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
+    }
+
+    @BeforeEach
+    void before() {
+        // Clean up ZK state from previous tests to prevent CuratorCache initial sync
+        // from picking up leftover data
+        try {
+            metadataManager.dropDatabase(DEFAULT_DB, true, true);
+        } catch (Exception ignored) {
+        }
+        metadataManager.createDatabase(DEFAULT_DB, DatabaseDescriptor.builder().build(), false);
+
+        eventManager = new TestingEventManager();
+        lifecycleThrottler =
+                new TableLifecycleThrottler(
+                        eventManager, SystemClock.getInstance(), new Configuration());
+        tableChangeWatcher =
+                new TableChangeWatcher(zookeeperClient, eventManager, lifecycleThrottler);
+        tableChangeWatcher.start();
+    }
+
+    @AfterEach
+    void after() {
+        if (tableChangeWatcher != null) {
+            tableChangeWatcher.stop();
+        }
+        if (lifecycleThrottler != null) {
+            lifecycleThrottler.close();
+        }
+    }
+
+    @Test
+    void testTableChanges() {
+        // create tables, collect create table events
+        List<CoordinatorEvent> expectedEvents = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            TablePath tablePath = TablePath.of(DEFAULT_DB, "table_" + i);
+            TableAssignment tableAssignment =
+                    generateAssignment(
+                            3,
+                            3,
+                            new TabletServerInfo[] {
+                                new TabletServerInfo(0, "rack0"),
+                                new TabletServerInfo(1, "rack1"),
+                                new TabletServerInfo(2, "rack2")
+                            });
+            long tableId =
+                    metadataManager.createTable(
+                            tablePath, remoteDataDir, TEST_TABLE, tableAssignment, false);
+            SchemaInfo schemaInfo = metadataManager.getLatestSchema(tablePath);
+            long currentMillis = System.currentTimeMillis();
+            expectedEvents.add(
+                    new CreateTableEvent(
+                            TableInfo.of(
+                                    tablePath,
+                                    tableId,
+                                    schemaInfo.getSchemaId(),
+                                    TEST_TABLE,
+                                    remoteDataDir,
+                                    currentMillis,
+                                    currentMillis),
+                            tableAssignment));
+            expectedEvents.add(new SchemaChangeEvent(tablePath, schemaInfo));
+        }
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(expectedEvents));
+
+        // drop tables, collect drop table events
+        List<CoordinatorEvent> expectedTableEvents = new ArrayList<>();
+        for (CoordinatorEvent coordinatorEvent : expectedEvents) {
+            if (coordinatorEvent instanceof SchemaChangeEvent) {
+                continue;
+            }
+            CreateTableEvent createTableEvent = (CreateTableEvent) coordinatorEvent;
+            TableInfo tableInfo = createTableEvent.getTableInfo();
+            metadataManager.dropTable(tableInfo.getTablePath(), false);
+            expectedTableEvents.add(new DropTableEvent(tableInfo.getTableId(), false, false));
+        }
+
+        // The throttler admits one drop at a time; drive it by completing each drop
+        // as it appears so the next pending drop is admitted.
+        for (CoordinatorEvent event : expectedTableEvents) {
+            DropTableEvent drop = (DropTableEvent) event;
+            retry(Duration.ofMinutes(1), () -> assertThat(eventManager.getEvents()).contains(drop));
+            lifecycleThrottler.onTableDropCompleted(drop.getTableId());
+        }
+
+        // collect all events and check the all events.
+        List<CoordinatorEvent> allEvents = new ArrayList<>(expectedEvents);
+        allEvents.addAll(expectedTableEvents);
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(allEvents));
+    }
+
+    @Test
+    void testPartitionedTable() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "partition_table");
+        TableDescriptor partitionedTable =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("a", DataTypes.INT())
+                                        .column("b", DataTypes.STRING())
+                                        .build())
+                        .distributedBy(3, "a")
+                        .partitionedBy("b")
+                        .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT.key(), "DAY")
+                        .build()
+                        .withReplicationFactor(3);
+        long tableId =
+                metadataManager.createTable(
+                        tablePath, remoteDataDir, partitionedTable, null, false);
+        List<CoordinatorEvent> expectedEvents = new ArrayList<>();
+        SchemaInfo schemaInfo = metadataManager.getLatestSchema(tablePath);
+        // create table event
+        long currentMillis = System.currentTimeMillis();
+        expectedEvents.add(
+                new CreateTableEvent(
+                        TableInfo.of(
+                                tablePath,
+                                tableId,
+                                schemaInfo.getSchemaId(),
+                                partitionedTable,
+                                remoteDataDir,
+                                currentMillis,
+                                currentMillis),
+                        TableAssignment.builder().build()));
+        expectedEvents.add(new SchemaChangeEvent(tablePath, schemaInfo));
+
+        // register partition
+        PartitionAssignment partitionAssignment =
+                new PartitionAssignment(
+                        tableId,
+                        generateAssignment(
+                                        3,
+                                        3,
+                                        new TabletServerInfo[] {
+                                            new TabletServerInfo(0, "rack0"),
+                                            new TabletServerInfo(1, "rack1"),
+                                            new TabletServerInfo(2, "rack2")
+                                        })
+                                .getBucketAssignments());
+        // register assignment and metadata
+        zookeeperClient.registerPartitionAssignmentAndMetadata(
+                1L,
+                "2011",
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                partitionAssignment.getBucketAssignments().size());
+        zookeeperClient.registerPartitionAssignmentAndMetadata(
+                2L,
+                "2022",
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                partitionAssignment.getBucketAssignments().size());
+
+        // create partitions events
+        expectedEvents.add(
+                new CreatePartitionEvent(tablePath, tableId, 1L, "2011", partitionAssignment));
+        expectedEvents.add(
+                new CreatePartitionEvent(tablePath, tableId, 2L, "2022", partitionAssignment));
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(expectedEvents));
+
+        metadataManager.dropTable(tablePath, false);
+
+        // drop partitions event
+        expectedEvents.add(new DropPartitionEvent(tableId, 1L, "2011"));
+        expectedEvents.add(new DropPartitionEvent(tableId, 2L, "2022"));
+        // drop table event
+        expectedEvents.add(new DropTableEvent(tableId, true, false));
+
+        // The throttler admits one drop at a time; drive it by completing partition
+        // drops as they arrive (the table drop is fire-and-forget for partitioned tables).
+        retry(
+                Duration.ofMinutes(1),
+                () -> {
+                    lifecycleThrottler.onPartitionDropCompleted(new TablePartition(tableId, 1L));
+                    lifecycleThrottler.onPartitionDropCompleted(new TablePartition(tableId, 2L));
+                    assertThat(eventManager.getEvents())
+                            .containsExactlyInAnyOrderElementsOf(expectedEvents);
+                });
+    }
+
+    @Test
+    void testSchemaChanges() {
+        // create tables, collect create table events
+        List<CoordinatorEvent> expectedEvents = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            TablePath tablePath = TablePath.of(DEFAULT_DB, "table_" + i);
+            TableAssignment tableAssignment =
+                    generateAssignment(
+                            3,
+                            3,
+                            new TabletServerInfo[] {
+                                new TabletServerInfo(0, "rack0"),
+                                new TabletServerInfo(1, "rack1"),
+                                new TabletServerInfo(2, "rack2")
+                            });
+            long tableId =
+                    metadataManager.createTable(
+                            tablePath, remoteDataDir, TEST_TABLE, tableAssignment, false);
+            SchemaInfo schemaInfo = metadataManager.getLatestSchema(tablePath);
+            long currentMillis = System.currentTimeMillis();
+            expectedEvents.add(
+                    new CreateTableEvent(
+                            TableInfo.of(
+                                    tablePath,
+                                    tableId,
+                                    schemaInfo.getSchemaId(),
+                                    TEST_TABLE,
+                                    remoteDataDir,
+                                    currentMillis,
+                                    currentMillis),
+                            tableAssignment));
+            expectedEvents.add(new SchemaChangeEvent(tablePath, schemaInfo));
+        }
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(expectedEvents));
+
+        // alter schema.
+        List<CoordinatorEvent> expectedTableEvents = new ArrayList<>();
+        for (CoordinatorEvent coordinatorEvent : expectedEvents) {
+            if (coordinatorEvent instanceof SchemaChangeEvent) {
+                continue;
+            }
+            CreateTableEvent createTableEvent = (CreateTableEvent) coordinatorEvent;
+            TableInfo tableInfo = createTableEvent.getTableInfo();
+            metadataManager.alterTableSchema(
+                    tableInfo.getTablePath(),
+                    Collections.singletonList(
+                            TableChange.addColumn(
+                                    "add_column",
+                                    DataTypes.INT(),
+                                    null,
+                                    TableChange.ColumnPosition.last())),
+                    false,
+                    null);
+            Schema newSchema =
+                    Schema.newBuilder()
+                            .fromSchema(tableInfo.getSchema())
+                            .column("add_column", DataTypes.INT())
+                            .build();
+            expectedTableEvents.add(
+                    new SchemaChangeEvent(tableInfo.getTablePath(), new SchemaInfo(newSchema, 2)));
+        }
+
+        // collect all events and check the all events
+        List<CoordinatorEvent> allEvents = new ArrayList<>(expectedEvents);
+        allEvents.addAll(expectedTableEvents);
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(allEvents));
+    }
+
+    @Test
+    void testTableRegistrationChange() {
+        // create a table
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "table_registration_change");
+        TableAssignment tableAssignment =
+                generateAssignment(
+                        3,
+                        3,
+                        new TabletServerInfo[] {
+                            new TabletServerInfo(0, "rack0"),
+                            new TabletServerInfo(1, "rack1"),
+                            new TabletServerInfo(2, "rack2")
+                        });
+        long tableId =
+                metadataManager.createTable(
+                        tablePath, remoteDataDir, TEST_TABLE, tableAssignment, false);
+        SchemaInfo schemaInfo = metadataManager.getLatestSchema(tablePath);
+        long currentMillis = System.currentTimeMillis();
+
+        List<CoordinatorEvent> expectedEvents = new ArrayList<>();
+        expectedEvents.add(
+                new CreateTableEvent(
+                        TableInfo.of(
+                                tablePath,
+                                tableId,
+                                schemaInfo.getSchemaId(),
+                                TEST_TABLE,
+                                remoteDataDir,
+                                currentMillis,
+                                currentMillis),
+                        tableAssignment));
+        expectedEvents.add(new SchemaChangeEvent(tablePath, schemaInfo));
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(expectedEvents));
+
+        // alter table properties (custom property)
+        TablePropertyChanges.Builder builder = TablePropertyChanges.builder();
+        builder.setCustomProperty("custom.key", "custom.value");
+        TablePropertyChanges tablePropertyChanges = builder.build();
+        metadataManager.alterTableProperties(
+                tablePath,
+                Collections.emptyList(),
+                tablePropertyChanges,
+                false,
+                null,
+                (currentTable, updatedTable) -> {},
+                (currentTable, updatedTable) -> {},
+                ZkVersion.MATCH_ANY_VERSION.getVersion());
+
+        // get the updated table registration
+        TableRegistration updatedTableRegistration =
+                metadataManager.getTableRegistration(tablePath);
+
+        // verify TableRegistrationChangeEvent is generated
+        expectedEvents.add(new TableRegistrationChangeEvent(tablePath, updatedTableRegistration));
+
+        metadataManager.dropTable(tablePath, false);
+        expectedEvents.add(new DropTableEvent(tableId, false, false));
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(eventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(expectedEvents));
+    }
+
+    /**
+     * Tests that table creation is correctly detected via NODE_CREATED events with full data. This
+     * exercises the fix for the CuratorCache async getData race condition.
+     *
+     * <p>When CuratorCache starts (or during the race), it fires NODE_CREATED for table nodes that
+     * already contain full data. Without the fix, only NODE_CHANGED triggers {@code
+     * processCreateTable}, so these events would be missed. The fix adds table path handling in the
+     * NODE_CREATED branch to cover this case.
+     */
+    @Test
+    void testTableCreationDetectedViaNodeCreatedEvent() {
+        // Stop the watcher started in @BeforeEach to prevent it from processing events
+        tableChangeWatcher.stop();
+
+        // Create tables BEFORE starting a new watcher. This ensures that when
+        // CuratorCache starts and does its initial sync, the table nodes already
+        // have full data. CuratorCache fires NODE_CREATED (not NODE_CHANGED) for
+        // existing nodes, exercising the same code path that handles the race
+        // condition where NODE_CHANGED is lost due to async getData.
+        List<CoordinatorEvent> expectedEvents = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            TablePath tablePath = TablePath.of(DEFAULT_DB, "table_nc_" + i);
+            TableAssignment tableAssignment =
+                    generateAssignment(
+                            3,
+                            3,
+                            new TabletServerInfo[] {
+                                new TabletServerInfo(0, "rack0"),
+                                new TabletServerInfo(1, "rack1"),
+                                new TabletServerInfo(2, "rack2")
+                            });
+            long tableId =
+                    metadataManager.createTable(
+                            tablePath, remoteDataDir, TEST_TABLE, tableAssignment, false);
+            SchemaInfo schemaInfo = metadataManager.getLatestSchema(tablePath);
+            long currentMillis = System.currentTimeMillis();
+            expectedEvents.add(
+                    new CreateTableEvent(
+                            TableInfo.of(
+                                    tablePath,
+                                    tableId,
+                                    schemaInfo.getSchemaId(),
+                                    TEST_TABLE,
+                                    remoteDataDir,
+                                    currentMillis,
+                                    currentMillis),
+                            tableAssignment));
+            expectedEvents.add(new SchemaChangeEvent(tablePath, schemaInfo));
+        }
+
+        // Verify that the watcher has not processed any events
+        assertThat(eventManager.getEvents()).isEmpty();
+
+        // Start a new watcher. CuratorCache initial sync fires NODE_CREATED for
+        // existing nodes with full data - the same code path as when the async
+        // getData race causes NODE_CHANGED to be lost.
+        TestingEventManager newEventManager = new TestingEventManager();
+        TableLifecycleThrottler newThrottler =
+                new TableLifecycleThrottler(
+                        newEventManager, SystemClock.getInstance(), new Configuration());
+        TableChangeWatcher newWatcher =
+                new TableChangeWatcher(zookeeperClient, newEventManager, newThrottler);
+        newWatcher.start();
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(newEventManager.getEvents())
+                                .containsExactlyInAnyOrderElementsOf(expectedEvents));
+        newWatcher.stop();
+        newThrottler.close();
+    }
+}

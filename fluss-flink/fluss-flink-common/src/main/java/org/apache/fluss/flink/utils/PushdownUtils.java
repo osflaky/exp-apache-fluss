@@ -1,0 +1,564 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.utils;
+
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.admin.ListOffsetsResult;
+import org.apache.fluss.client.admin.OffsetSpec;
+import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.scanner.batch.BatchScanner;
+import org.apache.fluss.client.table.writer.UpsertWriter;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.StatisticsColumnsConfig;
+import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.flink.source.lookup.FlinkLookupFunction;
+import org.apache.fluss.flink.source.lookup.LookupNormalizer;
+import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.PartitionSpec;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TableStats;
+import org.apache.fluss.predicate.CompoundPredicate;
+import org.apache.fluss.predicate.LeafPredicate;
+import org.apache.fluss.predicate.Predicate;
+import org.apache.fluss.predicate.PredicateVisitor;
+import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.TimestampLtz;
+import org.apache.fluss.row.TimestampNtz;
+import org.apache.fluss.types.DataTypeChecks;
+
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.TimestampData;
+import org.apache.flink.table.data.binary.BinaryStringData;
+import org.apache.flink.table.expressions.CallExpression;
+import org.apache.flink.table.expressions.FieldReferenceExpression;
+import org.apache.flink.table.expressions.ResolvedExpression;
+import org.apache.flink.table.expressions.ValueLiteralExpression;
+import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
+import org.apache.flink.table.functions.LookupFunction;
+import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.RowType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.Serializable;
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.apache.fluss.client.table.scanner.batch.BatchScanUtils.collectRows;
+import static org.apache.fluss.flink.source.lookup.LookupNormalizer.createPrimaryKeyLookupNormalizer;
+import static org.apache.fluss.utils.ExceptionUtils.findThrowable;
+
+/** Utilities for pushdown abilities. */
+public class PushdownUtils {
+    private static final Logger LOG = LoggerFactory.getLogger(PushdownUtils.class);
+
+    private static final int MAX_LIMIT_PUSHDOWN = 2048;
+
+    /** Extract field equality information from expressions. */
+    public static List<FieldEqual> extractFieldEquals(
+            List<ResolvedExpression> expressions,
+            Map<Integer, LogicalType> fieldIndexToType,
+            List<ResolvedExpression> acceptedFiltersResult,
+            List<ResolvedExpression> remainingFiltersResult,
+            ValueConversion valueConversion) {
+        List<FieldEqual> fieldEquals = new ArrayList<>();
+        for (ResolvedExpression expr : expressions) {
+            if (expr instanceof CallExpression && expr.getChildren().size() == 2) {
+                CallExpression callExpress = (CallExpression) expr;
+
+                // Only support equals now.
+                if (callExpress.getFunctionDefinition() == BuiltInFunctionDefinitions.EQUALS) {
+
+                    ResolvedExpression left = expr.getResolvedChildren().get(0);
+                    ResolvedExpression right = expr.getResolvedChildren().get(1);
+
+                    FieldEqual fieldEqual = null;
+                    if (left instanceof FieldReferenceExpression
+                            && right instanceof ValueLiteralExpression) {
+                        FieldReferenceExpression leftFieldRef = (FieldReferenceExpression) left;
+                        ValueLiteralExpression rightValue = (ValueLiteralExpression) right;
+                        fieldEqual =
+                                extractFieldEqual(
+                                        leftFieldRef,
+                                        rightValue,
+                                        fieldIndexToType,
+                                        valueConversion);
+                    } else if (left instanceof ValueLiteralExpression
+                            && right instanceof FieldReferenceExpression) {
+                        ValueLiteralExpression leftValue = (ValueLiteralExpression) left;
+                        FieldReferenceExpression rightFieldRef = (FieldReferenceExpression) right;
+                        fieldEqual =
+                                extractFieldEqual(
+                                        rightFieldRef,
+                                        leftValue,
+                                        fieldIndexToType,
+                                        valueConversion);
+                    }
+
+                    if (fieldEqual != null) {
+                        fieldEquals.add(fieldEqual);
+                        acceptedFiltersResult.add(expr);
+                    } else {
+                        remainingFiltersResult.add(expr);
+                    }
+                } else {
+                    remainingFiltersResult.add(expr);
+                }
+            } else {
+                remainingFiltersResult.add(expr);
+            }
+        }
+        return fieldEquals;
+    }
+
+    @Nullable
+    private static FieldEqual extractFieldEqual(
+            FieldReferenceExpression fieldsRef,
+            ValueLiteralExpression valueLiteral,
+            Map<Integer, LogicalType> fieldIndexToType,
+            ValueConversion valueConversion) {
+        int columnIndex = fieldsRef.getFieldIndex();
+        if (fieldIndexToType.containsKey(columnIndex)) {
+            LogicalType expectedType = fieldIndexToType.get(columnIndex);
+            if (expectedType.getTypeRoot()
+                    != valueLiteral.getOutputDataType().getLogicalType().getTypeRoot()) {
+                return null;
+            }
+
+            final Object value;
+            if (valueConversion == ValueConversion.FLINK_INTERNAL_VALUE) {
+                value = toFlinkInternalValue(valueLiteral);
+            } else {
+                value = toFlussInternalValue(valueLiteral);
+            }
+
+            if (value == null) {
+                return null;
+            } else {
+                return new FieldEqual(columnIndex, value);
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private static Object toFlussInternalValue(ValueLiteralExpression valueExp) {
+        LogicalType type = valueExp.getOutputDataType().getLogicalType();
+        Object value;
+        switch (type.getTypeRoot()) {
+            case CHAR:
+            case VARCHAR:
+                value = BinaryString.fromString(valueExp.getValueAs(String.class).get());
+                break;
+            case BOOLEAN:
+                value = valueExp.getValueAs(Boolean.class).get();
+                break;
+            case DECIMAL:
+                DecimalType decimalType = (DecimalType) type;
+                value =
+                        Decimal.fromBigDecimal(
+                                valueExp.getValueAs(BigDecimal.class).get(),
+                                decimalType.getPrecision(),
+                                decimalType.getScale());
+                break;
+            case INTEGER:
+                value = valueExp.getValueAs(Integer.class).get();
+                break;
+            case BIGINT:
+                value = valueExp.getValueAs(Long.class).get();
+                break;
+            case DOUBLE:
+                value = valueExp.getValueAs(Double.class).get();
+                break;
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+                value =
+                        TimestampNtz.fromLocalDateTime(
+                                valueExp.getValueAs(LocalDateTime.class).get());
+                break;
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                value = TimestampLtz.fromInstant(valueExp.getValueAs(Instant.class).get());
+                break;
+            default:
+                value = null;
+                break;
+        }
+        return value;
+    }
+
+    @Nullable
+    private static Object toFlinkInternalValue(ValueLiteralExpression valueExp) {
+        LogicalType type = valueExp.getOutputDataType().getLogicalType();
+        Object value;
+        switch (type.getTypeRoot()) {
+            case CHAR:
+            case VARCHAR:
+                value = BinaryStringData.fromString(valueExp.getValueAs(String.class).get());
+                break;
+            case BOOLEAN:
+                value = valueExp.getValueAs(Boolean.class).get();
+                break;
+            case DECIMAL:
+                DecimalType decimalType = (DecimalType) type;
+                value =
+                        DecimalData.fromBigDecimal(
+                                valueExp.getValueAs(BigDecimal.class).get(),
+                                decimalType.getPrecision(),
+                                decimalType.getScale());
+                break;
+            case INTEGER:
+                value = valueExp.getValueAs(Integer.class).get();
+                break;
+            case BIGINT:
+                value = valueExp.getValueAs(Long.class).get();
+                break;
+            case DOUBLE:
+                value = valueExp.getValueAs(Double.class).get();
+                break;
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+                value =
+                        TimestampData.fromLocalDateTime(
+                                valueExp.getValueAs(LocalDateTime.class).get());
+                break;
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                value = TimestampData.fromInstant(valueExp.getValueAs(Instant.class).get());
+                break;
+            default:
+                value = null;
+                break;
+        }
+        return value;
+    }
+
+    public static Collection<RowData> querySingleRow(
+            GenericRowData lookupRow,
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType sourceOutputType,
+            int[] primaryKeyIndexes,
+            @Nullable int[] projectedFields) {
+        LookupNormalizer lookupNormalizer =
+                createPrimaryKeyLookupNormalizer(primaryKeyIndexes, sourceOutputType);
+        LookupFunction lookupFunction =
+                new FlinkLookupFunction(
+                        flussConfig,
+                        tablePath,
+                        sourceOutputType,
+                        lookupNormalizer,
+                        projectedFields,
+                        false);
+        try {
+            // it's fine to pass null here, as we don't use it in it
+            lookupFunction.open(null);
+            return lookupFunction.lookup(lookupRow);
+        } catch (Exception e) {
+            throw new FlussRuntimeException(e);
+        }
+    }
+
+    public static void deleteSingleRow(
+            GenericRow deleteRow, TablePath tablePath, Configuration flussConfig) {
+        try (Connection connection = ConnectionFactory.createConnection(flussConfig);
+                Table table = connection.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            upsertWriter.delete(deleteRow).get();
+        } catch (Exception e) {
+            throw new TableException("Failed execute DELETE statement on Fluss table.", e);
+        }
+    }
+
+    public static Collection<RowData> limitScan(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            long limitRowNum) {
+        if (limitRowNum > MAX_LIMIT_PUSHDOWN) {
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "LIMIT statement doesn't support greater than %s", MAX_LIMIT_PUSHDOWN));
+        }
+        int limit = (int) limitRowNum;
+        try (Connection connection = ConnectionFactory.createConnection(flussConfig);
+                Table table = connection.getTable(tablePath);
+                BatchScanner batchScanner =
+                        table.newScan()
+                                .project(projectedFields)
+                                .limit(limit)
+                                .createBatchScanner()) {
+            List<InternalRow> scannedRows = collectRows(batchScanner);
+            // convert fluss row into flink row
+            List<RowData> flinkRows = new ArrayList<>();
+            FlussRowToFlinkRowConverter flussRowToFlinkRowConverter =
+                    new FlussRowToFlinkRowConverter(
+                            projectedFields != null
+                                    ? FlinkConversions.toFlussRowType(sourceOutputType)
+                                            .project(projectedFields)
+                                    : FlinkConversions.toFlussRowType(sourceOutputType));
+            int count = 0;
+            for (InternalRow row : scannedRows) {
+                flinkRows.add(flussRowToFlinkRowConverter.toFlinkRowData(row));
+                if (++count >= limit) {
+                    break;
+                }
+            }
+
+            return flinkRows;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(e);
+        }
+    }
+
+    public static boolean partitionExists(
+            TablePath tablePath, Configuration flussConfig, PartitionSpec partitionSpec) {
+        try (Connection connection = ConnectionFactory.createConnection(flussConfig);
+                Admin flussAdmin = connection.getAdmin()) {
+            return !flussAdmin.listPartitionInfos(tablePath, partitionSpec).get().isEmpty();
+        } catch (Exception e) {
+            throw new FlussRuntimeException(e);
+        }
+    }
+
+    public static long countTable(TablePath tablePath, Configuration flussConfig) {
+        try (Connection connection = ConnectionFactory.createConnection(flussConfig);
+                Admin flussAdmin = connection.getAdmin()) {
+            try {
+                TableStats tableStats = flussAdmin.getTableStats(tablePath).get();
+                return tableStats.getRowCount();
+            } catch (Exception e) {
+                if (findThrowable(e, UnsupportedVersionException.class).isPresent()) {
+                    // if the server doesn't support getTableStats, we fallback to countLogTable,
+                    // which is less efficient.
+                    return countLogTable(flussAdmin, tablePath);
+                } else {
+                    throw e;
+                }
+            }
+        } catch (Exception e) {
+            throw new FlussRuntimeException(e);
+        }
+    }
+
+    /**
+     * We keep this method for back compatibility for old clusters (< 0.9), but it's not efficient.
+     * We should use countTable instead in the future.
+     */
+    private static long countLogTable(Admin flussAdmin, TablePath tablePath) throws Exception {
+        TableInfo tableInfo = flussAdmin.getTableInfo(tablePath).get();
+        if (tableInfo.hasPrimaryKey()) {
+            throw new IllegalArgumentException(
+                    "The Fluss cluster doesn't support count(*) on primary key table yet. Please upgrade to newer version (≥ 0.9).");
+        }
+        int bucketCount = tableInfo.getNumBuckets();
+        List<PartitionInfo> partitionInfos;
+        if (tableInfo.isPartitioned()) {
+            partitionInfos = flussAdmin.listPartitionInfos(tablePath).get();
+        } else {
+            partitionInfos = Collections.singletonList(null);
+        }
+
+        List<CompletableFuture<Long>> countFutureList =
+                offsetLengthes(flussAdmin, tablePath, partitionInfos, bucketCount);
+        // wait for all the response
+        CompletableFuture.allOf(countFutureList.toArray(new CompletableFuture[0])).join();
+        long count = 0;
+        for (CompletableFuture<Long> countFuture : countFutureList) {
+            count += countFuture.get();
+        }
+        return count;
+    }
+
+    private static List<CompletableFuture<Long>> offsetLengthes(
+            Admin flussAdmin,
+            TablePath tablePath,
+            List<PartitionInfo> partitionInfos,
+            int tableBucketCount) {
+        List<CompletableFuture<Long>> list = new ArrayList<>();
+        for (@Nullable PartitionInfo info : partitionInfos) {
+            String partitionName = info != null ? info.getPartitionName() : null;
+            int partitionBucketCount = PartitionInfo.bucketCountOrDefault(info, tableBucketCount);
+            Collection<Integer> buckets =
+                    IntStream.range(0, partitionBucketCount).boxed().collect(Collectors.toList());
+            ListOffsetsResult earliestOffsets =
+                    listOffsets(
+                            flussAdmin,
+                            tablePath,
+                            buckets,
+                            new OffsetSpec.EarliestSpec(),
+                            partitionName);
+            ListOffsetsResult latestOffsets =
+                    listOffsets(
+                            flussAdmin,
+                            tablePath,
+                            buckets,
+                            new OffsetSpec.LatestSpec(),
+                            partitionName);
+            CompletableFuture<Long> apply =
+                    earliestOffsets
+                            .all()
+                            .thenCombine(
+                                    latestOffsets.all(),
+                                    (earliestOffsetsMap, latestOffsetsMap) -> {
+                                        long count = 0;
+                                        for (int bucket : earliestOffsetsMap.keySet()) {
+                                            count +=
+                                                    latestOffsetsMap.get(bucket)
+                                                            - earliestOffsetsMap.get(bucket);
+                                        }
+                                        return count;
+                                    });
+            list.add(apply);
+        }
+        return list;
+    }
+
+    private static ListOffsetsResult listOffsets(
+            Admin flussAdmin,
+            TablePath tablePath,
+            Collection<Integer> buckets,
+            OffsetSpec offsetSpec,
+            @Nullable String partitionName) {
+        return partitionName == null
+                ? flussAdmin.listOffsets(tablePath, buckets, offsetSpec)
+                : flussAdmin.listOffsets(tablePath, partitionName, buckets, offsetSpec);
+    }
+
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Computes the set of column names that have statistics available for filter pushdown, based on
+     * the table's statistics configuration. Returns an empty set when statistics collection is
+     * disabled.
+     *
+     * @param flussRowType the row type whose columns are considered
+     * @param tableConfig the table configuration carrying the statistics settings
+     * @return the set of column names that have statistics available
+     */
+    public static Set<String> computeAvailableStatsColumns(
+            org.apache.fluss.types.RowType flussRowType, TableConfig tableConfig) {
+        StatisticsColumnsConfig statsConfig = tableConfig.getStatisticsColumns();
+        if (!statsConfig.isEnabled()) {
+            LOG.debug("Statistics collection is disabled for the table");
+            return Collections.emptySet();
+        }
+
+        Set<String> columns = new HashSet<>();
+        if (statsConfig.getMode() == StatisticsColumnsConfig.Mode.ALL) {
+            for (int i = 0; i < flussRowType.getFieldCount(); i++) {
+                if (DataTypeChecks.isSupportedStatisticsType(flussRowType.getTypeAt(i))) {
+                    columns.add(flussRowType.getFieldNames().get(i));
+                }
+            }
+        } else {
+            for (String columnName : statsConfig.getColumns()) {
+                int columnIndex = flussRowType.getFieldNames().indexOf(columnName);
+                if (columnIndex >= 0) {
+                    if (DataTypeChecks.isSupportedStatisticsType(
+                            flussRowType.getTypeAt(columnIndex))) {
+                        columns.add(columnName);
+                    } else {
+                        LOG.trace(
+                                "Configured statistics column '{}' has unsupported type and will be ignored",
+                                columnName);
+                    }
+                } else {
+                    LOG.trace(
+                            "Configured statistics column '{}' does not exist in table schema",
+                            columnName);
+                }
+            }
+        }
+        return columns;
+    }
+
+    /**
+     * Checks if a predicate can benefit from statistics based on the available statistics columns.
+     * A compound predicate is usable only if all of its children are usable.
+     *
+     * @param predicate the predicate to check
+     * @param rowType the row type the predicate indexes into
+     * @param availableStatsColumns the columns that have statistics available
+     * @return true if the predicate can use statistics
+     */
+    public static boolean canPredicateUseStatistics(
+            Predicate predicate,
+            org.apache.fluss.types.RowType rowType,
+            Set<String> availableStatsColumns) {
+        class StatisticsUsageVisitor implements PredicateVisitor<Boolean> {
+            @Override
+            public Boolean visit(LeafPredicate leaf) {
+                String fieldName = rowType.getFieldNames().get(leaf.index());
+                return availableStatsColumns.contains(fieldName);
+            }
+
+            @Override
+            public Boolean visit(CompoundPredicate compound) {
+                for (Predicate child : compound.children()) {
+                    if (!child.visit(this)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+
+        return predicate.visit(new StatisticsUsageVisitor());
+    }
+
+    /** A structure represents a source field equal literal expression. */
+    public static class FieldEqual implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public final int fieldIndex;
+        public final Object equalValue;
+
+        public FieldEqual(int fieldIndex, Object equalValue) {
+            this.fieldIndex = fieldIndex;
+            this.equalValue = equalValue;
+        }
+    }
+
+    /** The value conversion type between Flink internal value and Fluss internal value. */
+    public enum ValueConversion {
+        FLUSS_INTERNAL_VALUE,
+        FLINK_INTERNAL_VALUE
+    }
+}

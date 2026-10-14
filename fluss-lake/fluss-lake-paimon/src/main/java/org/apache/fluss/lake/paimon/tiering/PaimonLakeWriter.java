@@ -1,0 +1,173 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.lake.paimon.tiering;
+
+import org.apache.fluss.lake.batch.ArrowRecordBatch;
+import org.apache.fluss.lake.batch.RecordBatch;
+import org.apache.fluss.lake.paimon.tiering.append.AppendOnlyWriter;
+import org.apache.fluss.lake.paimon.tiering.mergetree.MergeTreeWriter;
+import org.apache.fluss.lake.paimon.utils.PaimonUtils;
+import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.SupportsRecordBatchWrite;
+import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.types.RowType;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.table.FileStoreTable;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
+
+/** Implementation of {@link LakeWriter} for Paimon. */
+public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, SupportsRecordBatchWrite {
+
+    private final Catalog paimonCatalog;
+    private final RecordWriter<?> recordWriter;
+
+    public PaimonLakeWriter(
+            PaimonCatalogProvider paimonCatalogProvider, WriterInitContext writerInitContext)
+            throws IOException {
+        this.paimonCatalog = paimonCatalogProvider.get();
+        // Only Fixed Bucket tables (bucket keys non-empty) carry a positive BUCKET in Paimon.
+        // Overriding on an Unaware Bucket table (BUCKET = -1) would change its bucket mode.
+        // The context always resolves the actual bucket count.
+        Integer bucketOverride =
+                !writerInitContext.tableInfo().getBucketKeys().isEmpty()
+                        ? writerInitContext.bucketCount()
+                        : null;
+        TablePath lakeTablePath = writerInitContext.tableInfo().getLakeTablePath();
+        FileStoreTable fileStoreTable =
+                getTable(
+                        lakeTablePath,
+                        writerInitContext.tableInfo().getTableConfig().isDataLakeAutoCompaction(),
+                        bucketOverride);
+
+        List<String> partitionKeys = fileStoreTable.partitionKeys();
+        RowType flussRowType = writerInitContext.tableInfo().getRowType();
+        boolean historicalPartition =
+                HISTORICAL_PARTITION_VALUE.equals(writerInitContext.partition());
+
+        // FIP-27: detect whether the target Paimon table is a clean table (only user columns) or a
+        // legacy table (carrying the three Fluss system columns). Writers emit system columns only
+        // for legacy tables.
+        boolean paimonIncludingSystemColumns = PaimonUtils.isLegacyTable(fileStoreTable.rowType());
+
+        this.recordWriter =
+                fileStoreTable.primaryKeys().isEmpty()
+                        ? new AppendOnlyWriter(
+                                fileStoreTable,
+                                writerInitContext.tableBucket(),
+                                writerInitContext.partition(),
+                                partitionKeys,
+                                flussRowType,
+                                paimonIncludingSystemColumns,
+                                historicalPartition)
+                        : new MergeTreeWriter(
+                                fileStoreTable,
+                                writerInitContext.tableBucket(),
+                                writerInitContext.partition(),
+                                partitionKeys,
+                                flussRowType,
+                                writerInitContext.ioTmpDirs(),
+                                paimonIncludingSystemColumns,
+                                historicalPartition);
+    }
+
+    @Override
+    public void write(LogRecord record) throws IOException {
+        try {
+            recordWriter.write(record);
+        } catch (Exception e) {
+            throw new IOException("Failed to write Fluss record to Paimon.", e);
+        }
+    }
+
+    @Override
+    public void write(RecordBatch recordBatch) throws IOException {
+        if (!(recordBatch instanceof ArrowRecordBatch)) {
+            throw new IllegalArgumentException(
+                    "PaimonLakeWriter only supports ArrowRecordBatch, but got "
+                            + recordBatch.getClass().getSimpleName());
+        }
+        if (!(recordWriter instanceof AppendOnlyWriter)) {
+            throw new IllegalStateException(
+                    "Arrow record batch writing is only supported for append-only tables.");
+        }
+        try {
+            ((AppendOnlyWriter) recordWriter)
+                    .writeArrowBatch(((ArrowRecordBatch) recordBatch).getArrowBatchData());
+        } catch (Exception e) {
+            throw new IOException("Failed to write Arrow record batch to Paimon.", e);
+        }
+    }
+
+    @Override
+    public PaimonWriteResult complete() throws IOException {
+        try {
+            return new PaimonWriteResult(recordWriter.complete());
+        } catch (Exception e) {
+            throw new IOException("Failed to complete Paimon write.", e);
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        try {
+            if (recordWriter != null) {
+                recordWriter.close();
+            }
+            if (paimonCatalog != null) {
+                paimonCatalog.close();
+            }
+        } catch (Exception e) {
+            throw new IOException("Failed to close PaimonLakeWriter.", e);
+        }
+    }
+
+    private FileStoreTable getTable(
+            TablePath tablePath, boolean isAutoCompaction, @Nullable Integer bucketOverride)
+            throws IOException {
+        try {
+            FileStoreTable table = (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
+            if (bucketOverride != null) {
+                // copy(Map) rejects BUCKET as immutable, so swap it in via a schema copy,
+                // which only rebuilds the in-memory table view.
+                Map<String, String> schemaOptions = new HashMap<>(table.schema().options());
+                schemaOptions.put(CoreOptions.BUCKET.key(), String.valueOf(bucketOverride));
+                table = table.copy(table.schema().copy(schemaOptions));
+            }
+            Map<String, String> dynamicOptions = new HashMap<>();
+            dynamicOptions.put(
+                    CoreOptions.WRITE_ONLY.key(),
+                    isAutoCompaction ? Boolean.FALSE.toString() : Boolean.TRUE.toString());
+            return table.copy(dynamicOptions);
+        } catch (Exception e) {
+            throw new IOException("Failed to get table " + tablePath + " in Paimon.", e);
+        }
+    }
+}

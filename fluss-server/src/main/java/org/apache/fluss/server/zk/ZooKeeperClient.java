@@ -1,0 +1,2459 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.server.zk;
+
+import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.ConfigurationUtils;
+import org.apache.fluss.config.FlussConfigUtils;
+import org.apache.fluss.exception.CoordinatorEpochFencedException;
+import org.apache.fluss.metadata.DatabaseSummary;
+import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.SchemaInfo;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePartition;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.security.acl.AccessControlEntry;
+import org.apache.fluss.security.acl.Resource;
+import org.apache.fluss.security.acl.ResourceType;
+import org.apache.fluss.server.authorizer.DefaultAuthorizer.VersionedAcls;
+import org.apache.fluss.server.coordinator.CoordinatorContext;
+import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
+import org.apache.fluss.server.metadata.BucketMetadata;
+import org.apache.fluss.server.zk.ZkAsyncRequest.ZkCheckExistsRequest;
+import org.apache.fluss.server.zk.ZkAsyncRequest.ZkGetChildrenRequest;
+import org.apache.fluss.server.zk.ZkAsyncRequest.ZkGetDataRequest;
+import org.apache.fluss.server.zk.ZkAsyncResponse.ZkCheckExistsResponse;
+import org.apache.fluss.server.zk.ZkAsyncResponse.ZkGetChildrenResponse;
+import org.apache.fluss.server.zk.ZkAsyncResponse.ZkGetDataResponse;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
+import org.apache.fluss.server.zk.data.CoordinatorAddress;
+import org.apache.fluss.server.zk.data.DatabaseRegistration;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
+import org.apache.fluss.server.zk.data.RebalanceTask;
+import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
+import org.apache.fluss.server.zk.data.ResourceAcl;
+import org.apache.fluss.server.zk.data.ServerTags;
+import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.TabletServerRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.server.zk.data.ZkData.AclChangeNotificationNode;
+import org.apache.fluss.server.zk.data.ZkData.BucketIdsZNode;
+import org.apache.fluss.server.zk.data.ZkData.BucketRemoteLogsZNode;
+import org.apache.fluss.server.zk.data.ZkData.BucketSnapshotIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.BucketSnapshotsZNode;
+import org.apache.fluss.server.zk.data.ZkData.ConfigEntityZNode;
+import org.apache.fluss.server.zk.data.ZkData.DatabaseZNode;
+import org.apache.fluss.server.zk.data.ZkData.DatabasesZNode;
+import org.apache.fluss.server.zk.data.ZkData.KvSnapshotLeaseZNode;
+import org.apache.fluss.server.zk.data.ZkData.KvSnapshotLeasesZNode;
+import org.apache.fluss.server.zk.data.ZkData.LakeTableZNode;
+import org.apache.fluss.server.zk.data.ZkData.LeaderAndIsrZNode;
+import org.apache.fluss.server.zk.data.ZkData.PartitionIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.PartitionSequenceIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.PartitionZNode;
+import org.apache.fluss.server.zk.data.ZkData.PartitionsZNode;
+import org.apache.fluss.server.zk.data.ZkData.ProducerIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.ProducersZNode;
+import org.apache.fluss.server.zk.data.ZkData.RebalanceZNode;
+import org.apache.fluss.server.zk.data.ZkData.ResourceAclNode;
+import org.apache.fluss.server.zk.data.ZkData.SchemaZNode;
+import org.apache.fluss.server.zk.data.ZkData.SchemasZNode;
+import org.apache.fluss.server.zk.data.ZkData.ServerIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.ServerIdsZNode;
+import org.apache.fluss.server.zk.data.ZkData.ServerTagsZNode;
+import org.apache.fluss.server.zk.data.ZkData.TableIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.TableSequenceIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.TableZNode;
+import org.apache.fluss.server.zk.data.ZkData.TablesZNode;
+import org.apache.fluss.server.zk.data.ZkData.WriterIdZNode;
+import org.apache.fluss.server.zk.data.ZkVersion;
+import org.apache.fluss.server.zk.data.lake.LakeTable;
+import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFramework;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.BackgroundCallback;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.CuratorEvent;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.transaction.CuratorOp;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.CreateMode;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.data.Stat;
+import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.types.Tuple2;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static java.util.stream.Collectors.toMap;
+import static org.apache.fluss.metadata.ResolvedPartitionSpec.fromPartitionName;
+import static org.apache.fluss.server.zk.ZooKeeperOp.multiRequest;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+
+/**
+ * This class includes methods for write/read various metadata (leader address, tablet server
+ * registration, table assignment, table, schema) in Zookeeper.
+ *
+ * <p>In some method, 'expectedZkVersion' is used to execute an epoch Zookeeper version check.
+ * Conditions requiring epoch checks (all must be met):
+ *
+ * <pre>
+ * ┌─────────────────────────────────────────────────────────┐
+ * │ 1. Invoked by the Coordinator (not the TabletServer)    │
+ * │ 2. Operates on persistent nodes (not ephemeral)         │
+ * │ 3. Constitutes a "control plane" operation:             │
+ * │    partition assignment or LeaderAndIsr election        │
+ * │ 4. Concurrent access to the same path by old and new    │
+ * │    leaders during leader failover                       │
+ * │ 5. No other mechanisms (optimistic locking,             │
+ * │    idempotency, or reloading) provide fallback          │
+ * └─────────────────────────────────────────────────────────┘
+ * </pre>
+ *
+ * <p>In practice, only two types of operations truly require this:
+ *
+ * <ul>
+ *   <li>CRUD for Table/Partition Assignment (assignment decisions).
+ *   <li>CRUD for LeaderAndIsr (leader election results).
+ * </ul>
+ *
+ * <p>These operations are inevitably executed concurrently by the old and new coordinators during
+ * failover (as the new leader immediately reassigns partitions), and overwrites cannot be
+ * automatically recovered.
+ *
+ * <p>All other operations do not require epoch checks because:
+ *
+ * <ul>
+ *   <li>DDL operations are protected against concurrency by client reconnection mechanisms.
+ *   <li>TabletServer operations are unaffected by coordinator failovers.
+ *   <li>ACLs and Configs have their own version control or idempotency guarantees.
+ *   <li>Ephemeral nodes are managed via session lifecycle.
+ * </ul>
+ */
+@Internal
+public class ZooKeeperClient implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ZooKeeperClient.class);
+    public static final int UNKNOWN_VERSION = -2;
+    private static final int MAX_BATCH_SIZE = 1024;
+    private static final int DEFAULT_SCHEMA_ID = 1;
+
+    private final CuratorFrameworkWithUnhandledErrorListener curatorFrameworkWrapper;
+
+    private final CuratorFramework zkClient;
+    private final ZooKeeperOp zkOp;
+    private final ZkSequenceIDCounter tableIdCounter;
+    private final ZkSequenceIDCounter partitionIdCounter;
+    private final ZkSequenceIDCounter writerIdCounter;
+
+    private final Semaphore inFlightRequests;
+    private final Configuration configuration;
+
+    private final String defaultRemoteDataDir;
+
+    public ZooKeeperClient(
+            CuratorFrameworkWithUnhandledErrorListener curatorFrameworkWrapper,
+            Configuration configuration) {
+        this.curatorFrameworkWrapper = curatorFrameworkWrapper;
+        this.zkClient = curatorFrameworkWrapper.asCuratorFramework();
+        this.zkOp = new ZooKeeperOp(zkClient);
+        this.tableIdCounter = new ZkSequenceIDCounter(zkClient, TableSequenceIdZNode.path());
+        this.partitionIdCounter =
+                new ZkSequenceIDCounter(zkClient, PartitionSequenceIdZNode.path());
+        this.writerIdCounter = new ZkSequenceIDCounter(zkClient, WriterIdZNode.path());
+
+        int maxInFlightRequests =
+                configuration.getInt(ConfigOptions.ZOOKEEPER_MAX_INFLIGHT_REQUESTS);
+        this.inFlightRequests = new Semaphore(maxInFlightRequests);
+        this.configuration = configuration;
+
+        this.defaultRemoteDataDir = FlussConfigUtils.getDefaultRemoteDataDir(configuration);
+    }
+
+    public Optional<byte[]> getOrEmpty(String path) throws Exception {
+        try {
+            return Optional.of(zkClient.getData().forPath(path));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Reads the znode data and captures its {@link Stat} (hence the ZK version) atomically. Used by
+     * compare-and-set callers that must write back with the exact version they read.
+     */
+    private Optional<byte[]> getDataWithStat(String path, Stat stat) throws Exception {
+        try {
+            return Optional.of(zkClient.getData().storingStatIn(stat).forPath(path));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    public String getDefaultRemoteDataDir() {
+        return defaultRemoteDataDir;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Coordinator server
+    // --------------------------------------------------------------------------------------------
+
+    /** Register a coordinator server to ZK. */
+    public void registerCoordinatorServer(CoordinatorAddress coordinatorAddress) throws Exception {
+        String path = ZkData.CoordinatorIdZNode.path(coordinatorAddress.getId());
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.EPHEMERAL)
+                .forPath(path, ZkData.CoordinatorIdZNode.encode(coordinatorAddress));
+        LOG.info("Registered Coordinator server {} at path {}.", coordinatorAddress, path);
+    }
+
+    /**
+     * Become coordinator leader. This method is a step after electCoordinatorLeader() and before
+     * registerCoordinatorLeader(). This is to ensure the coordinator get and update the coordinator
+     * epoch and coordinator epoch zk version.
+     */
+    public ZkEpoch fenceBecomeCoordinatorLeader(String coordinatorId) throws Exception {
+        ensureEpochZnodeExists();
+
+        try {
+            ZkEpoch getEpoch = getCurrentEpoch();
+            int currentCoordinatorEpoch = getEpoch.getCoordinatorEpoch();
+            int currentCoordinatorEpochZkVersion = getEpoch.getCoordinatorEpochZkVersion();
+            int newCoordinatorEpoch = currentCoordinatorEpoch + 1;
+            LOG.info(
+                    "Coordinator leader {} tries to update epoch. Current epoch={}, Zookeeper version={}, new epoch={}",
+                    coordinatorId,
+                    currentCoordinatorEpoch,
+                    currentCoordinatorEpochZkVersion,
+                    newCoordinatorEpoch);
+
+            // atomically update epoch
+            Stat stat =
+                    zkClient.setData()
+                            .withVersion(currentCoordinatorEpochZkVersion)
+                            .forPath(
+                                    ZkData.CoordinatorEpochZNode.path(),
+                                    ZkData.CoordinatorEpochZNode.encode(newCoordinatorEpoch));
+
+            LOG.info(
+                    "Coordinator leader has updated epoch. Current epoch={}, Zookeeper version={}",
+                    newCoordinatorEpoch,
+                    stat.getVersion());
+
+            return new ZkEpoch(newCoordinatorEpoch, stat.getVersion());
+        } catch (KeeperException.BadVersionException e) {
+            // Other coordinator leader has updated epoch.
+            // If this happens, it means our fence is in effect.
+            LOG.info("Coordinator leader {} failed to update epoch.", coordinatorId);
+            throw new CoordinatorEpochFencedException(
+                    "Coordinator leader election has been fenced.");
+        }
+    }
+
+    /** Register a coordinator leader to ZK. */
+    public void registerCoordinatorLeader(CoordinatorAddress coordinatorAddress) throws Exception {
+        String path = ZkData.CoordinatorLeaderZNode.path();
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.EPHEMERAL)
+                .forPath(path, ZkData.CoordinatorLeaderZNode.encode(coordinatorAddress));
+        LOG.info("Registered Coordinator leader {} at path {}.", coordinatorAddress, path);
+    }
+
+    /** Manually unregister a coordinator leader from ZK. */
+    public void unregisterCoordinatorLeader(CoordinatorAddress coordinatorAddress)
+            throws Exception {
+        String path = ZkData.CoordinatorLeaderZNode.path();
+        Stat stat = new Stat();
+        byte[] bytes = zkClient.getData().storingStatIn(stat).forPath(path);
+        if (bytes == null || bytes.length == 0) {
+            // not exists, not need to unregister
+            return;
+        }
+        CoordinatorAddress storedAddress = ZkData.CoordinatorLeaderZNode.decode(bytes);
+        if (storedAddress.getId().equals(coordinatorAddress.getId())) {
+            zkClient.delete().withVersion(stat.getVersion()).forPath(path);
+            LOG.info("Unregistered Coordinator leader {} at path {}.", coordinatorAddress, path);
+        }
+    }
+
+    /** Get the leader address registered in ZK. */
+    public Optional<CoordinatorAddress> getCoordinatorLeaderAddress() throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(ZkData.CoordinatorLeaderZNode.path());
+        return bytes.map(
+                data ->
+                        // maybe an empty node when a leader is elected but not registered
+                        data.length == 0 ? null : ZkData.CoordinatorLeaderZNode.decode(data));
+    }
+
+    /** Gets the list of coordinator server Ids. */
+    public List<String> getCoordinatorServerList() throws Exception {
+        return getChildren(ZkData.CoordinatorIdsZNode.path());
+    }
+
+    /** Ensure epoch znode exists. */
+    public void ensureEpochZnodeExists() throws Exception {
+        String path = ZkData.CoordinatorEpochZNode.path();
+        if (zkClient.checkExists().forPath(path) == null) {
+            try {
+                zkClient.create()
+                        .creatingParentsIfNeeded()
+                        .withMode(CreateMode.PERSISTENT)
+                        .forPath(
+                                path,
+                                ZkData.CoordinatorEpochZNode.encode(
+                                        CoordinatorContext.INITIAL_COORDINATOR_EPOCH - 1));
+            } catch (KeeperException.NodeExistsException e) {
+                // can be ignored when two coordinator almost simultaneously create the epoch znode
+            }
+        }
+    }
+
+    /** Get epoch now in ZK. */
+    public ZkEpoch getCurrentEpoch() throws Exception {
+        Stat currentStat = new Stat();
+        byte[] bytes =
+                zkClient.getData()
+                        .storingStatIn(currentStat)
+                        .forPath(ZkData.CoordinatorEpochZNode.path());
+        int currentEpoch = ZkData.CoordinatorEpochZNode.decode(bytes);
+        int currentVersion = currentStat.getVersion();
+        return new ZkEpoch(currentEpoch, currentVersion);
+    }
+    // --------------------------------------------------------------------------------------------
+    // Tablet server
+    // --------------------------------------------------------------------------------------------
+
+    /** Register a tablet server to ZK. */
+    public void registerTabletServer(
+            int tabletServerId, TabletServerRegistration tabletServerRegistration)
+            throws Exception {
+        String path = ServerIdZNode.path(tabletServerId);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.EPHEMERAL)
+                .forPath(path, ServerIdZNode.encode(tabletServerRegistration));
+        LOG.info(
+                "Registered tablet server {} at path {} with registration {}.",
+                tabletServerId,
+                path,
+                tabletServerRegistration);
+    }
+
+    /** Get the tablet server registered in ZK. */
+    public Optional<TabletServerRegistration> getTabletServer(int tabletServerId) throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(ServerIdZNode.path(tabletServerId));
+        return bytes.map(ServerIdZNode::decode);
+    }
+
+    /** Get the tablet servers registered in ZK. */
+    public Map<Integer, TabletServerRegistration> getTabletServers(int[] tabletServerIds)
+            throws Exception {
+        Map<String, Integer> path2IdMap =
+                Arrays.stream(tabletServerIds)
+                        .boxed()
+                        .collect(toMap(ServerIdZNode::path, id -> id));
+
+        List<ZkGetDataResponse> responses = getDataInBackground(path2IdMap.keySet());
+        return processGetDataResponses(
+                responses,
+                response -> path2IdMap.get(response.getPath()),
+                ServerIdZNode::decode,
+                "tablet server registration");
+    }
+
+    /** Gets the list of sorted server Ids. */
+    public int[] getSortedTabletServerList() throws Exception {
+        List<String> tabletServers = getChildren(ServerIdsZNode.path());
+        return tabletServers.stream().mapToInt(Integer::parseInt).sorted().toArray();
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Tablet assignments
+    // --------------------------------------------------------------------------------------------
+
+    /** Register table assignment to ZK. */
+    public void registerTableAssignment(long tableId, TableAssignment tableAssignment)
+            throws Exception {
+        String path = TableIdZNode.path(tableId);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, TableIdZNode.encode(tableAssignment));
+        LOG.info("Registered table assignment {} for table id {}.", tableAssignment, tableId);
+    }
+
+    /** Get the table assignment in ZK. */
+    public Optional<TableAssignment> getTableAssignment(long tableId) throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(TableIdZNode.path(tableId));
+        return bytes.map(
+                data ->
+                        // we'll put a laketable node under TableIdZNode,
+                        // so it won't be Optional#empty
+                        // but will with a zero-length array
+                        data.length == 0 ? null : TableIdZNode.decode(data));
+    }
+
+    /** Get the tables assignments in ZK. */
+    public Map<Long, TableAssignment> getTablesAssignments(Collection<Long> tableIds)
+            throws Exception {
+        Map<String, Long> path2TableIdMap =
+                tableIds.stream().collect(toMap(TableIdZNode::path, id -> id));
+
+        List<ZkGetDataResponse> responses = getDataInBackground(path2TableIdMap.keySet());
+        return processGetDataResponsesOrThrow(
+                responses,
+                response -> path2TableIdMap.get(response.getPath()),
+                data -> data == null || data.length == 0 ? null : TableIdZNode.decode(data));
+    }
+
+    /** Get the partition assignment in ZK. */
+    public Optional<PartitionAssignment> getPartitionAssignment(long partitionId) throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(PartitionIdZNode.path(partitionId));
+        return bytes.map(PartitionIdZNode::decode);
+    }
+
+    /** Get the partitions assignments in ZK. */
+    public Map<Long, PartitionAssignment> getPartitionsAssignments(Collection<Long> partitionIds)
+            throws Exception {
+        Map<String, Long> path2PartitionIdMap =
+                partitionIds.stream().collect(toMap(PartitionIdZNode::path, id -> id));
+
+        List<ZkGetDataResponse> responses = getDataInBackground(path2PartitionIdMap.keySet());
+        return processGetDataResponsesOrThrow(
+                responses,
+                response -> path2PartitionIdMap.get(response.getPath()),
+                PartitionIdZNode::decode);
+    }
+
+    public void updateTableAssignment(
+            long tableId, TableAssignment tableAssignment, int expectedZkVersion) throws Exception {
+        String path = TableIdZNode.path(tableId);
+        byte[] data = TableIdZNode.encode(tableAssignment);
+        CuratorOp updateOp = zkOp.updateOp(path, data);
+        List<CuratorOp> ops = wrapRequestWithEpochCheck(updateOp, expectedZkVersion);
+
+        zkClient.transaction().forOperations(ops);
+        LOG.debug("Updated table assignment {} for table id {}.", tableAssignment, tableId);
+    }
+
+    public void updatePartitionAssignment(
+            long partitionId, PartitionAssignment partitionAssignment, int expectedZkVersion)
+            throws Exception {
+        String path = PartitionIdZNode.path(partitionId);
+        byte[] data = PartitionIdZNode.encode(partitionAssignment);
+        CuratorOp updateOp = zkOp.updateOp(path, data);
+        List<CuratorOp> ops = wrapRequestWithEpochCheck(updateOp, expectedZkVersion);
+
+        zkClient.transaction().forOperations(ops);
+        LOG.debug(
+                "Updated partition assignment {} for partition id {}.",
+                partitionAssignment,
+                partitionId);
+    }
+
+    public void deleteTableAssignment(long tableId) throws Exception {
+        String path = TableIdZNode.path(tableId);
+        zkClient.delete().deletingChildrenIfNeeded().forPath(path);
+        LOG.info("Deleted table assignment for table id {}.", tableId);
+    }
+
+    public void deletePartitionAssignment(long partitionId) throws Exception {
+        String path = PartitionIdZNode.path(partitionId);
+        zkClient.delete().deletingChildrenIfNeeded().forPath(path);
+        LOG.info("Deleted table assignment for partition id {}.", partitionId);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Table state
+    // --------------------------------------------------------------------------------------------
+
+    /** Register bucket LeaderAndIsr to ZK. */
+    public void registerLeaderAndIsr(
+            TableBucket tableBucket, LeaderAndIsr leaderAndIsr, int expectedZkVersion)
+            throws Exception {
+
+        String path = LeaderAndIsrZNode.path(tableBucket);
+        byte[] data = LeaderAndIsrZNode.encode(leaderAndIsr);
+
+        createRecursiveWithEpochCheck(path, data, expectedZkVersion, false);
+        LOG.info("Registered {} for bucket {} in Zookeeper.", leaderAndIsr, tableBucket);
+    }
+
+    public void batchRegisterLeaderAndIsrForTablePartition(
+            List<RegisterTableBucketLeadAndIsrInfo> registerList, int expectedZkVersion)
+            throws Exception {
+        if (registerList.isEmpty()) {
+            return;
+        }
+
+        List<CuratorOp> ops = new ArrayList<>(registerList.size());
+        // In transaction API, it is not allowed to use "creatingParentsIfNeeded()"
+        // So we have to create parent dictionary in advance.
+        RegisterTableBucketLeadAndIsrInfo firstInfo = registerList.get(0);
+        String bucketsParentPath = BucketIdsZNode.path(firstInfo.getTableBucket());
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(bucketsParentPath);
+
+        for (RegisterTableBucketLeadAndIsrInfo info : registerList) {
+            LOG.info(
+                    "Batch Register {} for bucket {} in Zookeeper.",
+                    info.getLeaderAndIsr(),
+                    info.getTableBucket());
+            byte[] data = LeaderAndIsrZNode.encode(info.getLeaderAndIsr());
+            // create direct parent node
+            CuratorOp parentNodeCreate =
+                    zkClient.transactionOp()
+                            .create()
+                            .withMode(CreateMode.PERSISTENT)
+                            .forPath(ZkData.BucketIdZNode.path(info.getTableBucket()));
+            // create current node
+            CuratorOp currentNodeCreate =
+                    zkClient.transactionOp()
+                            .create()
+                            .withMode(CreateMode.PERSISTENT)
+                            .forPath(LeaderAndIsrZNode.path(info.getTableBucket()), data);
+            ops.add(parentNodeCreate);
+            ops.add(currentNodeCreate);
+            if (ops.size() == MAX_BATCH_SIZE) {
+                List<CuratorOp> wrapOps = wrapRequestsWithEpochCheck(ops, expectedZkVersion);
+                zkClient.transaction().forOperations(wrapOps);
+                ops.clear();
+            }
+        }
+        if (!ops.isEmpty()) {
+            List<CuratorOp> wrapOps = wrapRequestsWithEpochCheck(ops, expectedZkVersion);
+            zkClient.transaction().forOperations(wrapOps);
+        }
+        LOG.info(
+                "Batch registered leadAndIsr for tableId: {}, partitionId: {}, partitionName: {}  in Zookeeper.",
+                firstInfo.getTableBucket().getTableId(),
+                firstInfo.getTableBucket().getPartitionId(),
+                firstInfo.getPartitionName());
+    }
+
+    /** Get the bucket LeaderAndIsr in ZK. */
+    public Optional<LeaderAndIsr> getLeaderAndIsr(TableBucket tableBucket) throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(LeaderAndIsrZNode.path(tableBucket));
+        return bytes.map(LeaderAndIsrZNode::decode);
+    }
+
+    /**
+     * Get the LeaderAndIsr for each buckets in a batch async way. The returned map only contains
+     * buckets those have leader and isr assigned (zk node created).
+     */
+    public Map<TableBucket, LeaderAndIsr> getLeaderAndIsrs(Collection<TableBucket> tableBuckets)
+            throws Exception {
+        Map<String, TableBucket> path2TableBucketMap =
+                tableBuckets.stream().collect(toMap(LeaderAndIsrZNode::path, bucket -> bucket));
+
+        List<ZkGetDataResponse> responses = getDataInBackground(path2TableBucketMap.keySet());
+        return processGetDataResponsesOrThrow(
+                responses,
+                response -> path2TableBucketMap.get(response.getPath()),
+                LeaderAndIsrZNode::decode);
+    }
+
+    public void updateLeaderAndIsr(
+            TableBucket tableBucket, LeaderAndIsr leaderAndIsr, int expectedZkVersion)
+            throws Exception {
+        String path = LeaderAndIsrZNode.path(tableBucket);
+        byte[] data = LeaderAndIsrZNode.encode(leaderAndIsr);
+
+        CuratorOp updateOp = zkOp.updateOp(path, data);
+        List<CuratorOp> ops = wrapRequestWithEpochCheck(updateOp, expectedZkVersion);
+
+        zkClient.transaction().forOperations(ops);
+        LOG.info("Updated {} for bucket {} in Zookeeper.", leaderAndIsr, tableBucket);
+    }
+
+    public void batchUpdateLeaderAndIsr(
+            Map<TableBucket, LeaderAndIsr> leaderAndIsrList, int expectedZkVersion)
+            throws Exception {
+        if (leaderAndIsrList.isEmpty()) {
+            return;
+        }
+
+        long startTimeMs = System.currentTimeMillis();
+        int transactionCount = 0;
+        List<CuratorOp> ops = new ArrayList<>(leaderAndIsrList.size());
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry : leaderAndIsrList.entrySet()) {
+            TableBucket tableBucket = entry.getKey();
+            LeaderAndIsr leaderAndIsr = entry.getValue();
+
+            LOG.debug("Batch update {} for bucket {} in ZooKeeper.", leaderAndIsr, tableBucket);
+            String path = LeaderAndIsrZNode.path(tableBucket);
+            byte[] data = LeaderAndIsrZNode.encode(leaderAndIsr);
+            CuratorOp updateOp = zkClient.transactionOp().setData().forPath(path, data);
+            ops.add(updateOp);
+            if (ops.size() == MAX_BATCH_SIZE) {
+                List<CuratorOp> wrapOps = wrapRequestsWithEpochCheck(ops, expectedZkVersion);
+                zkClient.transaction().forOperations(wrapOps);
+                transactionCount++;
+                ops.clear();
+            }
+        }
+        if (!ops.isEmpty()) {
+            List<CuratorOp> wrapOps = wrapRequestsWithEpochCheck(ops, expectedZkVersion);
+            zkClient.transaction().forOperations(wrapOps);
+            transactionCount++;
+        }
+        LOG.info(
+                "Batch updated LeaderAndIsr for {} buckets in {} ZooKeeper transactions in {} ms.",
+                leaderAndIsrList.size(),
+                transactionCount,
+                System.currentTimeMillis() - startTimeMs);
+    }
+
+    protected void deleteLeaderAndIsr(TableBucket tableBucket) throws Exception {
+        String path = LeaderAndIsrZNode.path(tableBucket);
+        zkClient.delete().forPath(path);
+        LOG.info("Deleted LeaderAndIsr for bucket {} in Zookeeper.", tableBucket);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Database
+    // --------------------------------------------------------------------------------------------
+    public void registerDatabase(String database, DatabaseRegistration databaseRegistration)
+            throws Exception {
+        String path = DatabaseZNode.path(database);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, DatabaseZNode.encode(databaseRegistration));
+        LOG.info("Registered database {}", database);
+    }
+
+    public void updateDatabase(String database, DatabaseRegistration databaseRegistration)
+            throws Exception {
+        String path = DatabaseZNode.path(database);
+        zkClient.setData().forPath(path, DatabaseZNode.encode(databaseRegistration));
+        LOG.info("Updated database {}", database);
+    }
+
+    /** Get the database in ZK. */
+    public Optional<DatabaseRegistration> getDatabase(String database) throws Exception {
+        String path = DatabaseZNode.path(database);
+        Optional<byte[]> bytes = getOrEmpty(path);
+        return bytes.map(DatabaseZNode::decode);
+    }
+
+    public void deleteDatabase(String database) throws Exception {
+        String path = DatabaseZNode.path(database);
+        zkClient.delete().deletingChildrenIfNeeded().forPath(path);
+    }
+
+    public boolean databaseExists(String database) throws Exception {
+        String path = DatabaseZNode.path(database);
+        return zkClient.checkExists().forPath(path) != null;
+    }
+
+    public List<String> listDatabases() throws Exception {
+        return getChildren(DatabasesZNode.path());
+    }
+
+    public List<DatabaseSummary> listDatabaseSummaries(Collection<String> databaseNames)
+            throws Exception {
+        Map<String, String> dbPathToDatabaseName =
+                databaseNames.stream()
+                        .collect(toMap(DatabaseZNode::path, databaseName -> databaseName));
+        Map<String, String> tablesPathToDatabaseName =
+                databaseNames.stream()
+                        .collect(toMap(TablesZNode::path, databaseName -> databaseName));
+        List<String> requestPaths = new ArrayList<>(dbPathToDatabaseName.keySet());
+        requestPaths.addAll(tablesPathToDatabaseName.keySet());
+        List<ZkCheckExistsResponse> statResponses = getStatInBackground(requestPaths);
+
+        List<DatabaseSummary> databaseSummaries = new ArrayList<>();
+
+        Map<String, Long> dbCreatedTimes = new HashMap<>();
+        Map<String, Integer> dbTableCounts = new HashMap<>();
+        for (ZkCheckExistsResponse response : statResponses) {
+            Stat stat = response.getStat();
+            String path = response.getPath();
+            if (!response.hasError() && stat != null) {
+                if (dbPathToDatabaseName.containsKey(path)) {
+                    // Use zk node creation time as the database creation time to avoid reading
+                    // node data.
+                    dbCreatedTimes.put(dbPathToDatabaseName.get(path), stat.getCtime());
+                } else {
+                    dbTableCounts.put(tablesPathToDatabaseName.get(path), stat.getNumChildren());
+                }
+            } else if (response.getResultCode().equals(KeeperException.Code.NONODE)
+                    && tablesPathToDatabaseName.containsKey(path)) {
+                dbTableCounts.put(tablesPathToDatabaseName.get(path), 0);
+            } else {
+                LOG.warn(
+                        "Failed to get database summary for database {}: {}",
+                        path,
+                        response.getErrorMessage());
+            }
+        }
+
+        for (String databaseName : databaseNames) {
+            if (dbCreatedTimes.containsKey(databaseName)
+                    && dbTableCounts.containsKey(databaseName)) {
+                databaseSummaries.add(
+                        new DatabaseSummary(
+                                databaseName,
+                                dbCreatedTimes.get(databaseName),
+                                dbTableCounts.get(databaseName)));
+            }
+        }
+        return databaseSummaries;
+    }
+
+    public List<String> listTables(String databaseName) throws Exception {
+        return getChildren(TablesZNode.path(databaseName));
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Table
+    // --------------------------------------------------------------------------------------------
+
+    /** generate a table id . */
+    public long getTableIdAndIncrement() throws Exception {
+        return tableIdCounter.getAndIncrement();
+    }
+
+    public long getPartitionIdAndIncrement() throws Exception {
+        return partitionIdCounter.getAndIncrement();
+    }
+
+    /** Register table to ZK metadata. */
+    public void registerTable(TablePath tablePath, TableRegistration tableRegistration)
+            throws Exception {
+        registerTable(tablePath, tableRegistration, true);
+    }
+
+    /**
+     * Register table to ZK metadata.
+     *
+     * @param needCreateNode when register a table to zk, whether need to create the node of the
+     *     path. In the case that we first register the schema to a path which will be the children
+     *     path of the path to store the table, then register the table, we won't need to create the
+     *     node again.
+     */
+    public void registerTable(
+            TablePath tablePath, TableRegistration tableRegistration, boolean needCreateNode)
+            throws Exception {
+        String path = TableZNode.path(tablePath);
+        byte[] tableBytes = TableZNode.encode(tableRegistration);
+        if (needCreateNode) {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path, tableBytes);
+        } else {
+            zkClient.setData().forPath(path, tableBytes);
+        }
+        LOG.info(
+                "Registered table {} for database {}",
+                tablePath.getTableName(),
+                tablePath.getDatabaseName());
+    }
+
+    /** Get the table in ZK. */
+    public Optional<TableRegistration> getTable(TablePath tablePath) throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(TableZNode.path(tablePath));
+        Optional<TableRegistration> tableRegistration = bytes.map(TableZNode::decode);
+        // Set the default remote data dir for a node generated by an older version which does not
+        // have remote data dir
+        return tableRegistration.map(
+                t -> t.remoteDataDir == null ? t.newRemoteDataDir(defaultRemoteDataDir) : t);
+    }
+
+    /**
+     * Get the table registration together with the ZK version of its znode, so callers can perform
+     * a compare-and-set write (see {@link #updateTableWithPartitionBucketCountBackfill}).
+     */
+    public Optional<VersionedData<TableRegistration>> getTableWithVersion(TablePath tablePath)
+            throws Exception {
+        Stat stat = new Stat();
+        Optional<byte[]> bytes = getDataWithStat(TableZNode.path(tablePath), stat);
+        return bytes.map(TableZNode::decode)
+                .map(t -> t.remoteDataDir == null ? t.newRemoteDataDir(defaultRemoteDataDir) : t)
+                .map(t -> new VersionedData<>(t, stat.getVersion()));
+    }
+
+    /** Get the tables in ZK. */
+    public Map<TablePath, TableRegistration> getTables(Collection<TablePath> tablePaths)
+            throws Exception {
+        Map<String, TablePath> path2TablePathMap =
+                tablePaths.stream().collect(Collectors.toMap(TableZNode::path, path -> path));
+
+        List<ZkGetDataResponse> responses = getDataInBackground(path2TablePathMap.keySet());
+        return processGetDataResponses(
+                responses,
+                response -> path2TablePathMap.get(response.getPath()),
+                (data) -> {
+                    TableRegistration tableRegistration = TableZNode.decode(data);
+                    // Set the default remote data dir for a node generated by an older version
+                    // which does not
+                    // have remote data dir
+                    if (tableRegistration.remoteDataDir == null) {
+                        tableRegistration =
+                                tableRegistration.newRemoteDataDir(defaultRemoteDataDir);
+                    }
+                    return tableRegistration;
+                },
+                "tables registration");
+    }
+
+    /** Get the latest schema for given tables in ZK. */
+    public Map<TablePath, SchemaInfo> getLatestSchemas(Collection<TablePath> tablePaths)
+            throws Exception {
+        Map<String, TablePath> schemaChildren2TablePathMap =
+                tablePaths.stream().collect(toMap(SchemasZNode::path, path -> path));
+        List<ZkGetChildrenResponse> childrenResponses =
+                getChildrenInBackground(schemaChildren2TablePathMap.keySet());
+        // get the schema ids for each table
+        Map<TablePath, List<String>> schemaIdsForTables =
+                processGetChildrenResponses(
+                        childrenResponses,
+                        response -> schemaChildren2TablePathMap.get(response.getPath()),
+                        "schema children for tables");
+
+        // get the schema info for each latest schema id
+        Map<TablePath, Integer> latestSchemaIdMap = new HashMap<>();
+        Map<String, TablePath> path2TablePathMap = new HashMap<>();
+        schemaIdsForTables.forEach(
+                (tp, schemaIds) -> {
+                    int latestSchemaId =
+                            schemaIds.stream().map(Integer::parseInt).reduce(Math::max).orElse(0);
+                    latestSchemaIdMap.put(tp, latestSchemaId);
+                    path2TablePathMap.put(SchemaZNode.path(tp, latestSchemaId), tp);
+                });
+
+        List<ZkGetDataResponse> responses = getDataInBackground(path2TablePathMap.keySet());
+        Map<TablePath, Schema> schemasForTables =
+                processGetDataResponses(
+                        responses,
+                        resp -> path2TablePathMap.get(resp.getPath()),
+                        SchemaZNode::decode,
+                        "schema");
+
+        Map<TablePath, SchemaInfo> result = new HashMap<>();
+        schemasForTables.forEach(
+                (tp, schema) -> {
+                    int schemaId = latestSchemaIdMap.get(tp);
+                    result.put(tp, new SchemaInfo(schema, schemaId));
+                });
+        return result;
+    }
+
+    /** Update the table in ZK. */
+    public void updateTable(TablePath tablePath, TableRegistration tableRegistration)
+            throws Exception {
+        String path = TableZNode.path(tablePath);
+        zkClient.setData().forPath(path, TableZNode.encode(tableRegistration));
+        LOG.info(
+                "Updated table {} for database {}",
+                tablePath.getTableName(),
+                tablePath.getDatabaseName());
+    }
+
+    /** Delete the table in ZK. */
+    public void deleteTable(TablePath tablePath) throws Exception {
+        String path = TableZNode.path(tablePath);
+        zkClient.delete().deletingChildrenIfNeeded().forPath(path);
+        LOG.info("Deleted table {}.", tablePath);
+    }
+
+    public boolean tableExist(TablePath tablePath) throws Exception {
+        String path = TableZNode.path(tablePath);
+        Stat stat = zkClient.checkExists().forPath(path);
+        // when we create a table, we will first create a node with
+        // path 'table_path/schemas/schema_id' to store the schema, so we can't use the path of
+        // table 'table_path' exist or not to check the table exist or not.
+        return stat != null && stat.getDataLength() > 0;
+    }
+
+    /** Get the partitions of a table in ZK. */
+    public Set<String> getPartitions(TablePath tablePath) throws Exception {
+        String path = PartitionsZNode.path(tablePath);
+        return new HashSet<>(getChildren(path));
+    }
+
+    /** Get the partitions of tables in ZK. */
+    public Map<TablePath, List<String>> getPartitionsForTables(Collection<TablePath> tablePaths)
+            throws Exception {
+        Map<String, TablePath> path2TablePathMap =
+                tablePaths.stream().collect(toMap(PartitionsZNode::path, path -> path));
+
+        List<ZkGetChildrenResponse> responses = getChildrenInBackground(path2TablePathMap.keySet());
+        return processGetChildrenResponses(
+                responses,
+                response -> path2TablePathMap.get(response.getPath()),
+                "partitions for tables");
+    }
+
+    /** Get the partition registrations of a table in ZK. */
+    public Map<String, PartitionRegistration> getPartitionRegistrations(TablePath tablePath)
+            throws Exception {
+        return getPartitionRegistrations(tablePath, getPartitions(tablePath));
+    }
+
+    /** Get the partition and the id for the partitions of tables in ZK. */
+    public Map<TablePath, Map<String, Long>> getPartitionNameAndIdsForTables(
+            List<TablePath> tablePaths) throws Exception {
+        Map<TablePath, Map<String, Long>> result = new HashMap<>();
+
+        Map<TablePath, List<String>> tablePath2Partitions = getPartitionsForTables(tablePaths);
+
+        // each TablePath has a list of partitions
+        Map<String, TablePath> zkPath2TablePath = new HashMap<>();
+        Map<String, String> zkPath2PartitionName = new HashMap<>();
+        for (Map.Entry<TablePath, List<String>> entry : tablePath2Partitions.entrySet()) {
+            TablePath tablePath = entry.getKey();
+            List<String> partitions = entry.getValue();
+            for (String partitionName : partitions) {
+                zkPath2TablePath.put(PartitionZNode.path(tablePath, partitionName), tablePath);
+                zkPath2PartitionName.put(
+                        PartitionZNode.path(tablePath, partitionName), partitionName);
+            }
+        }
+
+        List<ZkGetDataResponse> responses = getDataInBackground(zkPath2TablePath.keySet());
+        for (ZkGetDataResponse response : responses) {
+            if (response.getResultCode() == KeeperException.Code.OK) {
+                String zkPath = response.getPath();
+                TablePath tablePath = zkPath2TablePath.get(zkPath);
+                String partitionName = zkPath2PartitionName.get(zkPath);
+                long partitionId = PartitionZNode.decode(response.getData()).getPartitionId();
+                result.computeIfAbsent(tablePath, k -> new HashMap<>())
+                        .put(partitionName, partitionId);
+            } else {
+                LOG.warn(
+                        "Failed to get data for path {}: {}",
+                        response.getPath(),
+                        response.getResultCode());
+            }
+        }
+        return result;
+    }
+
+    /** Get the partition registrations of a table in ZK by partition spec. */
+    public Map<String, PartitionRegistration> getPartitionRegistrations(
+            TablePath tablePath,
+            List<String> partitionKeys,
+            ResolvedPartitionSpec partialPartitionSpec)
+            throws Exception {
+        List<String> matchedPartitionNames =
+                getPartitions(tablePath).stream()
+                        .filter(
+                                partitionName ->
+                                        fromPartitionName(partitionKeys, partitionName)
+                                                .contains(partialPartitionSpec))
+                        .collect(Collectors.toList());
+        return getPartitionRegistrations(tablePath, matchedPartitionNames);
+    }
+
+    private Map<String, PartitionRegistration> getPartitionRegistrations(
+            TablePath tablePath, Collection<String> partitionNames) throws Exception {
+        Map<String, String> path2PartitionName =
+                partitionNames.stream()
+                        .collect(
+                                toMap(
+                                        partitionName ->
+                                                PartitionZNode.path(tablePath, partitionName),
+                                        partitionName -> partitionName));
+        return getPartitionZNodeData(
+                path2PartitionName,
+                partitionRegistration ->
+                        partitionRegistration.getRemoteDataDir() == null
+                                ? partitionRegistration.newRemoteDataDir(defaultRemoteDataDir)
+                                : partitionRegistration);
+    }
+
+    /** Get the id and name for the partitions of a table in ZK. */
+    public Map<Long, String> getPartitionIdAndNames(TablePath tablePath) throws Exception {
+        Map<Long, String> result = new HashMap<>();
+        getPartitionIdAndPaths(Collections.singletonList(tablePath))
+                .forEach(
+                        (k, v) -> {
+                            result.put(k, v.getPartitionName());
+                        });
+        return result;
+    }
+
+    /** Get the id and name for the partitions of tables in ZK. */
+    public Map<Long, PhysicalTablePath> getPartitionIdAndPaths(Collection<TablePath> tablePath)
+            throws Exception {
+        // batch get partitions names for tables
+        Map<TablePath, List<String>> partitionsForTables = getPartitionsForTables(tablePath);
+        List<PhysicalTablePath> partitionPaths = new ArrayList<>();
+        for (Map.Entry<TablePath, List<String>> entry : partitionsForTables.entrySet()) {
+            for (String partitionName : entry.getValue()) {
+                partitionPaths.add(PhysicalTablePath.of(entry.getKey(), partitionName));
+            }
+        }
+
+        // batch get partitions ids
+        Map<PhysicalTablePath, TablePartition> partitionIds = getPartitionIds(partitionPaths);
+        Map<Long, PhysicalTablePath> partitionIdAndPaths = new HashMap<>();
+        partitionIds.forEach(
+                (partitionPath, tablePartition) -> {
+                    if (tablePartition != null) {
+                        partitionIdAndPaths.put(tablePartition.getPartitionId(), partitionPath);
+                    }
+                });
+
+        return partitionIdAndPaths;
+    }
+
+    /** Get a partition of a table in ZK. */
+    public Optional<PartitionRegistration> getPartition(TablePath tablePath, String partitionName)
+            throws Exception {
+        String path = PartitionZNode.path(tablePath, partitionName);
+        Optional<PartitionRegistration> partitionRegistration =
+                getOrEmpty(path).map(PartitionZNode::decode);
+        // Set the default remote data dir for a node generated by an older version which does not
+        // have remote data dir
+        return partitionRegistration.map(
+                p -> p.getRemoteDataDir() == null ? p.newRemoteDataDir(defaultRemoteDataDir) : p);
+    }
+
+    /**
+     * Get a partition registration together with the ZK version of its znode, so callers can
+     * perform a compare-and-set backfill (see {@link
+     * #updateTableWithPartitionBucketCountBackfill}).
+     */
+    public Optional<VersionedData<PartitionRegistration>> getPartitionWithVersion(
+            TablePath tablePath, String partitionName) throws Exception {
+        String path = PartitionZNode.path(tablePath, partitionName);
+        Stat stat = new Stat();
+        return getDataWithStat(path, stat)
+                .map(PartitionZNode::decode)
+                .map(
+                        p ->
+                                p.getRemoteDataDir() == null
+                                        ? p.newRemoteDataDir(defaultRemoteDataDir)
+                                        : p)
+                .map(p -> new VersionedData<>(p, stat.getVersion()));
+    }
+
+    /**
+     * Gets all partition registrations of a table together with their ZK versions. The partition
+     * znodes are fetched concurrently to avoid one synchronous ZooKeeper round trip per partition.
+     * A partition dropped after the children listing is omitted from the result.
+     */
+    public Map<String, VersionedData<PartitionRegistration>> getPartitionRegistrationsWithVersion(
+            TablePath tablePath) throws Exception {
+        Set<String> partitionNames = getPartitions(tablePath);
+        if (partitionNames.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, String> pathToPartitionName =
+                partitionNames.stream()
+                        .collect(toMap(name -> PartitionZNode.path(tablePath, name), name -> name));
+        List<ZkGetDataResponse> responses = getDataInBackground(pathToPartitionName.keySet());
+        Map<String, VersionedData<PartitionRegistration>> registrations = new HashMap<>();
+        for (ZkGetDataResponse response : responses) {
+            if (response.getResultCode() == KeeperException.Code.NONODE) {
+                continue;
+            }
+            response.maybeThrow();
+            byte[] data =
+                    checkNotNull(
+                            response.getData(),
+                            "Partition registration data must not be null for %s",
+                            response.getPath());
+            Stat stat =
+                    checkNotNull(
+                            response.getStat(),
+                            "Partition registration stat must not be null for %s",
+                            response.getPath());
+            PartitionRegistration registration = PartitionZNode.decode(data);
+            if (registration.getRemoteDataDir() == null) {
+                registration = registration.newRemoteDataDir(defaultRemoteDataDir);
+            }
+            registrations.put(
+                    pathToPartitionName.get(response.getPath()),
+                    new VersionedData<>(registration, stat.getVersion()));
+        }
+        return registrations;
+    }
+
+    /**
+     * Overwrites a partition's registration znode without a version check. NOT used in production
+     * (the ALTER bucket.num backfill goes through {@link
+     * #updateTableWithPartitionBucketCountBackfill}); this is a test-only backdoor for constructing
+     * legacy partition znodes, e.g. one with a null per-partition bucket count (v1 data) or a stale
+     * znode version.
+     */
+    @VisibleForTesting
+    public void updatePartitionRegistration(
+            TablePath tablePath, String partitionName, PartitionRegistration registration)
+            throws Exception {
+        String path = PartitionZNode.path(tablePath, partitionName);
+        byte[] data = PartitionZNode.encode(registration);
+        zkClient.setData().forPath(path, data);
+    }
+
+    /**
+     * Updates the table registration and the given partition registrations in one atomic ZooKeeper
+     * transaction. Every {@code setData} is CAS-guarded by its expected ZK version and the whole
+     * transaction is fenced on the coordinator epoch znode ({@link ZkVersion#MATCH_ANY_VERSION}
+     * skips the fence), so a stale snapshot or a deposed coordinator fails with {@link
+     * KeeperException.BadVersionException} instead of committing.
+     *
+     * @param tablePath the table to update
+     * @param tableRegistration the new table-level registration
+     * @param expectedTableZkVersion the expected ZK version of the table znode
+     * @param partitionBackfills partition name -&gt; (updated registration + expected ZK version)
+     * @param expectedCoordinatorEpochZkVersion the coordinator epoch znode version to fence on
+     */
+    public void updateTableWithPartitionBucketCountBackfill(
+            TablePath tablePath,
+            TableRegistration tableRegistration,
+            int expectedTableZkVersion,
+            Map<String, VersionedData<PartitionRegistration>> partitionBackfills,
+            int expectedCoordinatorEpochZkVersion)
+            throws Exception {
+        List<CuratorOp> ops = new ArrayList<>(partitionBackfills.size() + 1);
+        for (Map.Entry<String, VersionedData<PartitionRegistration>> entry :
+                partitionBackfills.entrySet()) {
+            String partitionPath = PartitionZNode.path(tablePath, entry.getKey());
+            byte[] partitionData = PartitionZNode.encode(entry.getValue().data());
+            ops.add(
+                    zkClient.transactionOp()
+                            .setData()
+                            .withVersion(entry.getValue().zkVersion())
+                            .forPath(partitionPath, partitionData));
+        }
+        String tablePathStr = TableZNode.path(tablePath);
+        byte[] tableData = TableZNode.encode(tableRegistration);
+        ops.add(
+                zkClient.transactionOp()
+                        .setData()
+                        .withVersion(expectedTableZkVersion)
+                        .forPath(tablePathStr, tableData));
+
+        List<CuratorOp> fencedOps =
+                wrapRequestsWithEpochCheck(ops, expectedCoordinatorEpochZkVersion);
+        zkClient.transaction().forOperations(fencedOps);
+        if (!partitionBackfills.isEmpty()) {
+            LOG.info(
+                    "Atomically backfilled bucket count for {} partition(s) and updated table {} in "
+                            + "one transaction (CAS + epoch fence {}).",
+                    partitionBackfills.size(),
+                    tablePath,
+                    expectedCoordinatorEpochZkVersion);
+        }
+    }
+
+    /** Get partition id and table id for each partition in a batch async way. */
+    public Map<PhysicalTablePath, TablePartition> getPartitionIds(
+            Collection<PhysicalTablePath> partitionPaths) throws Exception {
+        Map<String, PhysicalTablePath> path2PartitionPathMap =
+                partitionPaths.stream()
+                        .collect(
+                                toMap(
+                                        p ->
+                                                PartitionZNode.path(
+                                                        p.getTablePath(),
+                                                        checkNotNull(p.getPartitionName())),
+                                        path -> path));
+
+        return getPartitionZNodeData(
+                path2PartitionPathMap, PartitionRegistration::toTablePartition);
+    }
+
+    private <K, V> Map<K, V> getPartitionZNodeData(
+            Map<String, K> path2Key, Function<PartitionRegistration, V> partitionRegistrationMapper)
+            throws Exception {
+        List<ZkGetDataResponse> responses = getDataInBackground(path2Key.keySet());
+        return processGetDataResponsesOrThrow(
+                responses,
+                response -> path2Key.get(response.getPath()),
+                data -> partitionRegistrationMapper.apply(PartitionZNode.decode(data)));
+    }
+
+    /** Get partition num of a table in ZK. */
+    public int getPartitionNumber(TablePath tablePath) throws Exception {
+        String path = PartitionsZNode.path(tablePath);
+        Stat stat = zkClient.checkExists().forPath(path);
+        if (stat == null) {
+            return 0;
+        }
+        return stat.getNumChildren();
+    }
+
+    /** Delete a partition for a table in ZK. */
+    public void deletePartition(TablePath tablePath, String partitionName) throws Exception {
+        String path = PartitionZNode.path(tablePath, partitionName);
+        zkClient.delete().forPath(path);
+    }
+
+    /** Register partition assignment and metadata in transaction. */
+    public void registerPartitionAssignmentAndMetadata(
+            long partitionId,
+            String partitionName,
+            PartitionAssignment partitionAssignment,
+            String remoteDataDir,
+            TablePath tablePath,
+            long tableId,
+            int bucketCount)
+            throws Exception {
+        // Merge "registerPartitionAssignment()" and "registerPartition()"
+        // into one transaction. This is to avoid the case that the partition assignment is
+        // registered
+        // but the partition metadata is not registered.
+
+        // Create parent dictionary in advance.
+        try {
+            String tabletServerPartitionParentPath = ZkData.PartitionIdsZNode.path();
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(tabletServerPartitionParentPath);
+        } catch (KeeperException.NodeExistsException e) {
+            // ignore
+        }
+        try {
+            String metadataPartitionParentPath = PartitionsZNode.path(tablePath);
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(metadataPartitionParentPath);
+        } catch (KeeperException.NodeExistsException e) {
+            // ignore
+        }
+
+        List<CuratorOp> ops = new ArrayList<>(2);
+        String tabletServerPartitionPath = PartitionIdZNode.path(partitionId);
+        CuratorOp tabletServerPartitionNode =
+                zkClient.transactionOp()
+                        .create()
+                        .withMode(CreateMode.PERSISTENT)
+                        .forPath(
+                                tabletServerPartitionPath,
+                                PartitionIdZNode.encode(partitionAssignment));
+
+        String metadataPath = PartitionZNode.path(tablePath, partitionName);
+        CuratorOp metadataPartitionNode =
+                zkClient.transactionOp()
+                        .create()
+                        .withMode(CreateMode.PERSISTENT)
+                        .forPath(
+                                metadataPath,
+                                PartitionZNode.encode(
+                                        new PartitionRegistration(
+                                                tableId, partitionId, remoteDataDir, bucketCount)));
+
+        ops.add(tabletServerPartitionNode);
+        ops.add(metadataPartitionNode);
+        zkClient.transaction().forOperations(ops);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Schema
+    // --------------------------------------------------------------------------------------------
+
+    /** Register schema to ZK metadata and return the schema id. */
+    public int registerFirstSchema(TablePath tablePath, Schema schema) throws Exception {
+        return registerSchema(tablePath, schema, DEFAULT_SCHEMA_ID);
+    }
+
+    public int registerSchema(TablePath tablePath, Schema schema, int schemaId) throws Exception {
+        // increase schema id.
+        String path = SchemaZNode.path(tablePath, schemaId);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, SchemaZNode.encode(schema));
+        LOG.info("Registered new schema version {} for table {}.", schemaId, tablePath);
+        return schemaId;
+    }
+
+    /** Get the specific schema by schema id in ZK metadata. */
+    public Optional<SchemaInfo> getSchemaById(TablePath tablePath, int schemaId) throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(SchemaZNode.path(tablePath, schemaId));
+        return bytes.map(b -> new SchemaInfo(SchemaZNode.decode(b), schemaId));
+    }
+
+    /** Gets the current schema id of the given table in ZK metadata. */
+    public int getCurrentSchemaId(TablePath tablePath) throws Exception {
+        Optional<Integer> currentSchemaId =
+                getChildren(SchemasZNode.path(tablePath)).stream()
+                        .map(Integer::parseInt)
+                        .reduce(Math::max);
+        return currentSchemaId.orElse(0);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Table Bucket snapshot
+    // --------------------------------------------------------------------------------------------
+    public void registerTableBucketSnapshot(TableBucket tableBucket, BucketSnapshot snapshot)
+            throws Exception {
+        String path = BucketSnapshotIdZNode.path(tableBucket, snapshot.getSnapshotId());
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .forPath(path, BucketSnapshotIdZNode.encode(snapshot));
+    }
+
+    public void deleteTableBucketSnapshot(TableBucket tableBucket, long snapshotId)
+            throws Exception {
+        String path = BucketSnapshotIdZNode.path(tableBucket, snapshotId);
+        zkClient.delete().forPath(path);
+    }
+
+    public OptionalLong getTableBucketLatestSnapshotId(TableBucket tableBucket) throws Exception {
+        String path = BucketSnapshotsZNode.path(tableBucket);
+        return getChildren(path).stream().mapToLong(Long::parseLong).max();
+    }
+
+    public Optional<BucketSnapshot> getTableBucketSnapshot(TableBucket tableBucket, long snapshotId)
+            throws Exception {
+        String path = BucketSnapshotIdZNode.path(tableBucket, snapshotId);
+        return getOrEmpty(path).map(BucketSnapshotIdZNode::decode);
+    }
+
+    /** Get the latest snapshot of the table bucket. */
+    public Optional<BucketSnapshot> getTableBucketLatestSnapshot(TableBucket tableBucket)
+            throws Exception {
+        OptionalLong latestSnapshotId = getTableBucketLatestSnapshotId(tableBucket);
+        if (latestSnapshotId.isPresent()) {
+            return getTableBucketSnapshot(tableBucket, latestSnapshotId.getAsLong());
+        } else {
+            return Optional.empty();
+        }
+    }
+
+    public List<Tuple2<BucketSnapshot, Long>> getTableBucketAllSnapshotAndIds(
+            TableBucket tableBucket) throws Exception {
+        String path = BucketSnapshotsZNode.path(tableBucket);
+        List<Tuple2<BucketSnapshot, Long>> snapshotAndIds = new ArrayList<>();
+        for (String snapshotId : getChildren(path)) {
+            long snapshotIdLong = Long.parseLong(snapshotId);
+            Optional<BucketSnapshot> optionalTableBucketSnapshot =
+                    getTableBucketSnapshot(tableBucket, snapshotIdLong);
+            optionalTableBucketSnapshot.ifPresent(
+                    snapshot -> snapshotAndIds.add(Tuple2.of(snapshot, snapshotIdLong)));
+        }
+        return snapshotAndIds;
+    }
+
+    /**
+     * Get all the latest snapshot for the buckets of the table. If no any buckets found for the
+     * table in zk, return empty. The key of the map is the bucket id, the value is the optional
+     * latest snapshot, empty if there is no snapshot for the kv bucket.
+     */
+    public Map<Integer, Optional<BucketSnapshot>> getTableLatestBucketSnapshot(long tableId)
+            throws Exception {
+        Optional<TableAssignment> optTableAssignment = getTableAssignment(tableId);
+        if (!optTableAssignment.isPresent()) {
+            return Collections.emptyMap();
+        } else {
+            TableAssignment tableAssignment = optTableAssignment.get();
+            return getBucketSnapshots(tableId, null, tableAssignment);
+        }
+    }
+
+    public Map<Integer, Optional<BucketSnapshot>> getPartitionLatestBucketSnapshot(long partitionId)
+            throws Exception {
+        Optional<PartitionAssignment> optPartitionAssignment = getPartitionAssignment(partitionId);
+        if (!optPartitionAssignment.isPresent()) {
+            return Collections.emptyMap();
+        } else {
+            return getBucketSnapshots(
+                    optPartitionAssignment.get().getTableId(),
+                    partitionId,
+                    optPartitionAssignment.get());
+        }
+    }
+
+    private Map<Integer, Optional<BucketSnapshot>> getBucketSnapshots(
+            long tableId, @Nullable Long partitionId, TableAssignment tableAssignment)
+            throws Exception {
+        Map<Integer, Optional<BucketSnapshot>> snapshots = new HashMap<>();
+        // first, put as empty for all buckets
+        for (Integer bucket : tableAssignment.getBuckets()) {
+            snapshots.put(bucket, Optional.empty());
+        }
+
+        // get the bucket ids
+        String bucketIdsPath =
+                partitionId == null
+                        ? BucketIdsZNode.pathOfTable(tableId)
+                        : BucketIdsZNode.pathOfPartition(partitionId);
+        Map<String, TableBucket> snapshotPathToTableBucket = new HashMap<>();
+        for (String bucketIdStr : getChildren(bucketIdsPath)) {
+            int bucketId = Integer.parseInt(bucketIdStr);
+            snapshots.put(bucketId, Optional.empty());
+            TableBucket tableBucket = new TableBucket(tableId, partitionId, bucketId);
+            snapshotPathToTableBucket.put(BucketSnapshotsZNode.path(tableBucket), tableBucket);
+        }
+
+        List<ZkGetChildrenResponse> childrenResponses =
+                getChildrenInBackground(snapshotPathToTableBucket.keySet());
+        Map<String, Integer> snapshotDataPathToBucketId = new HashMap<>();
+        for (ZkGetChildrenResponse response : childrenResponses) {
+            if (response.getResultCode() == KeeperException.Code.NONODE) {
+                continue;
+            }
+            response.maybeThrow();
+
+            OptionalLong latestSnapshotId =
+                    response.getChildren().stream().mapToLong(Long::parseLong).max();
+            if (latestSnapshotId.isPresent()) {
+                TableBucket tableBucket =
+                        checkNotNull(snapshotPathToTableBucket.get(response.getPath()));
+                snapshotDataPathToBucketId.put(
+                        BucketSnapshotIdZNode.path(tableBucket, latestSnapshotId.getAsLong()),
+                        tableBucket.getBucket());
+            }
+        }
+
+        List<ZkGetDataResponse> dataResponses =
+                getDataInBackground(snapshotDataPathToBucketId.keySet());
+        for (ZkGetDataResponse response : dataResponses) {
+            if (response.getResultCode() == KeeperException.Code.NONODE) {
+                // The snapshot may be deleted between listing the children and reading its data.
+                continue;
+            }
+            response.maybeThrow();
+
+            int bucketId = checkNotNull(snapshotDataPathToBucketId.get(response.getPath()));
+            snapshots.put(bucketId, Optional.of(BucketSnapshotIdZNode.decode(response.getData())));
+        }
+        return snapshots;
+    }
+
+    public List<String> getKvSnapshotLeasesList() throws Exception {
+        return getChildren(KvSnapshotLeasesZNode.path());
+    }
+
+    public void registerKvSnapshotLeaseMetadata(
+            String leaseId, KvSnapshotLeaseMetadata leaseMetadata) throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, KvSnapshotLeaseZNode.encode(leaseMetadata));
+    }
+
+    public void updateKvSnapshotLeaseMetadata(String leaseId, KvSnapshotLeaseMetadata leaseMetadata)
+            throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        zkClient.setData().forPath(path, KvSnapshotLeaseZNode.encode(leaseMetadata));
+    }
+
+    public Optional<KvSnapshotLeaseMetadata> getKvSnapshotLeaseMetadata(String leaseId)
+            throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        return getOrEmpty(path).map(KvSnapshotLeaseZNode::decode);
+    }
+
+    public void deleteKvSnapshotLease(String leaseId) throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        zkClient.delete().forPath(path);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Writer
+    // --------------------------------------------------------------------------------------------
+
+    /** generate an unique id for writer. */
+    public long getWriterIdAndIncrement() throws Exception {
+        return writerIdCounter.getAndIncrement();
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Remote log manifest handler
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Register or update the remote log manifest handle to zookeeper.
+     *
+     * <p>Note: If there is already a remote log manifest for the given table bucket, it will be
+     * overwritten.
+     */
+    public void upsertRemoteLogManifestHandle(
+            TableBucket tableBucket, RemoteLogManifestHandle remoteLogManifestHandle)
+            throws Exception {
+        String path = BucketRemoteLogsZNode.path(tableBucket);
+        if (getRemoteLogManifestHandle(tableBucket).isPresent()) {
+            zkClient.setData().forPath(path, BucketRemoteLogsZNode.encode(remoteLogManifestHandle));
+        } else {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .forPath(path, BucketRemoteLogsZNode.encode(remoteLogManifestHandle));
+        }
+    }
+
+    public Optional<RemoteLogManifestHandle> getRemoteLogManifestHandle(TableBucket tableBucket)
+            throws Exception {
+        String path = BucketRemoteLogsZNode.path(tableBucket);
+        return getOrEmpty(path).map(BucketRemoteLogsZNode::decode);
+    }
+
+    /**
+     * Lists all remote log manifest handles for buckets of the given table (or partition when
+     * {@code partitionId != null}). Reads the {@code BucketRemoteLogsZNode} subtree under either
+     * {@code /tabletservers/tables/{tableId}/buckets/} or {@code
+     * /tabletservers/partitions/{partitionId}/buckets/} as a single ZK getChildren call followed by
+     * per-bucket getData. Returns each bucket's currently-published manifest path from coordinator
+     * metadata; callers must read the manifest file separately.
+     */
+    public List<TableBucketAndManifest> listRemoteLogManifestHandles(
+            long tableId, @Nullable Long partitionId) throws Exception {
+        String bucketsPath =
+                partitionId == null
+                        ? TableIdZNode.path(tableId) + "/buckets"
+                        : PartitionIdZNode.path(partitionId) + "/buckets";
+        List<String> bucketIdStrs = getChildren(bucketsPath);
+        List<TableBucketAndManifest> result = new ArrayList<>(bucketIdStrs.size());
+        for (String bucketIdStr : bucketIdStrs) {
+            int bucketId = Integer.parseInt(bucketIdStr);
+            TableBucket tb =
+                    partitionId == null
+                            ? new TableBucket(tableId, bucketId)
+                            : new TableBucket(tableId, partitionId, bucketId);
+            Optional<RemoteLogManifestHandle> handle = getRemoteLogManifestHandle(tb);
+            handle.ifPresent(h -> result.add(new TableBucketAndManifest(tb, h)));
+        }
+        return result;
+    }
+
+    /**
+     * A decoded znode value together with the ZK version of its znode. Used to carry the version
+     * captured at read time so a later write can compare-and-set against it.
+     */
+    public static final class VersionedData<T> {
+        private final T data;
+        private final int zkVersion;
+
+        public VersionedData(T data, int zkVersion) {
+            this.data = data;
+            this.zkVersion = zkVersion;
+        }
+
+        public T data() {
+            return data;
+        }
+
+        public int zkVersion() {
+            return zkVersion;
+        }
+    }
+
+    /** Tuple of a table bucket and its current remote log manifest handle. */
+    public static final class TableBucketAndManifest {
+        private final TableBucket tableBucket;
+        private final RemoteLogManifestHandle manifestHandle;
+
+        public TableBucketAndManifest(
+                TableBucket tableBucket, RemoteLogManifestHandle manifestHandle) {
+            this.tableBucket = tableBucket;
+            this.manifestHandle = manifestHandle;
+        }
+
+        public TableBucket getTableBucket() {
+            return tableBucket;
+        }
+
+        public RemoteLogManifestHandle getManifestHandle() {
+            return manifestHandle;
+        }
+    }
+
+    /**
+     * Lists the snapshot ids of all completed bucket snapshots for the given {@link TableBucket}.
+     * Reads only the {@code BucketSnapshotsZNode} children — the per-snapshot payload is not
+     * fetched, since callers (e.g. orphan-files cleanup) only need the id set to identify which
+     * snapshot directories must be retained. Returned ids are ordered ascending.
+     */
+    public List<Long> listBucketSnapshotIds(TableBucket tableBucket) throws Exception {
+        String path = BucketSnapshotsZNode.path(tableBucket);
+        List<String> snapshotIdStrs = getChildren(path);
+        List<Long> ids = new ArrayList<>(snapshotIdStrs.size());
+        for (String snapshotIdStr : snapshotIdStrs) {
+            ids.add(Long.parseLong(snapshotIdStr));
+        }
+        Collections.sort(ids);
+        return ids;
+    }
+
+    /** Upsert the {@link LakeTable} to Zk Node. */
+    public void upsertLakeTable(long tableId, LakeTable lakeTable, boolean isUpdate)
+            throws Exception {
+        byte[] zkData = LakeTableZNode.encode(lakeTable);
+        String zkPath = LakeTableZNode.path(tableId);
+        if (isUpdate) {
+            zkClient.setData().forPath(zkPath, zkData);
+        } else {
+            zkClient.create().creatingParentsIfNeeded().forPath(zkPath, zkData);
+        }
+    }
+
+    /**
+     * Gets the {@link LakeTable} for the given table ID.
+     *
+     * @param tableId the table ID
+     * @return an Optional containing the LakeTable if it exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<LakeTable> getLakeTable(long tableId) throws Exception {
+        String zkPath = LakeTableZNode.path(tableId);
+        return getOrEmpty(zkPath).map(LakeTableZNode::decode);
+    }
+
+    /**
+     * Gets the {@link LakeTableSnapshot} for the given table ID.
+     *
+     * @param tableId the table ID
+     * @param snapshotId the snapshot id for the snapshot to get, null means to get latest snapshot
+     *     id
+     * @return an Optional containing the LakeTableSnapshot if the table exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<LakeTableSnapshot> getLakeTableSnapshot(long tableId, @Nullable Long snapshotId)
+            throws Exception {
+        Optional<LakeTable> optLakeTable = getLakeTable(tableId);
+        if (optLakeTable.isPresent()) {
+            // always get the latest snapshot
+            if (snapshotId == null) {
+                return Optional.ofNullable(optLakeTable.get().getOrReadLatestTableSnapshot());
+            } else {
+                return Optional.ofNullable(optLakeTable.get().getOrReadTableSnapshot(snapshotId));
+            }
+
+        } else {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Gets the latest readable {@link LakeTableSnapshot} for the given table ID.
+     *
+     * @param tableId the table ID
+     * @return an Optional containing the latest readable LakeTableSnapshot if found, empty
+     *     otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<LakeTableSnapshot> getLatestReadableLakeTableSnapshot(long tableId)
+            throws Exception {
+        Optional<LakeTable> optLakeTable = getLakeTable(tableId);
+        if (optLakeTable.isPresent()) {
+            LakeTableSnapshot readableSnapshot =
+                    optLakeTable.get().getOrReadLatestReadableTableSnapshot();
+            return Optional.ofNullable(readableSnapshot);
+        } else {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Register or update the acl registration to zookeeper.
+     *
+     * <p>Note: If there is already an acl registration for the given resources and the acl version
+     * is smaller than new one, it will be overwritten.(we need to compare the version before
+     * upsert)
+     *
+     * @return the version of the acl node after upsert.
+     */
+    public int updateResourceAcl(
+            Resource resource, Set<AccessControlEntry> accessControlEntries, int expectedVersion)
+            throws Exception {
+        String path = ResourceAclNode.path(resource);
+        LOG.info("update acl node {} with value {}", resource, accessControlEntries);
+        return zkClient.setData()
+                .withVersion(expectedVersion)
+                .forPath(path, ResourceAclNode.encode(new ResourceAcl(accessControlEntries)))
+                .getVersion();
+    }
+
+    public void createResourceAcl(Resource resource, Set<AccessControlEntry> accessControlEntries)
+            throws Exception {
+        String path = ResourceAclNode.path(resource);
+        LOG.info("insert acl node {} with value {}", resource, accessControlEntries);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, ResourceAclNode.encode(new ResourceAcl(accessControlEntries)));
+    }
+
+    /**
+     * Retrieves the ACL (Access Control List) for a specific resource from ZooKeeper.
+     *
+     * @param resource the resource to query
+     * @return an Optional containing the ResourceAcl if it exists, or empty if not found
+     * @throws Exception if there is an error accessing ZooKeeper
+     */
+    public VersionedAcls getResourceAclWithVersion(Resource resource) throws Exception {
+        String path = ResourceAclNode.path(resource);
+        try {
+            Stat stat = new Stat();
+            byte[] bytes = zkClient.getData().storingStatIn(stat).forPath(path);
+            int zkVersion = stat.getVersion();
+            Optional<ResourceAcl> resourceAcl =
+                    Optional.ofNullable(bytes).map(ResourceAclNode::decode);
+
+            return new VersionedAcls(
+                    zkVersion,
+                    resourceAcl.isPresent()
+                            ? resourceAcl.get().getEntries()
+                            : Collections.emptySet());
+        } catch (KeeperException.NoNodeException e) {
+            return new VersionedAcls(UNKNOWN_VERSION, Collections.emptySet());
+        }
+    }
+
+    /**
+     * Retrieves all resources of a specific type and their corresponding ACLs from ZooKeeper.
+     *
+     * @param resourceType the type of resource to query
+     * @return a list of child node names representing resources of the given type
+     * @throws Exception if there is an error accessing ZooKeeper
+     */
+    public List<String> listResourcesByType(ResourceType resourceType) throws Exception {
+        String path = ResourceAclNode.path(resourceType);
+        return getChildren(path);
+    }
+
+    /**
+     * Deletes the ACL (Access Control List) for a specific resource from ZooKeeper.
+     *
+     * @param resource the resource whose ACL should be deleted
+     * @throws Exception if there is an error accessing ZooKeeper
+     */
+    public void conditionalDeleteResourceAcl(Resource resource, int zkVersion) throws Exception {
+        String path = ResourceAclNode.path(resource);
+        zkClient.delete().withVersion(zkVersion).forPath(path);
+    }
+
+    public void insertAclChangeNotification(Resource resource) throws Exception {
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT_SEQUENTIAL)
+                .forPath(
+                        AclChangeNotificationNode.pathPrefix(),
+                        AclChangeNotificationNode.encode(resource));
+        LOG.info("addColumn acl change notification for resource {}  ", resource);
+    }
+
+    public Map<String, String> fetchEntityConfig() throws Exception {
+        String path = ConfigEntityZNode.path();
+        return getOrEmpty(path).map(ConfigEntityZNode::decode).orElse(new HashMap<>());
+    }
+
+    public void upsertServerEntityConfig(Map<String, String> configs) throws Exception {
+        upsertEntityConfigs(configs);
+    }
+
+    public void upsertEntityConfigs(Map<String, String> configs) throws Exception {
+        String path = ConfigEntityZNode.path();
+        if (zkClient.checkExists().forPath(path) != null) {
+            zkClient.setData().forPath(path, ConfigEntityZNode.encode(configs));
+        } else {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .forPath(path, ConfigEntityZNode.encode(configs));
+        }
+
+        LOG.info("upsert entity configs {}", ConfigurationUtils.hideSensitiveValues(configs));
+        insertConfigChangeNotification();
+    }
+
+    public void insertConfigChangeNotification() throws Exception {
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT_SEQUENTIAL)
+                .forPath(
+                        ZkData.ConfigEntityChangeNotificationSequenceZNode.pathPrefix(),
+                        ZkData.ConfigEntityChangeNotificationSequenceZNode.encode());
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Maintenance
+    // --------------------------------------------------------------------------------------------
+
+    public void registerServerTags(ServerTags newServerTags) throws Exception {
+        String path = ServerTagsZNode.path();
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, ServerTagsZNode.encode(newServerTags));
+    }
+
+    public void updateServerTags(ServerTags newServerTags) throws Exception {
+        String path = ServerTagsZNode.path();
+        zkClient.setData().forPath(path, ServerTagsZNode.encode(newServerTags));
+    }
+
+    public Optional<ServerTags> getServerTags() throws Exception {
+        String path = ServerTagsZNode.path();
+        return getOrEmpty(path).map(ServerTagsZNode::decode);
+    }
+
+    public void deleteServerTags() throws Exception {
+        deletePath(ServerTagsZNode.path());
+    }
+
+    public void registerRebalanceTask(RebalanceTask rebalanceTask) throws Exception {
+        String path = RebalanceZNode.path();
+        Stat stat = zkClient.checkExists().forPath(path);
+        if (stat == null) {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path, RebalanceZNode.encode(rebalanceTask));
+        } else {
+            zkClient.setData().forPath(path, RebalanceZNode.encode(rebalanceTask));
+        }
+    }
+
+    public Optional<RebalanceTask> getRebalanceTask() throws Exception {
+        String path = RebalanceZNode.path();
+        return getOrEmpty(path).map(RebalanceZNode::decode);
+    }
+
+    /** Deletes the rebalance task from ZooKeeper. Only for testing propose now */
+    @VisibleForTesting
+    public void deleteRebalanceTask() throws Exception {
+        deletePath(RebalanceZNode.path());
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Utils
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Gets all the child nodes at a given zk node path.
+     *
+     * @param path the path to list children
+     * @return list of child node names
+     */
+    public List<String> getChildren(String path) throws Exception {
+        try {
+            return zkClient.getChildren().forPath(path);
+        } catch (KeeperException.NoNodeException e) {
+            return Collections.emptyList();
+        }
+    }
+
+    /** Gets the data and stat of a given zk node path. */
+    public Optional<Stat> getStat(String path) throws Exception {
+        try {
+            Stat stat = zkClient.checkExists().forPath(path);
+            return Optional.ofNullable(stat);
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** delete a path. */
+    public void deletePath(String path) throws Exception {
+        try {
+            zkClient.delete().forPath(path);
+        } catch (KeeperException.NoNodeException ignored) {
+        }
+    }
+
+    public CuratorFramework getCuratorClient() {
+        return zkClient;
+    }
+
+    /**
+     * Returns the Curator wrapper owned by this client for tests that need a decorating client over
+     * the same ZooKeeper connection. The returned wrapper must not be closed by the caller.
+     */
+    @VisibleForTesting
+    public CuratorFrameworkWithUnhandledErrorListener getCuratorFrameworkWrapper() {
+        return curatorFrameworkWrapper;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Table and Partition Metadata
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Get bucket metadata for multiple tables in batch async way. The returned map only contains
+     * tables those have assignments. If a table has no assignment yet (just been created), it will
+     * not be included in the result map.
+     */
+    public Map<Long, List<BucketMetadata>> getBucketMetadataForTables(Collection<Long> tableIds)
+            throws Exception {
+        // The replica assignments map may not contain all tableIds
+        Map<Long, List<BucketMetadata>> result = new HashMap<>();
+        // initialize result with all table ids.
+        tableIds.forEach(id -> result.put(id, new ArrayList<>()));
+        Map<Long, TableAssignment> tablesAssignments = getTablesAssignments(tableIds);
+        List<TableBucket> buckets = new ArrayList<>();
+        tablesAssignments.forEach(
+                (tableId, assignment) -> {
+                    for (Integer bucketId : assignment.getBuckets()) {
+                        buckets.add(new TableBucket(tableId, null, bucketId));
+                    }
+                });
+        Map<TableBucket, LeaderAndIsr> leaderAndIsrs = getLeaderAndIsrs(buckets);
+        // The LeaderAndIsr map may not contain all buckets, so we iterate on assignment buckets
+        for (TableBucket bucket : buckets) {
+            int bucketId = bucket.getBucket();
+            long tableId = bucket.getTableId();
+            // this might be null if the leader and isr not known yet.
+            BucketMetadata bucketMetadata =
+                    createBucketMetadata(
+                            leaderAndIsrs,
+                            bucket,
+                            bucketId,
+                            checkNotNull(tablesAssignments.get(tableId)));
+            result.get(tableId).add(bucketMetadata);
+        }
+        return result;
+    }
+
+    /**
+     * Get bucket metadata for multiple partitions in batch async way. The returned map only
+     * contains partitions those have assignments. If a partition has no assignment yet (just been
+     * created), it will not be included in the result map.
+     */
+    public Map<Long, List<BucketMetadata>> getBucketMetadataForPartitions(
+            Collection<Long> partitionIds) throws Exception {
+        // The replica assignments map may not contain all partitionIds
+        Map<Long, PartitionAssignment> partitionsAssignments =
+                getPartitionsAssignments(partitionIds);
+        List<TableBucket> buckets = new ArrayList<>();
+        partitionsAssignments.forEach(
+                (partitionId, assignment) -> {
+                    for (Integer bucketId : assignment.getBuckets()) {
+                        buckets.add(
+                                new TableBucket(assignment.getTableId(), partitionId, bucketId));
+                    }
+                });
+        // The LeaderAndIsr map may not contain all buckets
+        Map<TableBucket, LeaderAndIsr> leaderAndIsrs = getLeaderAndIsrs(buckets);
+        Map<Long, List<BucketMetadata>> result = new HashMap<>();
+        for (TableBucket bucket : buckets) {
+            int bucketId = bucket.getBucket();
+            long partitionId = checkNotNull(bucket.getPartitionId());
+            BucketMetadata bucketMetadata =
+                    createBucketMetadata(
+                            leaderAndIsrs,
+                            bucket,
+                            bucketId,
+                            checkNotNull(partitionsAssignments.get(partitionId)));
+            result.computeIfAbsent(partitionId, k -> new ArrayList<>()).add(bucketMetadata);
+        }
+        return result;
+    }
+
+    private BucketMetadata createBucketMetadata(
+            Map<TableBucket, LeaderAndIsr> leaderAndIsrs,
+            TableBucket bucket,
+            int bucketId,
+            TableAssignment assignment) {
+        // this might be null if the leader and isr not known yet.
+        LeaderAndIsr leaderAndIsr = leaderAndIsrs.get(bucket);
+        Integer leader = leaderAndIsr != null ? leaderAndIsr.leader() : null;
+        Integer leaderEpoch = leaderAndIsr != null ? leaderAndIsr.leaderEpoch() : null;
+        List<Integer> isr = leaderAndIsr != null ? leaderAndIsr.isr() : Collections.emptyList();
+        int bucketEpoch =
+                leaderAndIsr != null
+                        ? leaderAndIsr.bucketEpoch()
+                        : BucketMetadata.NO_LEADER_ISR_STATE_EPOCH;
+        List<Integer> replicas = assignment.getBucketAssignments().get(bucketId).getReplicas();
+        return new BucketMetadata(bucketId, leader, leaderEpoch, replicas, isr, bucketEpoch);
+    }
+
+    /** Close the underlying ZooKeeperClient. */
+    @Override
+    public void close() {
+        LOG.info("Closing...");
+        if (curatorFrameworkWrapper != null) {
+            curatorFrameworkWrapper.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // ZK batch async utils
+    // -------------------------------------------------------------------------------------------
+
+    /**
+     * Send a pipelined sequence of requests and return a CompletableFuture for all their responses.
+     *
+     * <p>The watch flag on each outgoing request will be set if we've already registered a handler
+     * for the path associated with the request.
+     *
+     * @param requests a sequence of requests to send
+     * @param respCreator function to create response objects from curator events
+     * @return CompletableFuture containing the responses for the requests
+     */
+    private <Resp extends ZkAsyncResponse, Req extends ZkAsyncRequest>
+            CompletableFuture<List<Resp>> handleRequestInBackgroundAsync(
+                    List<Req> requests, Function<CuratorEvent, Resp> respCreator) {
+        if (requests == null || requests.isEmpty()) {
+            return CompletableFuture.completedFuture(Collections.emptyList());
+        }
+
+        CompletableFuture<List<Resp>> future = new CompletableFuture<>();
+        BackgroundCallback callback = createBackgroundCallback(requests, respCreator, future);
+
+        try {
+            for (Req request : requests) {
+                try {
+                    inFlightRequests.acquire();
+                    if (request instanceof ZkGetDataRequest) {
+                        zkClient.getData().inBackground(callback).forPath(request.getPath());
+
+                    } else if (request instanceof ZkGetChildrenRequest) {
+                        zkClient.getChildren().inBackground(callback).forPath(request.getPath());
+                    } else if (request instanceof ZkCheckExistsRequest) {
+                        zkClient.checkExists().inBackground(callback).forPath(request.getPath());
+                    } else {
+                        throw new IllegalArgumentException(
+                                "Unsupported request type: " + request.getClass());
+                    }
+                } catch (Exception e) {
+                    inFlightRequests.release();
+                    throw e;
+                }
+            }
+        } catch (Exception e) {
+            future.completeExceptionally(e);
+        }
+
+        return future;
+    }
+
+    @Nonnull
+    private <Resp extends ZkAsyncResponse, Req extends ZkAsyncRequest>
+            BackgroundCallback createBackgroundCallback(
+                    List<Req> requests,
+                    Function<CuratorEvent, Resp> respCreator,
+                    CompletableFuture<List<Resp>> future) {
+        ArrayBlockingQueue<Resp> responseQueue = new ArrayBlockingQueue<>(requests.size());
+        CountDownLatch countDownLatch = new CountDownLatch(requests.size());
+
+        // Complete future when all responses received
+        return (client, event) -> {
+            try {
+                Resp response = respCreator.apply(event);
+                responseQueue.add(response);
+                countDownLatch.countDown();
+
+                // Complete future when all responses received
+                if (countDownLatch.getCount() == 0) {
+                    future.complete(new ArrayList<>(responseQueue));
+                }
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            } finally {
+                inFlightRequests.release();
+            }
+        };
+    }
+
+    /**
+     * Gets the child nodes at given zk node paths in background.
+     *
+     * @param paths the paths to list children
+     * @return list of async responses for each path
+     * @throws Exception if there is an error during the operation
+     */
+    private List<ZkGetChildrenResponse> getChildrenInBackground(Collection<String> paths)
+            throws Exception {
+        List<ZkGetChildrenRequest> requests =
+                paths.stream().map(ZkGetChildrenRequest::new).collect(Collectors.toList());
+        return handleRequestInBackground(requests, ZkGetChildrenResponse::create);
+    }
+
+    /**
+     * Gets the data of given zk node paths in background.
+     *
+     * @param paths the paths to fetch data
+     * @return list of async responses for each path
+     * @throws Exception if there is an error during the operation
+     */
+    @VisibleForTesting
+    List<ZkGetDataResponse> getDataInBackground(Collection<String> paths) throws Exception {
+        List<ZkGetDataRequest> requests =
+                paths.stream().map(ZkGetDataRequest::new).collect(Collectors.toList());
+        return handleRequestInBackground(requests, ZkGetDataResponse::create);
+    }
+
+    /**
+     * Gets the stat of given zk node paths in background.
+     *
+     * @param paths the paths to fetch stat
+     * @return list of async responses for each path
+     * @throws Exception if there is an error during the operation
+     */
+    private List<ZkCheckExistsResponse> getStatInBackground(Collection<String> paths)
+            throws Exception {
+        List<ZkCheckExistsRequest> requests =
+                paths.stream().map(ZkCheckExistsRequest::new).collect(Collectors.toList());
+        return handleRequestInBackground(requests, ZkCheckExistsResponse::create);
+    }
+
+    /**
+     * Send a pipelined sequence of requests and wait for all of their responses synchronously in
+     * background.
+     *
+     * <p>The watch flag on each outgoing request will be set if we've already registered a handler
+     * for the path associated with the request.
+     *
+     * @param requests a sequence of requests to send and wait on.
+     * @return the responses for the requests. If all requests have the same type, the responses
+     *     will have the respective response type.
+     */
+    private <Resp extends ZkAsyncResponse, Req extends ZkAsyncRequest>
+            List<Resp> handleRequestInBackground(
+                    List<Req> requests, Function<CuratorEvent, Resp> respCreator) throws Exception {
+        try {
+            return handleRequestInBackgroundAsync(requests, respCreator).get();
+        } catch (ExecutionException e) {
+            Throwable cause = ExceptionUtils.stripExecutionException(e);
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            } else {
+                throw new Exception("Async request handling failed", cause);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new Exception("Request handling was interrupted", e);
+        }
+    }
+
+    /**
+     * Template method to process multiple ZooKeeper data responses with decoder.
+     *
+     * @param responses list of ZkGetDataResponse from ZooKeeper
+     * @param keyExtractor function to extract key from response
+     * @param decoder function to decode byte array to target type
+     * @param operationName name of the operation for error messages
+     * @param <K> the type of the result map key
+     * @param <V> the type of the result map value
+     * @return Map containing decoded results for successful responses
+     */
+    public static <K, V> Map<K, V> processGetDataResponses(
+            List<ZkGetDataResponse> responses,
+            Function<ZkGetDataResponse, K> keyExtractor,
+            Function<byte[], V> decoder,
+            String operationName) {
+        Map<K, V> result = new HashMap<>();
+        for (ZkGetDataResponse response : responses) {
+            if (response.getResultCode() == KeeperException.Code.OK) {
+                byte[] data = response.getData();
+                if (data != null && data.length > 0) {
+                    K key = keyExtractor.apply(response);
+                    V value = decoder.apply(response.getData());
+                    result.put(key, value);
+                } else {
+                    LOG.warn("Data is empty for path {}", response.getPath());
+                }
+            } else {
+                LOG.warn(
+                        "Failed to get {} for path {}: {}",
+                        operationName,
+                        response.getPath(),
+                        response.getResultCode());
+            }
+        }
+        return result;
+    }
+
+    @VisibleForTesting
+    static <K, V> Map<K, V> processGetDataResponsesOrThrow(
+            List<ZkGetDataResponse> responses,
+            Function<ZkGetDataResponse, K> keyExtractor,
+            Function<byte[], V> decoder)
+            throws KeeperException {
+        Map<K, V> result = new HashMap<>();
+        for (ZkGetDataResponse response : responses) {
+            if (response.getResultCode() == KeeperException.Code.NONODE) {
+                continue;
+            }
+            response.maybeThrow();
+
+            V value = decoder.apply(response.getData());
+            if (value != null) {
+                result.put(keyExtractor.apply(response), value);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Template method to process multiple ZooKeeper children responses with decoder.
+     *
+     * @param responses list of ZkGetChildrenResponse from ZooKeeper
+     * @param keyExtractor function to extract key from response
+     * @param operationName name of the operation for error messages
+     * @param <K> the type of the result map key
+     * @return Map containing children lists for successful responses
+     */
+    public static <K> Map<K, List<String>> processGetChildrenResponses(
+            List<ZkGetChildrenResponse> responses,
+            Function<ZkGetChildrenResponse, K> keyExtractor,
+            String operationName) {
+        Map<K, List<String>> result = new HashMap<>();
+        for (ZkGetChildrenResponse response : responses) {
+            if (response.getResultCode() == KeeperException.Code.OK) {
+                K key = keyExtractor.apply(response);
+                result.put(key, response.getChildren());
+            } else {
+                LOG.warn(
+                        "Failed to get {} for path {}: {}",
+                        operationName,
+                        response.getPath(),
+                        response.getResultCode());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * create a node (recursively if parent path not exists) with Zk epoch version check.
+     *
+     * @param path the path to create
+     * @param data the data to write
+     * @param throwIfPathExists whether to throw exception if path exist
+     * @throws Exception if any error occurs
+     */
+    public void createRecursiveWithEpochCheck(
+            String path, byte[] data, int expectedZkVersion, boolean throwIfPathExists)
+            throws Exception {
+        CuratorOp createOp = zkOp.createOp(path, data, CreateMode.PERSISTENT);
+        List<CuratorOp> ops = wrapRequestWithEpochCheck(createOp, expectedZkVersion);
+
+        try {
+            // try to directly create
+            zkClient.transaction().forOperations(ops);
+        } catch (KeeperException.NodeExistsException e) {
+            // should not exist
+            if (throwIfPathExists) {
+                throw e;
+            }
+        } catch (KeeperException.NoNodeException e) {
+            // if parent does not exist, create parent first
+            int indexOfLastSlash = path.lastIndexOf("/");
+            if (indexOfLastSlash == -1) {
+                throw new IllegalArgumentException("Invalid path: " + path);
+            } else if (indexOfLastSlash == 0) {
+                // root path can be directly create without fence
+                try {
+                    zkClient.create()
+                            .creatingParentsIfNeeded()
+                            .withMode(CreateMode.PERSISTENT)
+                            .forPath(path);
+                } catch (KeeperException.NodeExistsException ignored) {
+                    // ignore
+                }
+            } else {
+                // indexOfLastSlash > 0
+                String parentPath = path.substring(0, indexOfLastSlash);
+                createRecursiveWithEpochCheck(
+                        parentPath, null, expectedZkVersion, throwIfPathExists);
+                // After creating parent (or if parent is root), retry creating the original path
+                zkClient.transaction().forOperations(ops);
+            }
+        } catch (KeeperException.BadVersionException e) {
+            LOG.error("Bad version for path {}, expected version {} ", path, expectedZkVersion);
+            throw e;
+        }
+    }
+
+    public List<CuratorOp> wrapRequestWithEpochCheck(CuratorOp request, int expectedZkVersion)
+            throws Exception {
+        return wrapRequestsWithEpochCheck(Collections.singletonList(request), expectedZkVersion);
+    }
+
+    public List<CuratorOp> wrapRequestsWithEpochCheck(
+            List<CuratorOp> requestList, int expectedZkVersion) throws Exception {
+        if (ZkVersion.MATCH_ANY_VERSION.getVersion() == expectedZkVersion) {
+            return requestList;
+        } else if (expectedZkVersion >= 0) {
+            CuratorOp checkOp =
+                    zkOp.checkOp(ZkData.CoordinatorEpochZNode.path(), expectedZkVersion);
+            return multiRequest(checkOp, requestList);
+        } else {
+            throw new IllegalArgumentException(
+                    "Expected coordinator epoch zkVersion "
+                            + expectedZkVersion
+                            + " should be non-negative or equal to "
+                            + ZkVersion.MATCH_ANY_VERSION.getVersion());
+        }
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Producer Offset Snapshot
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Tries to atomically register a producer offset snapshot to ZK.
+     *
+     * <p>This method leverages ZooKeeper's atomic create operation to ensure that only one
+     * concurrent request can successfully create the snapshot. If a snapshot already exists for the
+     * given producer ID, this method returns false instead of throwing an exception.
+     *
+     * @param producerId the producer ID (typically Flink job ID)
+     * @param producerOffsets the producer offsets containing expiration time and table offset
+     *     metadata
+     * @return true if the snapshot was created successfully, false if a snapshot already exists
+     * @throws Exception if the operation fails for reasons other than node already existing
+     */
+    public boolean tryRegisterProducerOffsets(String producerId, ProducerOffsets producerOffsets)
+            throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        try {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path, ProducerIdZNode.encode(producerOffsets));
+            LOG.info("Registered producer snapshot for producer {} at path {}.", producerId, path);
+            return true;
+        } catch (KeeperException.NodeExistsException e) {
+            LOG.debug(
+                    "Producer snapshot already exists for producer {} at path {}, "
+                            + "returning false.",
+                    producerId,
+                    path);
+            return false;
+        }
+    }
+
+    /**
+     * Gets the {@link ProducerOffsets} for the given producer ID.
+     *
+     * @param producerId the producer ID
+     * @return an Optional containing the ProducerOffsets if it exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<ProducerOffsets> getProducerOffsets(String producerId) throws Exception {
+        String zkPath = ProducerIdZNode.path(producerId);
+        return getOrEmpty(zkPath).map(ProducerIdZNode::decode);
+    }
+
+    /**
+     * Deletes the producer offset snapshot for the given producer ID.
+     *
+     * @param producerId the producer ID
+     * @throws Exception if the operation fails
+     */
+    public void deleteProducerOffsets(String producerId) throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        zkClient.delete().forPath(path);
+        LOG.info("Deleted producer offsets snapshot for producer {} at path {}.", producerId, path);
+    }
+
+    /**
+     * Gets the {@link ProducerOffsets} for the given producer ID along with its ZK version.
+     *
+     * <p>The version can be used for conditional updates/deletes to handle concurrent modifications
+     * safely.
+     *
+     * @param producerId the producer ID
+     * @return an Optional containing a Tuple2 of (ProducerOffsets, version) if it exists, empty
+     *     otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<Tuple2<ProducerOffsets, Integer>> getProducerOffsetsWithVersion(
+            String producerId) throws Exception {
+        String zkPath = ProducerIdZNode.path(producerId);
+        try {
+            Stat stat = new Stat();
+            byte[] data = zkClient.getData().storingStatIn(stat).forPath(zkPath);
+            return Optional.of(Tuple2.of(ProducerIdZNode.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Deletes the producer offset snapshot for the given producer ID only if the version matches.
+     *
+     * <p>This provides optimistic concurrency control - the delete will only succeed if no other
+     * process has modified the snapshot since it was read.
+     *
+     * @param producerId the producer ID
+     * @param expectedVersion the expected ZK version (obtained from getProducerSnapshotWithVersion)
+     * @return true if deleted successfully, false if version mismatch (snapshot was modified)
+     * @throws Exception if the operation fails for reasons other than version mismatch
+     */
+    public boolean deleteProducerSnapshotIfVersion(String producerId, int expectedVersion)
+            throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        try {
+            zkClient.delete().withVersion(expectedVersion).forPath(path);
+            LOG.info(
+                    "Deleted producer snapshot for producer {} at path {} with version {}.",
+                    producerId,
+                    path,
+                    expectedVersion);
+            return true;
+        } catch (KeeperException.BadVersionException e) {
+            LOG.debug(
+                    "Failed to delete producer snapshot for producer {} - version mismatch "
+                            + "(expected {}, snapshot was modified by another process).",
+                    producerId,
+                    expectedVersion);
+            return false;
+        } catch (KeeperException.NoNodeException e) {
+            LOG.debug(
+                    "Producer snapshot for producer {} was already deleted by another process.",
+                    producerId);
+            return true; // Already deleted, consider it success
+        }
+    }
+
+    /**
+     * Lists all producer IDs that have registered snapshots.
+     *
+     * @return list of producer IDs
+     * @throws Exception if the operation fails
+     */
+    public List<String> listProducerIds() throws Exception {
+        return getChildren(ProducersZNode.path());
+    }
+}

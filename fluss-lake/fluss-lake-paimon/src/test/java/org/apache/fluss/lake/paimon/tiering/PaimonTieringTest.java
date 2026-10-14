@@ -1,0 +1,1367 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.lake.paimon.tiering;
+
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.lake.batch.ArrowRecordBatch;
+import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
+import org.apache.fluss.lake.committer.CommitterInitContext;
+import org.apache.fluss.lake.committer.LakeCommitter;
+import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
+import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.SupportsRecordBatchWrite;
+import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.ArrowBatchData;
+import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.GenericRecord;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.utils.UnshadedArrowReadUtils;
+import org.apache.fluss.utils.types.Tuple2;
+
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.manifest.ManifestCommittable;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.Partition;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.CloseableIterator;
+import org.apache.paimon.utils.SnapshotManager;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import javax.annotation.Nullable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Stream;
+
+import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
+import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
+import static org.apache.fluss.lake.writer.LakeTieringFactory.FLUSS_LAKE_TIERING_COMMIT_USER;
+import static org.apache.fluss.metadata.TableDescriptor.BUCKET_COLUMN_NAME;
+import static org.apache.fluss.metadata.TableDescriptor.OFFSET_COLUMN_NAME;
+import static org.apache.fluss.metadata.TableDescriptor.TIMESTAMP_COLUMN_NAME;
+import static org.apache.fluss.record.ChangeType.APPEND_ONLY;
+import static org.apache.fluss.record.ChangeType.DELETE;
+import static org.apache.fluss.record.ChangeType.INSERT;
+import static org.apache.fluss.record.ChangeType.UPDATE_AFTER;
+import static org.apache.fluss.record.ChangeType.UPDATE_BEFORE;
+import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
+import static org.apache.paimon.table.sink.BatchWriteBuilder.COMMIT_IDENTIFIER;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** The UT for tiering to Paimon via {@link PaimonLakeTieringFactory}. */
+class PaimonTieringTest {
+
+    private @TempDir File tempWarehouseDir;
+    private PaimonLakeTieringFactory paimonLakeTieringFactory;
+    private Catalog paimonCatalog;
+
+    @BeforeEach
+    void beforeEach() {
+        Configuration configuration = new Configuration();
+        configuration.setString("warehouse", tempWarehouseDir.toString());
+        paimonLakeTieringFactory = new PaimonLakeTieringFactory(configuration);
+        paimonCatalog =
+                CatalogFactory.createCatalog(
+                        CatalogContext.create(Options.fromMap(configuration.toMap())));
+    }
+
+    private static Stream<Arguments> tieringWriteArgs() {
+        return Stream.of(
+                Arguments.of(true, true),
+                Arguments.of(true, false),
+                Arguments.of(false, true),
+                Arguments.of(false, false));
+    }
+
+    private static Stream<Arguments> snapshotExpireArgs() {
+        return Stream.of(
+                Arguments.of(true, true, true),
+                Arguments.of(true, true, false),
+                Arguments.of(true, false, true),
+                Arguments.of(true, false, false),
+                Arguments.of(false, true, true),
+                Arguments.of(false, true, false),
+                Arguments.of(false, false, true),
+                Arguments.of(false, false, false));
+    }
+
+    private static Stream<Arguments> partitionExpireArgs() {
+        return Stream.of(
+                Arguments.of(true, true),
+                Arguments.of(true, false),
+                Arguments.of(false, true),
+                Arguments.of(false, false));
+    }
+
+    @ParameterizedTest
+    @MethodSource("tieringWriteArgs")
+    void testTieringWriteTable(boolean isPrimaryKeyTable, boolean isPartitioned) throws Exception {
+        int bucketNum = 3;
+        TablePath tablePath =
+                TablePath.of(
+                        "paimon",
+                        String.format(
+                                "test_tiering_table_%s_%s",
+                                isPrimaryKeyTable ? "primary_key" : "log",
+                                isPartitioned ? "partitioned" : "non_partitioned"));
+        createTable(
+                tablePath,
+                isPrimaryKeyTable,
+                isPartitioned,
+                isPrimaryKeyTable ? bucketNum : null,
+                Collections.emptyMap());
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .distributedBy(bucketNum)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            // should no any missing snapshot
+            assertThat(lakeCommitter.getMissingLakeSnapshot(1L)).isNull();
+        }
+
+        Map<Tuple2<String, Integer>, List<LogRecord>> recordsByBucket = new HashMap<>();
+        Map<Long, String> partitionIdAndName =
+                isPartitioned
+                        ? new HashMap<Long, String>() {
+                            {
+                                put(1L, "p1");
+                                put(2L, "p2");
+                                put(3L, "p3");
+                            }
+                        }
+                        : Collections.singletonMap(null, null);
+
+        // firstly, write some data
+        writeData(tableInfo, recordsByBucket, partitionIdAndName);
+
+        // then, check data
+        for (int bucket = 0; bucket < 3; bucket++) {
+            for (String partition : partitionIdAndName.values()) {
+                Tuple2<String, Integer> partitionBucket = Tuple2.of(partition, bucket);
+                List<LogRecord> expectRecords = recordsByBucket.get(partitionBucket);
+                CloseableIterator<InternalRow> actualRecords =
+                        getPaimonRows(tablePath, partition, isPrimaryKeyTable, bucket);
+                verifyTableRecords(actualRecords, expectRecords, bucket, partition);
+            }
+        }
+
+        // then, let's verify getMissingLakeSnapshot works
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            // use snapshot id 0 as the known snapshot id
+            CommittedLakeSnapshot committedLakeSnapshot = lakeCommitter.getMissingLakeSnapshot(0L);
+            assertThat(committedLakeSnapshot).isNotNull();
+            assertThat(committedLakeSnapshot.getLakeSnapshotId()).isOne();
+
+            // use null as the known snapshot id
+            CommittedLakeSnapshot committedLakeSnapshot2 =
+                    lakeCommitter.getMissingLakeSnapshot(null);
+            assertThat(committedLakeSnapshot2).isEqualTo(committedLakeSnapshot);
+
+            // use snapshot id 1 as the known snapshot id
+            committedLakeSnapshot = lakeCommitter.getMissingLakeSnapshot(1L);
+            // no any missing committed offset since the latest snapshot is 1L
+            assertThat(committedLakeSnapshot).isNull();
+        }
+    }
+
+    @Test
+    void testHistoricalPrimaryKeyTiering() throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_historical_primary_key");
+        TableInfo tableInfo = createHistoricalTable(tablePath, true);
+        long timestamp = 1_000L;
+        List<LogRecord> records =
+                Arrays.asList(
+                        historicalRecord(0L, timestamp, 1, "20240101", INSERT),
+                        historicalRecord(1L, timestamp, 1, "20240102", INSERT));
+
+        PaimonWriteResult writeResult;
+        try (LakeWriter<PaimonWriteResult> lakeWriter =
+                createLakeWriter(tablePath, 0, HISTORICAL_PARTITION_VALUE, 1L, tableInfo)) {
+            for (LogRecord record : records) {
+                lakeWriter.write(record);
+            }
+            writeResult = lakeWriter.complete();
+        }
+
+        SimpleVersionedSerializer<PaimonWriteResult> serializer =
+                paimonLakeTieringFactory.getWriteResultSerializer();
+        writeResult =
+                serializer.deserialize(serializer.getVersion(), serializer.serialize(writeResult));
+        assertHistoricalPartitions(writeResult);
+
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> committer =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            committer.commit(
+                    committer.toCommittable(Collections.singletonList(writeResult)),
+                    Collections.emptyMap());
+        }
+        assertThat(paimonCatalog.listPartitions(toPaimon(tablePath)))
+                .extracting(partition -> partition.spec().get("c3"))
+                .containsExactlyInAnyOrder("20240101", "20240102");
+    }
+
+    @Test
+    void testHistoricalArrowBatchTiering() throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_historical_arrow");
+        TableInfo tableInfo = createHistoricalTable(tablePath, false);
+        long baseOffset = 10L;
+        long timestamp = 1_000L;
+        List<LogRecord> records =
+                Arrays.asList(
+                        historicalRecord(baseOffset, timestamp, 1, "20240101", APPEND_ONLY),
+                        historicalRecord(baseOffset + 1, timestamp, 2, "20240102", APPEND_ONLY));
+
+        PaimonWriteResult writeResult;
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                LakeWriter<PaimonWriteResult> lakeWriter =
+                        createLakeWriter(tablePath, 0, HISTORICAL_PARTITION_VALUE, 1L, tableInfo)) {
+            VectorSchemaRoot root =
+                    VectorSchemaRoot.create(
+                            UnshadedArrowReadUtils.toArrowSchema(tableInfo.getRowType()),
+                            allocator);
+            try (ArrowRecordBatch arrowRecordBatch =
+                    new ArrowRecordBatch(new ArrowBatchData(root, baseOffset, timestamp, 1))) {
+                writeArrowRows(root, records);
+                ((SupportsRecordBatchWrite) lakeWriter).write(arrowRecordBatch);
+            }
+            writeResult = lakeWriter.complete();
+        }
+
+        assertHistoricalPartitions(writeResult);
+    }
+
+    @Test
+    void testEmptyCommitCreatesSnapshot() throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_empty_commit");
+        createTable(tablePath, false, false, null, Collections.emptyMap());
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+
+        // an empty commit should still create a snapshot to persist tiering progress
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            PaimonCommittable committable = lakeCommitter.toCommittable(Collections.emptyList());
+            long snapshotId =
+                    lakeCommitter
+                            .commit(
+                                    committable,
+                                    Collections.singletonMap("fluss-offsets", "offsets-path"))
+                            .getCommittedSnapshotId();
+            assertThat(snapshotId).isEqualTo(1);
+
+            CommittedLakeSnapshot committedLakeSnapshot =
+                    lakeCommitter.getMissingLakeSnapshot(null);
+            assertThat(committedLakeSnapshot).isNotNull();
+            assertThat(committedLakeSnapshot.getLakeSnapshotId()).isOne();
+            assertThat(committedLakeSnapshot.getSnapshotProperties())
+                    .containsEntry("fluss-offsets", "offsets-path");
+        }
+    }
+
+    @Test
+    void testUniqueCommitUsersAndBackwardCompatibleRecovery() throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_unique_commit_users");
+        TableInfo tableInfo = createNonPartitionedLogTable(tablePath);
+        FileStoreTable fileStoreTable =
+                ((FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath)))
+                        .copy(Collections.singletonMap(CoreOptions.COMMIT_CALLBACKS.key(), ""));
+
+        ManifestCommittable legacyCommittable = new ManifestCommittable(COMMIT_IDENTIFIER);
+        legacyCommittable.addProperty(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "legacy-offsets");
+        try (TableCommitImpl tableCommit =
+                fileStoreTable.newCommit(FLUSS_LAKE_TIERING_COMMIT_USER)) {
+            tableCommit.ignoreEmptyCommit(false).commit(legacyCommittable);
+        }
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            CommittedLakeSnapshot legacySnapshot = lakeCommitter.getMissingLakeSnapshot(null);
+            assertThat(legacySnapshot).isNotNull();
+            assertThat(legacySnapshot.getLakeSnapshotId()).isOne();
+        }
+
+        long firstSnapshotId = commitEmptySnapshot(tablePath, tableInfo, "first-offsets");
+        long secondSnapshotId = commitEmptySnapshot(tablePath, tableInfo, "second-offsets");
+
+        Snapshot firstSnapshot = fileStoreTable.snapshotManager().snapshot(firstSnapshotId);
+        Snapshot secondSnapshot = fileStoreTable.snapshotManager().snapshot(secondSnapshotId);
+        String uniqueCommitUserPrefix = FLUSS_LAKE_TIERING_COMMIT_USER + "_";
+        assertThat(firstSnapshot.commitUser()).startsWith(uniqueCommitUserPrefix);
+        assertThat(secondSnapshot.commitUser())
+                .startsWith(uniqueCommitUserPrefix)
+                .isNotEqualTo(firstSnapshot.commitUser());
+
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            CommittedLakeSnapshot missingSnapshot =
+                    lakeCommitter.getMissingLakeSnapshot(firstSnapshotId);
+            assertThat(missingSnapshot).isNotNull();
+            assertThat(missingSnapshot.getLakeSnapshotId()).isEqualTo(secondSnapshotId);
+        }
+    }
+
+    @Test
+    void testMultiPartitionTiering() throws Exception {
+        // Test multiple partitions: region + year
+        TablePath tablePath = TablePath.of("paimon", "test_multi_partition");
+        createMultiPartitionTable(tablePath);
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("region", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("year", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .partitionedBy("region", "year")
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+
+        Map<String, List<LogRecord>> recordsByPartition = new HashMap<>();
+        List<PaimonWriteResult> paimonWriteResults = new ArrayList<>();
+        Map<TableBucket, Long> tableBucketOffsets = new HashMap<>();
+
+        // Test data for different partitions using $ separator
+        Map<Long, String> partitionIdAndName =
+                new HashMap<Long, String>() {
+                    {
+                        put(1L, "us-east$2024");
+                        put(2L, "us-west$2024");
+                        put(3L, "eu-central$2023");
+                    }
+                };
+
+        int bucket = 0;
+
+        for (Map.Entry<Long, String> entry : partitionIdAndName.entrySet()) {
+            String partition = entry.getValue();
+            try (LakeWriter<PaimonWriteResult> lakeWriter =
+                    createLakeWriter(tablePath, bucket, partition, entry.getKey(), tableInfo)) {
+                List<LogRecord> logRecords =
+                        genLogTableRecordsForMultiPartition(partition, bucket, 3);
+                recordsByPartition.put(partition, logRecords);
+
+                for (LogRecord logRecord : logRecords) {
+                    lakeWriter.write(logRecord);
+                }
+                tableBucketOffsets.put(new TableBucket(0, entry.getKey(), bucket), 3L);
+                PaimonWriteResult result = lakeWriter.complete();
+                paimonWriteResults.add(result);
+            }
+        }
+
+        // Commit all data
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            PaimonCommittable committable = lakeCommitter.toCommittable(paimonWriteResults);
+            long snapshot =
+                    lakeCommitter
+                            .commit(committable, Collections.emptyMap())
+                            .getCommittedSnapshotId();
+            assertThat(snapshot).isEqualTo(1);
+        }
+
+        // Verify data for each partition
+        for (String partition : partitionIdAndName.values()) {
+            List<LogRecord> expectRecords = recordsByPartition.get(partition);
+            CloseableIterator<InternalRow> actualRecords =
+                    getPaimonRowsMultiPartition(tablePath, partition);
+            verifyLogTableRecordsMultiPartition(actualRecords, expectRecords, bucket);
+        }
+    }
+
+    @Test
+    void testThreePartitionTiering() throws Exception {
+        // Test three partitions: region + year + month
+        TablePath tablePath = TablePath.of("paimon", "test_three_partition");
+        createThreePartitionTable(tablePath);
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("region", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("year", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("month", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .partitionedBy("region", "year", "month")
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+        Map<String, List<LogRecord>> recordsByPartition = new HashMap<>();
+        List<PaimonWriteResult> paimonWriteResults = new ArrayList<>();
+
+        // Test data for different three-level partitions using $ separator
+        Map<Long, String> partitionIdAndName =
+                new LinkedHashMap<Long, String>() {
+                    {
+                        put(1L, "us-east$2024$01");
+                        put(2L, "eu-central$2023$12");
+                    }
+                };
+        int bucket = 0;
+
+        for (Map.Entry<Long, String> entry : partitionIdAndName.entrySet()) {
+            String partition = entry.getValue();
+            try (LakeWriter<PaimonWriteResult> lakeWriter =
+                    createLakeWriter(tablePath, bucket, partition, entry.getKey(), tableInfo)) {
+                List<LogRecord> logRecords =
+                        genLogTableRecordsForMultiPartition(
+                                partition, bucket, 2); // Use same method
+                recordsByPartition.put(partition, logRecords);
+
+                for (LogRecord logRecord : logRecords) {
+                    lakeWriter.write(logRecord);
+                }
+
+                PaimonWriteResult result = lakeWriter.complete();
+                paimonWriteResults.add(result);
+            }
+        }
+
+        // Commit all data
+        long snapshot;
+        Map<String, String> snapshotProperties =
+                Collections.singletonMap(
+                        FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "/path/to/snapshot1");
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            PaimonCommittable committable = lakeCommitter.toCommittable(paimonWriteResults);
+            snapshot =
+                    lakeCommitter.commit(committable, snapshotProperties).getCommittedSnapshotId();
+            assertThat(snapshot).isEqualTo(1);
+        }
+
+        // check fluss offsets in paimon snapshot property
+        assertThat(getSnapshotProperties(tablePath, snapshot)).isEqualTo(snapshotProperties);
+
+        // Verify data for each partition
+        for (String partition : partitionIdAndName.values()) {
+            List<LogRecord> expectRecords = recordsByPartition.get(partition);
+            CloseableIterator<InternalRow> actualRecords =
+                    getPaimonRowsThreePartition(tablePath, partition);
+            verifyLogTableRecordsThreePartition(actualRecords, expectRecords, bucket);
+        }
+    }
+
+    @Test
+    void testTieringStampsPartitionBucketCountAcrossRounds() throws Exception {
+        // After ALTER bucket.num=8: files tiered for the "old" partition are stamped with its
+        // actual count 4 (writer override) while the "new" partition inherits the schema value 8;
+        // a second tiering round passes Paimon's native bucket-count check (historical 4 ==
+        // writer 4), and all rows of both partitions stay readable via bucket-aware reads.
+        int schemaBucketCount = 8;
+        int oldPartitionBucketCount = 4;
+        int recordsPerBucketPerRound = 2;
+        TablePath tablePath = TablePath.of("paimon", "test_partition_bucket_count_stamp");
+        createTable(
+                tablePath,
+                false,
+                true,
+                schemaBucketCount,
+                Collections.singletonMap(CoreOptions.BUCKET_KEY.key(), "c1"));
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .partitionedBy("c3")
+                        .distributedBy(schemaBucketCount, "c1")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+
+        // two independent tiering rounds against the SAME partitions; each round creates fresh
+        // writers and its own committer, exactly as TieringCommitOperator does
+        for (int round = 0; round < 2; round++) {
+            List<PaimonWriteResult> paimonWriteResults = new ArrayList<>();
+            // "old" partition: created before the ALTER, still routes by its original bucket count
+            for (int bucket = 0; bucket < oldPartitionBucketCount; bucket++) {
+                try (LakeWriter<PaimonWriteResult> lakeWriter =
+                        createLakeWriter(
+                                tablePath, bucket, "old", 1L, tableInfo, oldPartitionBucketCount)) {
+                    for (LogRecord logRecord :
+                            genLogTableRecords("old", bucket, recordsPerBucketPerRound).f0) {
+                        lakeWriter.write(logRecord);
+                    }
+                    paimonWriteResults.add(lakeWriter.complete());
+                }
+            }
+            // "new" partition: created after the ALTER, routes by the schema bucket count
+            for (int bucket = 0; bucket < schemaBucketCount; bucket++) {
+                try (LakeWriter<PaimonWriteResult> lakeWriter =
+                        createLakeWriter(tablePath, bucket, "new", 2L, tableInfo, null)) {
+                    for (LogRecord logRecord :
+                            genLogTableRecords("new", bucket, recordsPerBucketPerRound).f0) {
+                        lakeWriter.write(logRecord);
+                    }
+                    paimonWriteResults.add(lakeWriter.complete());
+                }
+            }
+            try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                    createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+                PaimonCommittable committable = lakeCommitter.toCommittable(paimonWriteResults);
+                lakeCommitter.commit(committable, Collections.emptyMap());
+            }
+        }
+
+        // files of BOTH rounds carry each partition's actual bucket count
+        assertThat(totalBucketsOfPartition(tablePath, "old"))
+                .containsExactly(oldPartitionBucketCount);
+        assertThat(totalBucketsOfPartition(tablePath, "new")).containsExactly(schemaBucketCount);
+
+        // both partitions must stay fully readable through the bucket-aware read path, each
+        // holding exactly its own (rounds * records * bucketCount) rows
+        assertThat(rowCountOfPartition(tablePath, "old"))
+                .isEqualTo(2 * recordsPerBucketPerRound * oldPartitionBucketCount);
+        assertThat(rowCountOfPartition(tablePath, "new"))
+                .isEqualTo(2 * recordsPerBucketPerRound * schemaBucketCount);
+    }
+
+    private int rowCountOfPartition(TablePath tablePath, String partition) throws Exception {
+        FileStoreTable fileStoreTable =
+                (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
+        ReadBuilder readBuilder =
+                fileStoreTable
+                        .newReadBuilder()
+                        .withPartitionFilter(Collections.singletonMap("c3", partition));
+        int rowCount = 0;
+        try (CloseableIterator<InternalRow> iterator =
+                readBuilder
+                        .newRead()
+                        .createReader(readBuilder.newScan().plan().splits())
+                        .toCloseableIterator()) {
+            while (iterator.hasNext()) {
+                iterator.next();
+                rowCount++;
+            }
+        }
+        return rowCount;
+    }
+
+    private Set<Integer> totalBucketsOfPartition(TablePath tablePath, String partition)
+            throws Exception {
+        FileStoreTable fileStoreTable =
+                (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
+        List<Split> splits =
+                fileStoreTable
+                        .newReadBuilder()
+                        .withPartitionFilter(Collections.singletonMap("c3", partition))
+                        .newScan()
+                        .plan()
+                        .splits();
+        assertThat(splits).isNotEmpty();
+        Set<Integer> totalBuckets = new HashSet<>();
+        for (Split split : splits) {
+            totalBuckets.add(((DataSplit) split).totalBuckets());
+        }
+        return totalBuckets;
+    }
+
+    @ParameterizedTest
+    @MethodSource("snapshotExpireArgs")
+    void testSnapshotExpiration(
+            boolean isPartitioned,
+            boolean isTableAutoExpireSnapshot,
+            boolean isLakeTieringExpireSnapshot)
+            throws Exception {
+        int bucketNum = 3;
+        TablePath tablePath =
+                TablePath.of(
+                        "paimon",
+                        String.format(
+                                "test_tiering_snapshot_expiration_table_%s",
+                                isPartitioned ? "partitioned" : "non_partitioned"));
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.SNAPSHOT_NUM_RETAINED_MIN.key(), "1");
+        options.put(CoreOptions.SNAPSHOT_NUM_RETAINED_MAX.key(), "2");
+        createTable(tablePath, false, isPartitioned, null, options);
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .distributedBy(bucketNum)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT,
+                                isTableAutoExpireSnapshot)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+        // Get the FileStoreTable to verify snapshots
+        FileStoreTable fileStoreTable =
+                (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
+        SnapshotManager snapshotManager = fileStoreTable.snapshotManager();
+
+        Map<Long, String> partitionIdAndName =
+                isPartitioned
+                        ? new HashMap<Long, String>() {
+                            {
+                                put(1L, "p1");
+                                put(2L, "p2");
+                                put(3L, "p3");
+                            }
+                        }
+                        : Collections.singletonMap(null, null);
+
+        Configuration lakeTieringConfig = new Configuration();
+        lakeTieringConfig.set(
+                ConfigOptions.LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT, isLakeTieringExpireSnapshot);
+
+        // Write some data to generate 2 snapshots
+        writeData(tableInfo, lakeTieringConfig, new HashMap<>(), partitionIdAndName);
+        writeData(tableInfo, lakeTieringConfig, new HashMap<>(), partitionIdAndName);
+        assertThat(snapshotManager.snapshotCount()).isEqualTo(2);
+
+        // write more data
+        for (int i = 0; i < 5; i++) {
+            writeData(tableInfo, lakeTieringConfig, new HashMap<>(), partitionIdAndName);
+            if (isTableAutoExpireSnapshot || isLakeTieringExpireSnapshot) {
+                // if auto snapshot expiration is enabled, snapshot should be expired
+                assertThat(snapshotManager.snapshotCount()).isEqualTo(2);
+            } else {
+                // if auto snapshot expiration is disabled, snapshot should never be expired
+                assertThat(snapshotManager.snapshotCount()).isGreaterThan(2);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionExpireArgs")
+    void testPartitionExpiration(
+            boolean isTableAutoExpireSnapshot, boolean isLakeTieringExpireSnapshot)
+            throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_partition_expire");
+        // Use a fixed ancient date so the partition is always considered expired.
+        // "20200101" with expiration-time=1d is always past-due – no wall-clock dependency.
+        String expiredPartition = "20200101";
+
+        Map<String, String> tableOptions = new HashMap<>();
+        tableOptions.put(CoreOptions.PARTITION_EXPIRATION_TIME.key(), "1 d");
+        tableOptions.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "10 min");
+        tableOptions.put(CoreOptions.PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd");
+        createTable(tablePath, false, true, null, tableOptions);
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .partitionedBy("c3")
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT,
+                                isTableAutoExpireSnapshot)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+
+        Configuration lakeTieringConfig = new Configuration();
+        lakeTieringConfig.set(
+                ConfigOptions.LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT, isLakeTieringExpireSnapshot);
+
+        Map<Long, String> partitionIdAndName =
+                new HashMap<Long, String>() {
+                    {
+                        put(1L, expiredPartition);
+                    }
+                };
+
+        // Simulate multiple tiering rounds – each round creates a new LakeCommitter (try-with-
+        // resources), exactly as TieringCommitOperator does in production.
+        for (int round = 0; round < 5; round++) {
+            writeData(tableInfo, lakeTieringConfig, new HashMap<>(), partitionIdAndName);
+        }
+
+        List<Partition> partitions = paimonCatalog.listPartitions(toPaimon(tablePath));
+        if (isTableAutoExpireSnapshot || isLakeTieringExpireSnapshot) {
+            // if auto snapshot expiration is enabled, partition should also be expired
+            assertThat(partitions).isEmpty();
+        } else {
+            // if auto snapshot expiration is disabled, partition should never be expired
+            assertThat(partitions).isNotEmpty();
+        }
+    }
+
+    private void verifyLogTableRecordsMultiPartition(
+            CloseableIterator<InternalRow> actualRecords,
+            List<LogRecord> expectRecords,
+            int expectBucket)
+            throws Exception {
+        for (LogRecord expectRecord : expectRecords) {
+            InternalRow actualRow = actualRecords.next();
+            // check business columns:
+            assertThat(actualRow.getInt(0)).isEqualTo(expectRecord.getRow().getInt(0));
+            assertThat(actualRow.getString(1).toString())
+                    .isEqualTo(expectRecord.getRow().getString(1).toString());
+
+            // check partition columns (should match record data)
+            assertThat(actualRow.getString(2).toString())
+                    .isEqualTo(expectRecord.getRow().getString(2).toString()); // region
+            assertThat(actualRow.getString(3).toString())
+                    .isEqualTo(expectRecord.getRow().getString(3).toString()); // year
+
+            // check system columns: __bucket, __offset, __timestamp
+            assertThat(actualRow.getInt(4)).isEqualTo(expectBucket);
+            assertThat(actualRow.getLong(5)).isEqualTo(expectRecord.logOffset());
+            assertThat(actualRow.getTimestamp(6, 3).getMillisecond())
+                    .isEqualTo(expectRecord.timestamp());
+        }
+        assertThat(actualRecords.hasNext()).isFalse();
+        actualRecords.close();
+    }
+
+    private void verifyLogTableRecordsThreePartition(
+            CloseableIterator<InternalRow> actualRecords,
+            List<LogRecord> expectRecords,
+            int expectBucket)
+            throws Exception {
+        for (LogRecord expectRecord : expectRecords) {
+            InternalRow actualRow = actualRecords.next();
+            // check business columns:
+            assertThat(actualRow.getInt(0)).isEqualTo(expectRecord.getRow().getInt(0));
+            assertThat(actualRow.getString(1).toString())
+                    .isEqualTo(expectRecord.getRow().getString(1).toString());
+
+            // check partition columns (should match record data)
+            assertThat(actualRow.getString(2).toString())
+                    .isEqualTo(expectRecord.getRow().getString(2).toString()); // region
+            assertThat(actualRow.getString(3).toString())
+                    .isEqualTo(expectRecord.getRow().getString(3).toString()); // year
+            assertThat(actualRow.getString(4).toString())
+                    .isEqualTo(expectRecord.getRow().getString(4).toString()); // month
+
+            // check system columns: __bucket, __offset, __timestamp
+            assertThat(actualRow.getInt(5)).isEqualTo(expectBucket);
+            assertThat(actualRow.getLong(6)).isEqualTo(expectRecord.logOffset());
+            assertThat(actualRow.getTimestamp(7, 3).getMillisecond())
+                    .isEqualTo(expectRecord.timestamp());
+        }
+        assertThat(actualRecords.hasNext()).isFalse();
+        actualRecords.close();
+    }
+
+    private void assertHistoricalPartitions(PaimonWriteResult writeResult) {
+        assertThat(writeResult.commitMessages())
+                .extracting(message -> message.partition().getString(0).toString())
+                .containsExactlyInAnyOrder("20240101", "20240102");
+    }
+
+    private void verifyTableRecords(
+            CloseableIterator<InternalRow> actualRecords,
+            List<LogRecord> expectRecords,
+            int expectBucket,
+            @Nullable String partition)
+            throws Exception {
+        for (LogRecord expectRecord : expectRecords) {
+            InternalRow actualRow = actualRecords.next();
+            // check business columns:
+            assertThat(actualRow.getInt(0)).isEqualTo(expectRecord.getRow().getInt(0));
+            assertThat(actualRow.getString(1).toString())
+                    .isEqualTo(expectRecord.getRow().getString(1).toString());
+
+            assertThat(actualRow.getString(2).toString())
+                    .isEqualTo(expectRecord.getRow().getString(2).toString());
+            if (partition != null) {
+                assertThat(actualRow.getString(2).toString()).isEqualTo(partition);
+            }
+            // check system columns: __bucket, __offset, __timestamp
+            assertThat(actualRow.getInt(3)).isEqualTo(expectBucket);
+            assertThat(actualRow.getLong(4)).isEqualTo(expectRecord.logOffset());
+            assertThat(actualRow.getTimestamp(5, 3).getMillisecond())
+                    .isEqualTo(expectRecord.timestamp());
+        }
+        assertThat(actualRecords.hasNext()).isFalse();
+        actualRecords.close();
+    }
+
+    private Tuple2<List<LogRecord>, List<LogRecord>> genLogTableRecords(
+            @Nullable String partition, int bucket, int numRecords) {
+        List<LogRecord> logRecords = new ArrayList<>();
+        for (int i = 0; i < numRecords; i++) {
+            GenericRow genericRow;
+            // Partitioned table: include partition field in data
+            genericRow = new GenericRow(3); // c1, c2, c3(partition)
+            genericRow.setField(0, i);
+            genericRow.setField(1, BinaryString.fromString("bucket" + bucket + "_" + i));
+            if (partition != null) {
+                genericRow.setField(2, BinaryString.fromString(partition)); // partition field
+            } else {
+                genericRow.setField(2, BinaryString.fromString("bucket" + bucket));
+            }
+            LogRecord logRecord =
+                    new GenericRecord(
+                            i, System.currentTimeMillis(), ChangeType.APPEND_ONLY, genericRow);
+            logRecords.add(logRecord);
+        }
+        return Tuple2.of(logRecords, logRecords);
+    }
+
+    private List<LogRecord> genLogTableRecordsForMultiPartition(
+            String partition, int bucket, int numRecords) {
+        String[] partitionValues = partition.split("\\$");
+        List<LogRecord> logRecords = new ArrayList<>();
+        for (int i = 0; i < numRecords; i++) {
+            GenericRow genericRow =
+                    new GenericRow(2 + partitionValues.length); // c1, c2, region, year
+            genericRow.setField(0, i);
+            genericRow.setField(
+                    1, BinaryString.fromString(partitionValues[0] + "_data_" + bucket + "_" + i));
+
+            // Add partition fields to record data
+            for (int partitionIndex = 0;
+                    partitionIndex < partitionValues.length;
+                    partitionIndex++) {
+                genericRow.setField(
+                        2 + partitionIndex,
+                        BinaryString.fromString(partitionValues[partitionIndex]));
+            }
+
+            LogRecord logRecord =
+                    new GenericRecord(
+                            i, System.currentTimeMillis(), ChangeType.APPEND_ONLY, genericRow);
+            logRecords.add(logRecord);
+        }
+        return logRecords;
+    }
+
+    private Tuple2<List<LogRecord>, List<LogRecord>> genPrimaryKeyTableRecords(
+            @Nullable String partition, int bucket) {
+        int offset = -1;
+        // gen +I, -U, +U, -D
+        List<GenericRow> rows = genKvRow(partition, bucket, 0, 0, 4);
+        List<LogRecord> writtenLogRecords =
+                new ArrayList<>(
+                        Arrays.asList(
+                                toRecord(++offset, rows.get(0), INSERT),
+                                toRecord(++offset, rows.get(1), UPDATE_BEFORE),
+                                toRecord(++offset, rows.get(2), UPDATE_AFTER),
+                                toRecord(++offset, rows.get(3), DELETE)));
+        List<LogRecord> expectLogRecords = new ArrayList<>();
+
+        // gen +I, -U, +U
+        rows = genKvRow(partition, bucket, 1, 4, 7);
+        writtenLogRecords.addAll(
+                Arrays.asList(
+                        toRecord(++offset, rows.get(0), INSERT),
+                        toRecord(++offset, rows.get(1), UPDATE_BEFORE),
+                        toRecord(++offset, rows.get(2), UPDATE_AFTER)));
+        expectLogRecords.add(writtenLogRecords.get(writtenLogRecords.size() - 1));
+
+        // gen +I, +U
+        rows = genKvRow(partition, bucket, 2, 7, 9);
+        writtenLogRecords.addAll(
+                Arrays.asList(
+                        toRecord(++offset, rows.get(0), INSERT),
+                        toRecord(++offset, rows.get(1), UPDATE_AFTER)));
+        expectLogRecords.add(writtenLogRecords.get(writtenLogRecords.size() - 1));
+
+        // gen +I
+        rows = genKvRow(partition, bucket, 3, 9, 10);
+        writtenLogRecords.add(toRecord(++offset, rows.get(0), INSERT));
+        expectLogRecords.add(writtenLogRecords.get(writtenLogRecords.size() - 1));
+
+        return Tuple2.of(writtenLogRecords, expectLogRecords);
+    }
+
+    private List<GenericRow> genKvRow(
+            @Nullable String partition, int bucket, int key, int from, int to) {
+        List<GenericRow> rows = new ArrayList<>();
+        for (int i = from; i < to; i++) {
+            GenericRow genericRow;
+            if (partition != null) {
+                // Partitioned table: include partition field in data
+                genericRow = new GenericRow(3); // c1, c2, c3(partition)
+                genericRow.setField(0, key);
+                genericRow.setField(1, BinaryString.fromString("bucket" + bucket + "_" + i));
+                genericRow.setField(2, BinaryString.fromString(partition)); // partition field
+            } else {
+                // Non-partitioned table
+                genericRow = new GenericRow(3);
+                genericRow.setField(0, key);
+                genericRow.setField(1, BinaryString.fromString("bucket" + bucket + "_" + i));
+                genericRow.setField(2, BinaryString.fromString("bucket" + bucket));
+            }
+            rows.add(genericRow);
+        }
+        return rows;
+    }
+
+    private GenericRecord toRecord(long offset, GenericRow row, ChangeType changeType) {
+        return new GenericRecord(offset, System.currentTimeMillis(), changeType, row);
+    }
+
+    private LogRecord historicalRecord(
+            long offset, long timestamp, int key, String partition, ChangeType changeType) {
+        GenericRow row =
+                GenericRow.of(
+                        key, BinaryString.fromString("value"), BinaryString.fromString(partition));
+        return new GenericRecord(offset, timestamp, changeType, row);
+    }
+
+    private void writeArrowRows(VectorSchemaRoot root, List<LogRecord> records) {
+        root.allocateNew();
+        IntVector keyVector = (IntVector) root.getVector("c1");
+        VarCharVector valueVector = (VarCharVector) root.getVector("c2");
+        VarCharVector partitionVector = (VarCharVector) root.getVector("c3");
+        for (int i = 0; i < records.size(); i++) {
+            org.apache.fluss.row.InternalRow row = records.get(i).getRow();
+            keyVector.setSafe(i, row.getInt(0));
+            valueVector.setSafe(i, row.getString(1).toBytes());
+            partitionVector.setSafe(i, row.getString(2).toBytes());
+        }
+        root.setRowCount(records.size());
+    }
+
+    private CloseableIterator<InternalRow> getPaimonRows(
+            TablePath tablePath, @Nullable String partition, boolean isPrimaryKeyTable, int bucket)
+            throws Exception {
+        Identifier identifier = toPaimon(tablePath);
+        FileStoreTable fileStoreTable = (FileStoreTable) paimonCatalog.getTable(identifier);
+
+        ReadBuilder readBuilder = fileStoreTable.newReadBuilder();
+
+        if (partition != null) {
+            readBuilder =
+                    readBuilder.withPartitionFilter(Collections.singletonMap("c3", partition));
+        }
+        List<Split> splits = new ArrayList<>();
+        if (isPrimaryKeyTable) {
+            splits = readBuilder.withBucketFilter(b -> b == bucket).newScan().plan().splits();
+        } else {
+            // for log table, we can't filter by bucket directly, filter file by __bucket column
+            for (Split split : readBuilder.newScan().plan().splits()) {
+                DataSplit dataSplit = (DataSplit) split;
+                // bucket is always 0
+                assertThat(dataSplit.bucket()).isEqualTo(0);
+                // filter by __bucket column, remove any data file that don't belone to this bucket
+                dataSplit
+                        .dataFiles()
+                        .removeIf(
+                                dataFileMeta ->
+                                        !(dataFileMeta.valueStats().maxValues().getInt(3) == bucket
+                                                && dataFileMeta.valueStats().minValues().getInt(3)
+                                                        == bucket));
+                if (!dataSplit.dataFiles().isEmpty()) {
+                    splits.add(split);
+                }
+            }
+        }
+        return readBuilder.newRead().createReader(splits).toCloseableIterator();
+    }
+
+    private CloseableIterator<InternalRow> getPaimonRowsMultiPartition(
+            TablePath tablePath, String partition) throws Exception {
+        Identifier identifier = toPaimon(tablePath);
+        FileStoreTable fileStoreTable = (FileStoreTable) paimonCatalog.getTable(identifier);
+
+        ReadBuilder readBuilder = fileStoreTable.newReadBuilder();
+
+        // Parse partition: "us-east$2024" -> ["us-east", "2024"]
+        String[] partitionValues = partition.split("\\$");
+        String region = partitionValues[0];
+        String year = partitionValues[1];
+
+        Map<String, String> partitionFilter = new HashMap<>();
+        partitionFilter.put("region", region);
+        partitionFilter.put("year", year);
+        readBuilder = readBuilder.withPartitionFilter(partitionFilter);
+
+        List<Split> splits = readBuilder.newScan().plan().splits();
+        return readBuilder.newRead().createReader(splits).toCloseableIterator();
+    }
+
+    private CloseableIterator<InternalRow> getPaimonRowsThreePartition(
+            TablePath tablePath, String partition) throws Exception {
+        Identifier identifier = toPaimon(tablePath);
+        FileStoreTable fileStoreTable = (FileStoreTable) paimonCatalog.getTable(identifier);
+
+        ReadBuilder readBuilder = fileStoreTable.newReadBuilder();
+
+        // Parse partition: "us-east$2024$01" -> ["us-east", "2024", "01"]
+        String[] partitionValues = partition.split("\\$");
+        String region = partitionValues[0];
+        String year = partitionValues[1];
+        String month = partitionValues[2];
+
+        Map<String, String> partitionFilter = new HashMap<>();
+        partitionFilter.put("region", region);
+        partitionFilter.put("year", year);
+        partitionFilter.put("month", month);
+        readBuilder = readBuilder.withPartitionFilter(partitionFilter);
+
+        List<Split> splits = readBuilder.newScan().plan().splits();
+        return readBuilder.newRead().createReader(splits).toCloseableIterator();
+    }
+
+    private LakeWriter<PaimonWriteResult> createLakeWriter(
+            TablePath tablePath,
+            int bucket,
+            @Nullable String partition,
+            @Nullable Long partitionId,
+            TableInfo tableInfo)
+            throws IOException {
+        return createLakeWriter(tablePath, bucket, partition, partitionId, tableInfo, null);
+    }
+
+    private LakeWriter<PaimonWriteResult> createLakeWriter(
+            TablePath tablePath,
+            int bucket,
+            @Nullable String partition,
+            @Nullable Long partitionId,
+            TableInfo tableInfo,
+            @Nullable Integer partitionBucketCount)
+            throws IOException {
+        return paimonLakeTieringFactory.createLakeWriter(
+                new WriterInitContext() {
+                    @Override
+                    public TablePath tablePath() {
+                        return tablePath;
+                    }
+
+                    @Override
+                    public TableBucket tableBucket() {
+                        // don't care about tableId & partitionId
+                        return new TableBucket(0, partitionId, bucket);
+                    }
+
+                    @Nullable
+                    @Override
+                    public String partition() {
+                        return partition;
+                    }
+
+                    @Override
+                    public TableInfo tableInfo() {
+                        return tableInfo;
+                    }
+
+                    @Override
+                    public int bucketCount() {
+                        return partitionBucketCount != null
+                                ? partitionBucketCount
+                                : tableInfo.getNumBuckets();
+                    }
+                });
+    }
+
+    private LakeCommitter<PaimonWriteResult, PaimonCommittable> createLakeCommitter(
+            TablePath tablePath, TableInfo tableInfo, Configuration lakeTieringConfig)
+            throws IOException {
+        return paimonLakeTieringFactory.createLakeCommitter(
+                new CommitterInitContext() {
+                    @Override
+                    public TablePath tablePath() {
+                        return tablePath;
+                    }
+
+                    @Override
+                    public TableInfo tableInfo() {
+                        return tableInfo;
+                    }
+
+                    @Override
+                    public Configuration lakeTieringConfig() {
+                        return lakeTieringConfig;
+                    }
+
+                    @Override
+                    public Configuration flussClientConfig() {
+                        // don't care about fluss client config
+                        return new Configuration();
+                    }
+                });
+    }
+
+    private long commitEmptySnapshot(TablePath tablePath, TableInfo tableInfo, String offsets)
+            throws Exception {
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            return lakeCommitter
+                    .commit(
+                            lakeCommitter.toCommittable(Collections.emptyList()),
+                            Collections.singletonMap(
+                                    FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, offsets))
+                    .getCommittedSnapshotId();
+        }
+    }
+
+    private void createTable(
+            TablePath tablePath,
+            boolean isPrimaryTable,
+            boolean isPartitioned,
+            @Nullable Integer numBuckets,
+            Map<String, String> options)
+            throws Exception {
+        Schema.Builder builder =
+                Schema.newBuilder()
+                        .column("c1", DataTypes.INT())
+                        .column("c2", DataTypes.STRING())
+                        .column("c3", DataTypes.STRING());
+        if (isPartitioned) {
+            builder.partitionKeys("c3");
+        }
+        if (isPrimaryTable) {
+            if (isPartitioned) {
+                builder.primaryKey("c1", "c3");
+            } else {
+                builder.primaryKey("c1");
+            }
+            builder.option(
+                    CoreOptions.CHANGELOG_PRODUCER.key(),
+                    CoreOptions.ChangelogProducer.INPUT.toString());
+        }
+        if (numBuckets != null) {
+            builder.option(CoreOptions.BUCKET.key(), String.valueOf(numBuckets));
+        }
+        builder.options(options);
+        doCreatePaimonTable(tablePath, builder);
+    }
+
+    private TableInfo createNonPartitionedLogTable(TablePath tablePath) throws Exception {
+        createTable(tablePath, false, false, null, Collections.emptyMap());
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        return TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+    }
+
+    private TableInfo createHistoricalTable(TablePath tablePath, boolean isPrimaryKeyTable)
+            throws Exception {
+        createTable(
+                tablePath,
+                isPrimaryKeyTable,
+                true,
+                isPrimaryKeyTable ? 1 : null,
+                Collections.emptyMap());
+
+        org.apache.fluss.metadata.Schema.Builder schemaBuilder =
+                org.apache.fluss.metadata.Schema.newBuilder()
+                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                        .column("c3", org.apache.fluss.types.DataTypes.STRING());
+        if (isPrimaryKeyTable) {
+            schemaBuilder.primaryKey("c1", "c3");
+        }
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schemaBuilder.build())
+                        .partitionedBy("c3")
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        return TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+    }
+
+    private void createMultiPartitionTable(TablePath tablePath) throws Exception {
+        Schema.Builder builder =
+                Schema.newBuilder()
+                        .column("c1", DataTypes.INT())
+                        .column("c2", DataTypes.STRING())
+                        .column("region", DataTypes.STRING())
+                        .column("year", DataTypes.STRING())
+                        .partitionKeys("region", "year");
+        doCreatePaimonTable(tablePath, builder);
+    }
+
+    private void createThreePartitionTable(TablePath tablePath) throws Exception {
+        Schema.Builder builder =
+                Schema.newBuilder()
+                        .column("c1", DataTypes.INT())
+                        .column("c2", DataTypes.STRING())
+                        .column("region", DataTypes.STRING())
+                        .column("year", DataTypes.STRING())
+                        .column("month", DataTypes.STRING())
+                        .partitionKeys("region", "year", "month");
+        doCreatePaimonTable(tablePath, builder);
+    }
+
+    private void doCreatePaimonTable(TablePath tablePath, Schema.Builder paimonSchemaBuilder)
+            throws Exception {
+        paimonSchemaBuilder.column(BUCKET_COLUMN_NAME, DataTypes.INT());
+        paimonSchemaBuilder.column(OFFSET_COLUMN_NAME, DataTypes.BIGINT());
+        paimonSchemaBuilder.column(TIMESTAMP_COLUMN_NAME, DataTypes.TIMESTAMP_LTZ_MILLIS());
+        paimonSchemaBuilder.option(
+                CoreOptions.COMMIT_CALLBACKS.key(),
+                PaimonLakeCommitter.PaimonCommitCallback.class.getName());
+        paimonCatalog.createDatabase(tablePath.getDatabaseName(), true);
+        paimonCatalog.createTable(toPaimon(tablePath), paimonSchemaBuilder.build(), true);
+    }
+
+    private Map<String, String> getSnapshotProperties(TablePath tablePath, long snapshotId)
+            throws Exception {
+        Identifier identifier = toPaimon(tablePath);
+        FileStoreTable fileStoreTable = (FileStoreTable) paimonCatalog.getTable(identifier);
+        return fileStoreTable.snapshotManager().snapshot(snapshotId).properties();
+    }
+
+    private void writeData(
+            TableInfo tableInfo,
+            Map<Tuple2<String, Integer>, List<LogRecord>> recordsByBucket,
+            Map<Long, String> partitionIdAndName)
+            throws Exception {
+        writeData(tableInfo, new Configuration(), recordsByBucket, partitionIdAndName);
+    }
+
+    private void writeData(
+            TableInfo tableInfo,
+            Configuration lakeTieringConfig,
+            Map<Tuple2<String, Integer>, List<LogRecord>> recordsByBucket,
+            Map<Long, String> partitionIdAndName)
+            throws Exception {
+        TablePath tablePath = tableInfo.getTablePath();
+        int bucketNum = tableInfo.getNumBuckets();
+        boolean isPrimaryKeyTable = tableInfo.hasPrimaryKey();
+
+        List<PaimonWriteResult> paimonWriteResults = new ArrayList<>();
+        SimpleVersionedSerializer<PaimonWriteResult> writeResultSerializer =
+                paimonLakeTieringFactory.getWriteResultSerializer();
+        SimpleVersionedSerializer<PaimonCommittable> committableSerializer =
+                paimonLakeTieringFactory.getCommittableSerializer();
+
+        // first, write data
+        for (int bucket = 0; bucket < bucketNum; bucket++) {
+            for (Map.Entry<Long, String> entry : partitionIdAndName.entrySet()) {
+                String partition = entry.getValue();
+                try (LakeWriter<PaimonWriteResult> lakeWriter =
+                        createLakeWriter(tablePath, bucket, partition, entry.getKey(), tableInfo)) {
+                    Tuple2<String, Integer> partitionBucket = Tuple2.of(partition, bucket);
+                    Tuple2<List<LogRecord>, List<LogRecord>> writeAndExpectRecords =
+                            isPrimaryKeyTable
+                                    ? genPrimaryKeyTableRecords(partition, bucket)
+                                    : genLogTableRecords(partition, bucket, 10);
+                    List<LogRecord> writtenRecords = writeAndExpectRecords.f0;
+                    List<LogRecord> expectRecords = writeAndExpectRecords.f1;
+                    recordsByBucket.put(partitionBucket, expectRecords);
+                    for (LogRecord logRecord : writtenRecords) {
+                        lakeWriter.write(logRecord);
+                    }
+                    // serialize/deserialize writeResult
+                    PaimonWriteResult paimonWriteResult = lakeWriter.complete();
+                    byte[] serialized = writeResultSerializer.serialize(paimonWriteResult);
+                    paimonWriteResults.add(
+                            writeResultSerializer.deserialize(
+                                    writeResultSerializer.getVersion(), serialized));
+                }
+            }
+        }
+
+        // second, commit data
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo, lakeTieringConfig)) {
+            // serialize/deserialize committable
+            PaimonCommittable paimonCommittable = lakeCommitter.toCommittable(paimonWriteResults);
+            byte[] serialized = committableSerializer.serialize(paimonCommittable);
+            paimonCommittable =
+                    committableSerializer.deserialize(
+                            committableSerializer.getVersion(), serialized);
+
+            Map<String, String> snapshotProperties =
+                    Collections.singletonMap(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets");
+            lakeCommitter.commit(paimonCommittable, snapshotProperties);
+        }
+    }
+}

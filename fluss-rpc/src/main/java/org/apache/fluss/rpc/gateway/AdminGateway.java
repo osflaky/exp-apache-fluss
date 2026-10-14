@@ -1,0 +1,260 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.rpc.gateway;
+
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddServerTagByRackRequest;
+import org.apache.fluss.rpc.messages.AddServerTagByRackResponse;
+import org.apache.fluss.rpc.messages.AddServerTagRequest;
+import org.apache.fluss.rpc.messages.AddServerTagResponse;
+import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
+import org.apache.fluss.rpc.messages.AlterClusterConfigsResponse;
+import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
+import org.apache.fluss.rpc.messages.AlterDatabaseResponse;
+import org.apache.fluss.rpc.messages.AlterTableRequest;
+import org.apache.fluss.rpc.messages.AlterTableResponse;
+import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
+import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CreateAclsRequest;
+import org.apache.fluss.rpc.messages.CreateAclsResponse;
+import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
+import org.apache.fluss.rpc.messages.CreateDatabaseResponse;
+import org.apache.fluss.rpc.messages.CreatePartitionRequest;
+import org.apache.fluss.rpc.messages.CreatePartitionResponse;
+import org.apache.fluss.rpc.messages.CreateTableRequest;
+import org.apache.fluss.rpc.messages.CreateTableResponse;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.DropAclsRequest;
+import org.apache.fluss.rpc.messages.DropAclsResponse;
+import org.apache.fluss.rpc.messages.DropDatabaseRequest;
+import org.apache.fluss.rpc.messages.DropDatabaseResponse;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.DropPartitionRequest;
+import org.apache.fluss.rpc.messages.DropPartitionResponse;
+import org.apache.fluss.rpc.messages.DropTableRequest;
+import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsRequest;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressRequest;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsRequest;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
+import org.apache.fluss.rpc.messages.RebalanceRequest;
+import org.apache.fluss.rpc.messages.RebalanceResponse;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagByRackRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagByRackResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.rpc.protocol.RPC;
+
+import java.util.concurrent.CompletableFuture;
+
+/** The gateway interface between the client and the server for reading and writing metadata. */
+public interface AdminGateway extends AdminReadOnlyGateway {
+    /**
+     * Create a database.
+     *
+     * @param request Create database request
+     */
+    @RPC(api = ApiKeys.CREATE_DATABASE)
+    CompletableFuture<CreateDatabaseResponse> createDatabase(CreateDatabaseRequest request);
+
+    /**
+     * Alter a database.
+     *
+     * @param request the request to alter a database.
+     */
+    @RPC(api = ApiKeys.ALTER_DATABASE)
+    CompletableFuture<AlterDatabaseResponse> alterDatabase(AlterDatabaseRequest request);
+
+    /**
+     * Drop a database.
+     *
+     * @param request Drop database request.
+     */
+    @RPC(api = ApiKeys.DROP_DATABASE)
+    CompletableFuture<DropDatabaseResponse> dropDatabase(DropDatabaseRequest request);
+
+    /**
+     * Creates a new table.
+     *
+     * @param request the request to create table.
+     */
+    @RPC(api = ApiKeys.CREATE_TABLE)
+    CompletableFuture<CreateTableResponse> createTable(CreateTableRequest request);
+
+    /**
+     * Alter a table.
+     *
+     * @param request the request to alter a table.
+     */
+    @RPC(api = ApiKeys.ALTER_TABLE)
+    CompletableFuture<AlterTableResponse> alterTable(AlterTableRequest request);
+
+    /**
+     * Drop a table.
+     *
+     * @param request Drop table request
+     */
+    @RPC(api = ApiKeys.DROP_TABLE)
+    CompletableFuture<DropTableResponse> dropTable(DropTableRequest request);
+
+    /**
+     * Create a new partition for a partitioned table.
+     *
+     * @param request Create partition request
+     */
+    @RPC(api = ApiKeys.CREATE_PARTITION)
+    CompletableFuture<CreatePartitionResponse> createPartition(CreatePartitionRequest request);
+
+    /**
+     * Drop a partition from a partitioned table.
+     *
+     * @param request Drop partition request
+     */
+    @RPC(api = ApiKeys.DROP_PARTITION)
+    CompletableFuture<DropPartitionResponse> dropPartition(DropPartitionRequest request);
+
+    /**
+     * create acls for a resource.
+     *
+     * @param request create acl request.
+     */
+    @RPC(api = ApiKeys.CREATE_ACLS)
+    CompletableFuture<CreateAclsResponse> createAcls(CreateAclsRequest request);
+
+    /**
+     * Drop acls for a resource.
+     *
+     * @param request drop acl request.
+     */
+    @RPC(api = ApiKeys.DROP_ACLS)
+    CompletableFuture<DropAclsResponse> dropAcls(DropAclsRequest request);
+
+    @RPC(api = ApiKeys.ALTER_CLUSTER_CONFIGS)
+    CompletableFuture<AlterClusterConfigsResponse> alterClusterConfigs(
+            AlterClusterConfigsRequest request);
+
+    @RPC(api = ApiKeys.ADD_SERVER_TAG)
+    CompletableFuture<AddServerTagResponse> addServerTag(AddServerTagRequest request);
+
+    @RPC(api = ApiKeys.REMOVE_SERVER_TAG)
+    CompletableFuture<RemoveServerTagResponse> removeServerTag(RemoveServerTagRequest request);
+
+    @RPC(api = ApiKeys.ADD_SERVER_TAG_BY_RACK)
+    CompletableFuture<AddServerTagByRackResponse> addServerTagByRack(
+            AddServerTagByRackRequest request);
+
+    @RPC(api = ApiKeys.REMOVE_SERVER_TAG_BY_RACK)
+    CompletableFuture<RemoveServerTagByRackResponse> removeServerTagByRack(
+            RemoveServerTagByRackRequest request);
+
+    @RPC(api = ApiKeys.REBALANCE)
+    CompletableFuture<RebalanceResponse> rebalance(RebalanceRequest request);
+
+    @RPC(api = ApiKeys.LIST_REBALANCE_PROGRESS)
+    CompletableFuture<ListRebalanceProgressResponse> listRebalanceProgress(
+            ListRebalanceProgressRequest request);
+
+    @RPC(api = ApiKeys.CANCEL_REBALANCE)
+    CompletableFuture<CancelRebalanceResponse> cancelRebalance(CancelRebalanceRequest request);
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    /**
+     * Register producer offset snapshot with atomic "check and register" semantics.
+     *
+     * @param request the request containing producer ID and offsets
+     * @return response indicating whether snapshot was created or already existed
+     */
+    @RPC(api = ApiKeys.REGISTER_PRODUCER_OFFSETS)
+    CompletableFuture<RegisterProducerOffsetsResponse> registerProducerOffsets(
+            RegisterProducerOffsetsRequest request);
+
+    /**
+     * Get producer offset snapshot.
+     *
+     * @param request the request containing producer ID
+     * @return response containing the producer offsets
+     */
+    @RPC(api = ApiKeys.GET_PRODUCER_OFFSETS)
+    CompletableFuture<GetProducerOffsetsResponse> getProducerOffsets(
+            GetProducerOffsetsRequest request);
+
+    /**
+     * Delete producer offset snapshot.
+     *
+     * @param request the request containing producer ID
+     * @return response indicating deletion success
+     */
+    @RPC(api = ApiKeys.DELETE_PRODUCER_OFFSETS)
+    CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
+            DeleteProducerOffsetsRequest request);
+
+    @RPC(api = ApiKeys.ACQUIRE_KV_SNAPSHOT_LEASE)
+    CompletableFuture<AcquireKvSnapshotLeaseResponse> acquireKvSnapshotLease(
+            AcquireKvSnapshotLeaseRequest request);
+
+    @RPC(api = ApiKeys.RELEASE_KV_SNAPSHOT_LEASE)
+    CompletableFuture<ReleaseKvSnapshotLeaseResponse> releaseKvSnapshotLease(
+            ReleaseKvSnapshotLeaseRequest request);
+
+    @RPC(api = ApiKeys.DROP_KV_SNAPSHOT_LEASE)
+    CompletableFuture<DropKvSnapshotLeaseResponse> dropKvSnapshotLease(
+            DropKvSnapshotLeaseRequest request);
+
+    // todo: rename table & alter table
+
+    // ==================================================================================
+    // Orphan Cleanup RPCs (coordinator-only, internal)
+    // ==================================================================================
+
+    /**
+     * List remote log manifest entries for all buckets of a table or single partition.
+     *
+     * @param request request with table_id and optional partition_id
+     * @return per-bucket manifest path and end offset
+     */
+    @RPC(api = ApiKeys.LIST_REMOTE_LOG_MANIFESTS)
+    CompletableFuture<ListRemoteLogManifestsResponse> listRemoteLogManifests(
+            ListRemoteLogManifestsRequest request);
+
+    /**
+     * List active KV snapshot ids for a (tableId, partitionId) unit. The response is the union of
+     * (a) snapshots currently held by the in-memory {@code CompletedSnapshotStore} for each bucket
+     * and (b) snapshots still pinned by an active KV snapshot lease. No retention truncation is
+     * applied — every snapshot the coordinator has not yet pruned from ZK is reported as active so
+     * orphan cleanup never misdeletes a still-referenced snapshot. The server emits one entry per
+     * active {@code (bucket_id, snapshot_id)} pair with no source discriminator; callers must treat
+     * the entire response as the active set.
+     */
+    @RPC(api = ApiKeys.LIST_KV_SNAPSHOTS)
+    CompletableFuture<ListKvSnapshotsResponse> listKvSnapshots(ListKvSnapshotsRequest request);
+}

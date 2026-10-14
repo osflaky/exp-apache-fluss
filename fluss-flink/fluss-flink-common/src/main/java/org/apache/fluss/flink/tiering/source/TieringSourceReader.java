@@ -1,0 +1,185 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.tiering.source;
+
+import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.flink.adapter.SingleThreadMultiplexSourceReaderBaseAdapter;
+import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
+import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
+import org.apache.fluss.flink.tiering.source.split.TieringSplit;
+import org.apache.fluss.flink.tiering.source.state.TieringSplitState;
+import org.apache.fluss.lake.writer.LakeTieringFactory;
+
+import org.apache.flink.api.connector.source.SourceEvent;
+import org.apache.flink.api.connector.source.SourceReader;
+import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
+import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.fluss.flink.tiering.source.TieringSplitReader.DEFAULT_POLL_TIMEOUT;
+
+/** A {@link SourceReader} that read records from Fluss and write to lake. */
+@Internal
+public final class TieringSourceReader<WriteResult>
+        extends SingleThreadMultiplexSourceReaderBaseAdapter<
+                TableBucketWriteResult<WriteResult>,
+                TableBucketWriteResult<WriteResult>,
+                TieringSplit,
+                TieringSplitState> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TieringSourceReader.class);
+
+    private final Connection connection;
+
+    public TieringSourceReader(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
+                    elementsQueue,
+            SourceReaderContext context,
+            Connection connection,
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            String[] ioTmpDirs) {
+        this(
+                elementsQueue,
+                context,
+                connection,
+                lakeTieringFactory,
+                DEFAULT_POLL_TIMEOUT,
+                ioTmpDirs);
+    }
+
+    @VisibleForTesting
+    TieringSourceReader(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
+                    elementsQueue,
+            SourceReaderContext context,
+            Connection connection,
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            Duration pollTimeout) {
+        this(elementsQueue, context, connection, lakeTieringFactory, pollTimeout, new String[0]);
+    }
+
+    @VisibleForTesting
+    TieringSourceReader(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
+                    elementsQueue,
+            SourceReaderContext context,
+            Connection connection,
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            Duration pollTimeout,
+            String[] ioTmpDirs) {
+        super(
+                elementsQueue,
+                createFetcherManager(
+                        elementsQueue,
+                        context,
+                        connection,
+                        lakeTieringFactory,
+                        pollTimeout,
+                        ioTmpDirs),
+                new TableBucketWriteResultEmitter<>(),
+                context.getConfiguration(),
+                context);
+        this.connection = connection;
+    }
+
+    private static <WriteResult> TieringSourceFetcherManager<WriteResult> createFetcherManager(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
+                    elementsQueue,
+            SourceReaderContext context,
+            Connection connection,
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            Duration pollTimeout,
+            String[] ioTmpDirs) {
+        TieringMetrics tieringMetrics = new TieringMetrics(context.metricGroup());
+        ClassLoader userClassLoader = context.getUserCodeClassLoader().asClassLoader();
+        return new TieringSourceFetcherManager<>(
+                elementsQueue,
+                () ->
+                        new TieringSplitReader<>(
+                                connection,
+                                lakeTieringFactory,
+                                userClassLoader,
+                                pollTimeout,
+                                tieringMetrics,
+                                ioTmpDirs),
+                context.getConfiguration(),
+                (ignore) -> {});
+    }
+
+    @Override
+    public void start() {
+        // we request a split only if we did not get splits during the checkpoint restore
+        if (getNumberOfCurrentlyAssignedSplits() == 0) {
+            context.sendSplitRequest();
+        }
+    }
+
+    @Override
+    protected void onSplitFinished(Map<String, TieringSplitState> finishedSplitIds) {
+        context.sendSplitRequest();
+    }
+
+    @Override
+    public List<TieringSplit> snapshotState(long checkpointId) {
+        // we return empty list to make source reader be stateless
+        return Collections.emptyList();
+    }
+
+    @Override
+    protected TieringSplitState initializedState(TieringSplit split) {
+        if (split.isTieringSnapshotSplit()) {
+            return new TieringSplitState(split);
+        } else if (split.isTieringLogSplit()) {
+            return new TieringSplitState(split);
+        } else {
+            throw new UnsupportedOperationException("Unsupported split type: " + split);
+        }
+    }
+
+    @Override
+    protected TieringSplit toSplitType(String splitId, TieringSplitState splitState) {
+        return splitState.toSourceSplit();
+    }
+
+    @Override
+    public void handleSourceEvents(SourceEvent sourceEvent) {
+        if (sourceEvent instanceof TieringReachMaxDurationEvent) {
+            TieringReachMaxDurationEvent reachMaxDurationEvent =
+                    (TieringReachMaxDurationEvent) sourceEvent;
+            long tableId = reachMaxDurationEvent.getTableId();
+            LOG.info("Received reach max duration for table {}", tableId);
+            ((TieringSourceFetcherManager<WriteResult>) splitFetcherManager)
+                    .markTableReachTieringMaxDuration(tableId);
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
+        connection.close();
+    }
+}

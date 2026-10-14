@@ -1,0 +1,265 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.spark.read
+
+import org.apache.fluss.client.table.scanner.{ScanRecord, SortMergeReader}
+import org.apache.fluss.client.table.scanner.batch.BatchScanner
+import org.apache.fluss.client.table.scanner.log.LogScanner
+import org.apache.fluss.config.Configuration
+import org.apache.fluss.memory.MemorySegment
+import org.apache.fluss.metadata.{TableBucket, TableBucketSnapshot, TablePath}
+import org.apache.fluss.record.LogRecord
+import org.apache.fluss.row.{encode, InternalRow => FlussInternalRow, KeyValueRow}
+import org.apache.fluss.spark.SparkFlussConf
+import org.apache.fluss.spark.utils.LogChangesIterator
+import org.apache.fluss.types.{DataField, RowType}
+import org.apache.fluss.utils.CloseableIterator
+
+import org.apache.spark.internal.Logging
+
+import java.util.Comparator
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable
+
+/**
+ * Partition reader that reads primary key table data.
+ *
+ * Reads both snapshot and log data, merging them using sort-merge algorithm. For rows with the same
+ * primary key, log data takes precedence over snapshot data.
+ */
+class FlussUpsertPartitionReader(
+    tablePath: TablePath,
+    projection: Array[Int],
+    limit: Option[Int],
+    flussPartition: FlussUpsertInputPartition,
+    flussConfig: Configuration)
+  extends FlussPartitionReader(tablePath, flussConfig, limit)
+  with Logging {
+
+  override protected lazy val projectedRowType: RowType = rowType.project(projectionWithPks)
+
+  private val readOptimized = flussConfig.get(SparkFlussConf.READ_OPTIMIZED_OPTION)
+  private val tableBucket: TableBucket = flussPartition.tableBucket
+  private val snapshotId: Long = flussPartition.snapshotId
+  private val logStartingOffset: Long = flussPartition.logStartingOffset
+  private val logStoppingOffset: Long = flussPartition.logStoppingOffset
+  private val timeRange: Option[FlussTimeRange] = flussPartition.timeRange
+  private val logScanFinished = logStartingOffset >= logStoppingOffset || logStoppingOffset <= 0
+
+  private val (projectionWithPks, pkProjection) = {
+    val pkIndexes = tableInfo.getSchema.getPrimaryKeyIndexes
+    var i = 0
+    val _pkProjection = mutable.ArrayBuffer.empty[Int]
+    val extraProjections = mutable.ArrayBuffer.empty[Int]
+    extraProjections ++= projection
+    pkIndexes.foreach {
+      pkIndex =>
+        projection.indexOf(pkIndex) match {
+          case -1 =>
+            extraProjections += pkIndex
+            _pkProjection += projection.length + i
+            i += 1
+          case idx => _pkProjection += idx
+        }
+    }
+    (extraProjections.toArray, _pkProjection.toArray)
+  }
+
+  private var snapshotScanner: BatchScanner = _
+  private var logScanner: LogScanner = _
+  private var mergedIterator: Iterator[FlussInternalRow] = _
+
+  // initialize scanners
+  initialize()
+
+  override def next0(): Boolean = {
+    if (closed) {
+      return false
+    }
+
+    if (mergedIterator.hasNext) {
+      currentRow = convertToSparkRow(mergedIterator.next())
+      true
+    } else {
+      false
+    }
+  }
+
+  private def createSortMergeReader(): SortMergeReader = {
+    // Create key encoder for primary keys
+    val pkIndexes = tableInfo.getSchema.getPrimaryKeyIndexes
+    val pkFields = new java.util.ArrayList[DataField]()
+    pkIndexes.foreach(i => pkFields.add(rowType.getFields.get(i)))
+    val pkRowType = new RowType(pkFields)
+    val keyEncoder =
+      encode.KeyEncoder.ofPrimaryKeyEncoder(
+        pkRowType,
+        tableInfo.getPhysicalPrimaryKeys,
+        tableInfo.getTableConfig,
+        tableInfo.isDefaultBucketKey)
+
+    // Create comparators based on primary key
+    val comparator = new Comparator[FlussInternalRow] {
+      override def compare(o1: FlussInternalRow, o2: FlussInternalRow): Int = {
+        val key1 = keyEncoder.encodeKey(o1)
+        val key2 = keyEncoder.encodeKey(o2)
+        MemorySegment.wrap(key1).compare(MemorySegment.wrap(key2), 0, 0, key1.length)
+      }
+    }
+
+    def createLogChangesIterator(): CloseableIterator[KeyValueRow] = {
+      // Initialize the log scanner
+      logScanner = table.newScan().project(projectionWithPks).createLogScanner()
+      if (tableBucket.getPartitionId == null) {
+        logScanner.subscribe(tableBucket.getBucket, logStartingOffset)
+      } else {
+        logScanner.subscribe(tableBucket.getPartitionId, tableBucket.getBucket, logStartingOffset)
+      }
+
+      // Collect all log records until logStoppingOffset
+      val allLogRecords = mutable.ArrayBuffer[ScanRecord]()
+      var continue = true
+
+      while (continue) {
+        val records = logScanner.poll(POLL_TIMEOUT)
+        if (!records.isEmpty) {
+          val flatRecords = records.asScala
+          for (scanRecord <- flatRecords) {
+            if (timeRange.exists(_.isAfter(scanRecord.timestamp()))) {
+              // Past the end of the requested window, and commit timestamps only grow from here.
+              continue = false
+            } else {
+              // Maybe data with logStoppingOffset doesn't exist.
+              if (
+                scanRecord.logOffset() <= logStoppingOffset - 1 &&
+                timeRange.forall(_.contains(scanRecord.timestamp()))
+              ) {
+                allLogRecords += scanRecord
+              }
+              if (scanRecord.logOffset() >= logStoppingOffset - 1) {
+                continue = false // Stop if we reach the stopping offset
+              }
+            }
+          }
+        }
+      }
+
+      // An incremental read scans up to the latest offset and applies its end bound above, so a
+      // non-empty offset range can still leave nothing behind. LogChangesIterator seeds its cursor
+      // from the first record, so it must not be handed an empty batch.
+      if (allLogRecords.isEmpty) {
+        CloseableIterator.emptyIterator[KeyValueRow]()
+      } else {
+        LogChangesIterator(allLogRecords.toArray, pkProjection, comparator)
+      }
+    }
+
+    def createSnapshotIterator(): CloseableIterator[LogRecord] = {
+      // Initialize the snapshot scanner
+      snapshotScanner =
+        table.newScan().project(projectionWithPks).createBatchScanner(tableBucket, snapshotId)
+
+      // Convert snapshot iterator to LogRecord iterator for SortMergeReader
+      new CloseableIterator[LogRecord] {
+        private var currentBatch: java.util.Iterator[FlussInternalRow] = _
+        private var hasMoreBatches = true
+
+        override def hasNext: Boolean = {
+          while ((currentBatch == null || !currentBatch.hasNext) && hasMoreBatches) {
+            val batch = snapshotScanner.pollBatch(POLL_TIMEOUT)
+            if (batch == null) {
+              hasMoreBatches = false
+            } else {
+              currentBatch = batch
+            }
+          }
+          currentBatch != null && currentBatch.hasNext
+        }
+
+        override def next(): LogRecord = {
+          // Convert InternalRow to LogRecord using GenericRecord
+          new ScanRecord(currentBatch.next())
+        }
+
+        override def close(): Unit = {
+          snapshotScanner.close()
+        }
+      }
+
+    }
+
+    // Get log iterator with proper filtering and sorting
+    val logIterator = if (logScanFinished || readOptimized) {
+      CloseableIterator.emptyIterator[KeyValueRow]()
+    } else {
+      createLogChangesIterator()
+    }
+
+    val snapshotIterators = if (snapshotId == TableBucketSnapshot.NO_SNAPSHOT_ID) {
+      null
+    } else {
+      createSnapshotIterator()
+    }
+
+    // null: scanners already project rows; passing projectionWithPks here double-projects
+    val sortMergeReader = new SortMergeReader(
+      null,
+      pkProjection,
+      snapshotIterators,
+      comparator,
+      logIterator
+    )
+    sortMergeReader
+  }
+
+  private def initialize(): Unit = {
+    val currentTs = System.currentTimeMillis()
+    logInfo(s"Prepare read table $tablePath $flussPartition")
+
+    val sortMergeReader = createSortMergeReader()
+
+    // Get the merged result iterator
+    val mergedResult = sortMergeReader.readBatch()
+
+    // If merged result is null, return an empty iterator
+    mergedIterator = if (mergedResult == null) {
+      Iterator.empty
+    } else {
+      mergedResult.asScala
+    }
+    val spend = (System.currentTimeMillis() - currentTs) / 1000
+    logInfo(s"Initialize FlussUpsertPartitionReader cost $spend(s)")
+  }
+
+  override def close0(): Unit = {
+    if (mergedIterator != null) {
+      mergedIterator match {
+        case closeable: AutoCloseable => closeable.close()
+        case _ => // Do nothing
+      }
+    }
+
+    if (logScanner != null) {
+      logScanner.close()
+    }
+    if (snapshotScanner != null) {
+      snapshotScanner.close()
+    }
+  }
+}

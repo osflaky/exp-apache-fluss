@@ -1,0 +1,163 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.flink.source.emitter;
+
+import org.apache.fluss.client.table.scanner.ScanRecord;
+import org.apache.fluss.flink.lake.LakeRecordRecordEmitter;
+import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
+import org.apache.fluss.flink.source.reader.FlinkSourceReader;
+import org.apache.fluss.flink.source.reader.RecordAndPos;
+import org.apache.fluss.flink.source.split.HybridSnapshotLogSplitState;
+import org.apache.fluss.flink.source.split.SourceSplitState;
+
+import org.apache.flink.api.connector.source.SourceOutput;
+import org.apache.flink.connector.base.source.reader.RecordEmitter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.Serializable;
+
+/**
+ * The {@link RecordEmitter} implementation for {@link FlinkSourceReader}.
+ *
+ * <p>During emitting records:
+ *
+ * <p>when the record is from snapshot data, it'll update the records number to skip which helps to
+ * skip the records has been read while restoring in reading snapshot data phase.
+ *
+ * <p>when the record is from log data, it'll update the offset
+ */
+public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT, SourceSplitState> {
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkRecordEmitter.class);
+
+    private final FlussDeserializationSchema<OUT> deserializationSchema;
+    @Nullable private final OutputProjection<OUT> outputProjection;
+    private LakeRecordRecordEmitter<OUT> lakeRecordRecordEmitter;
+
+    public FlinkRecordEmitter(FlussDeserializationSchema<OUT> deserializationSchema) {
+        this(deserializationSchema, null);
+    }
+
+    public FlinkRecordEmitter(
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            @Nullable OutputProjection<OUT> outputProjection) {
+        this.deserializationSchema = deserializationSchema;
+        this.outputProjection = outputProjection;
+    }
+
+    @Override
+    public void emitRecord(
+            RecordAndPos recordAndPosition,
+            SourceOutput<OUT> sourceOutput,
+            SourceSplitState splitState) {
+        if (splitState.isHybridSnapshotLogSplitState()) {
+            // if it's hybrid split, we need to update the records number to skip(if in snapshot
+            // phase) or log offset(in incremental phase)
+            HybridSnapshotLogSplitState hybridSnapshotLogSplitState =
+                    splitState.asHybridSnapshotLogSplitState();
+
+            if (recordAndPosition.isSnapshotPhaseFinished()) {
+                hybridSnapshotLogSplitState.markSnapshotFinished();
+                return;
+            }
+
+            ScanRecord scanRecord = recordAndPosition.record();
+            if (scanRecord.logOffset() >= 0) {
+                // record is with a valid offset, means it's in incremental phase,
+                // update the log offset
+                hybridSnapshotLogSplitState.setNextOffset(scanRecord.logOffset() + 1);
+            } else {
+                // record is with an invalid offset, means it's in snapshot phase,
+                // update the records number to skip
+                hybridSnapshotLogSplitState.setRecordsToSkip(recordAndPosition.readRecordsCount());
+            }
+            processAndEmitRecord(scanRecord, sourceOutput);
+        } else if (splitState.isLogSplitState()) {
+            // Attempt to process and emit the record.
+            // For $binlog, this returns true only when a complete row (or the final part of
+            // a split) is emitted.
+            boolean emitted = processAndEmitRecord(recordAndPosition.record(), sourceOutput);
+
+            if (emitted) {
+                // Only advance the offset in state if the record was successfully emitted.
+                // This ensures that if a crash occurs mid-update (between BEFORE and AFTER),
+                // the source will re-read the same log offset upon recovery,
+                // allowing the BinlogDeserializationSchema to correctly reconstruct the state.
+                splitState
+                        .asLogSplitState()
+                        .setNextOffset(recordAndPosition.record().logOffset() + 1);
+            }
+        } else if (splitState.isKvBatchSplitState()) {
+            processAndEmitRecord(recordAndPosition.record(), sourceOutput);
+        } else if (splitState.isLakeSplit()) {
+            if (lakeRecordRecordEmitter == null) {
+                lakeRecordRecordEmitter = new LakeRecordRecordEmitter<>(this::processAndEmitRecord);
+            }
+            lakeRecordRecordEmitter.emitRecord(splitState, sourceOutput, recordAndPosition);
+        } else {
+            LOG.warn("Unknown split state type: {}", splitState.getClass());
+        }
+    }
+
+    /**
+     * Processes and emits a record.
+     *
+     * @return true if a record was emitted, false if deserialize returned null (e.g., for $binlog
+     *     UPDATE_BEFORE records that are buffered pending their UPDATE_AFTER pair)
+     */
+    private boolean processAndEmitRecord(ScanRecord scanRecord, SourceOutput<OUT> sourceOutput) {
+        OUT record;
+        try {
+            record = deserializationSchema.deserialize(scanRecord);
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to deserialize record: " + scanRecord + ". Cause: " + e.getMessage(),
+                    e);
+        }
+
+        if (record != null && outputProjection != null) {
+            record = outputProjection.project(record);
+        }
+
+        if (record != null) {
+            long timestamp = scanRecord.timestamp();
+            if (timestamp > 0) {
+                sourceOutput.collect(record, timestamp);
+            } else {
+                sourceOutput.collect(record);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** Projection applied after deserialization and before the record is emitted. */
+    public interface OutputProjection<OUT> extends Serializable {
+
+        /**
+         * Projects a deserialized record.
+         *
+         * @param record the deserialized record
+         * @return the projected record, or {@code null} to skip emission
+         */
+        @Nullable
+        OUT project(OUT record);
+    }
+}
